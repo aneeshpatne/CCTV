@@ -10,6 +10,7 @@ def open_cap(URL):
 
 cap = open_cap(URL)
 attempt_count = 0
+read_attempt_count = 0  
 
 while True:
     if cap is None:
@@ -20,4 +21,14 @@ while True:
         time.sleep(1)
         cap = open_cap(URL)
         continue
-    
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        if read_attempt_count > 5: 
+            if attempt_count > 5:
+                print("Max attempts reached, exiting")
+                break
+        read_attempt_count+= 1
+        cap.release()
+        cap = None
+        continue
+
