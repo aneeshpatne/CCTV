@@ -1,3 +1,4 @@
 from tools.adjustLED import adJustLED
+from ultilities.warn import warning_blink
 
-adJustLED(0)
+warning_blink()
