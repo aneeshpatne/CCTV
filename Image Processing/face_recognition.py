@@ -13,7 +13,7 @@ def open_cap(URL):
     if not cap.isOpened():
         return None
     return cap
-cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml" # type: ignore
 face_cascade = cv2.CascadeClassifier(cascade_path)
 if face_cascade.empty():
     raise RuntimeError(f"Failed to load face cascade at {cascade_path}")
