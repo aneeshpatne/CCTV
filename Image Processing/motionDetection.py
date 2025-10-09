@@ -1,7 +1,7 @@
 import cv2
 import time
 from datetime import datetime, timezone, timedelta
-import pytz
+
 URL = "http://192.168.1.116:81/stream"  
 
 t0 = time.time()
@@ -13,10 +13,6 @@ def open_cap(URL):
     if not cap.isOpened():
         return None
     return cap
-cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-face_cascade = cv2.CascadeClassifier(cascade_path)
-if face_cascade.empty():
-    raise RuntimeError(f"Failed to load face cascade at {cascade_path}")
 
 cap = open_cap(URL)
 attempt_count = 0
@@ -33,7 +29,6 @@ while True:
         cap = open_cap(URL)
         continue
     ok, frame = cap.read()
-    
     if not ok or frame is None:
         if read_attempt_count > 5: 
             if attempt_count > 5:
@@ -43,16 +38,13 @@ while True:
         cap.release()
         cap = None
         continue
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-    for (x, y, w, h) in faces:
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
     frames += 1
     now = time.time()
     if now - t0 >= 1.0:
         fps = frames / (now - t0)
         frames, t0 = 0, now
 
+    # Get the current time in UTC and convert to IST
     ist = timezone(timedelta(hours=5, minutes=30))
     current_time = datetime.now(ist)
     ts = current_time.strftime("%Y-%m-%d %H:%M:%S")
