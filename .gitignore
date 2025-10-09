@@ -2,3 +2,4 @@
 .vscode
 __pycache__
 live.py
+motion_detection.py
