@@ -1,5 +1,7 @@
 import cv2
 import time
+from datetime import datetime, timezone, timedelta
+
 URL = "http://192.168.1.116:81/stream"  
 
 t0 = time.time()
@@ -42,7 +44,11 @@ while True:
         fps = frames / (now - t0)
         frames, t0 = 0, now
 
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Get the current time in UTC and convert to IST
+    ist = timezone(timedelta(hours=5, minutes=30))
+    current_time = datetime.now(ist)
+    ts = current_time.strftime("%Y-%m-%d %H:%M:%S")
+    
     cv2.putText(frame, f"{ts}  |  {fps:.1f} FPS", (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     cv2.imshow("ESP32-CAM (q=quit)", frame)
