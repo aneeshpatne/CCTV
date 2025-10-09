@@ -2,6 +2,10 @@ import cv2
 import time
 URL = "http://192.168.1.116:81/stream"  
 
+t0 = time.time()
+frames = 0
+
+
 def open_cap(URL):
     cap = cv2.VideoCapture(URL)
     if not cap.isOpened():
@@ -31,4 +35,11 @@ while True:
         cap.release()
         cap = None
         continue
+    frames += 1
+    now = time.time()
+    if now - t0 >= 1.0:
+        fps = frames / (now - t0)
+        frames, t0 = 0, now
+
+
 
