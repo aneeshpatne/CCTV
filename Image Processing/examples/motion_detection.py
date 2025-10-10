@@ -23,6 +23,70 @@ cv2.namedWindow("frame")
 mog2 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
 
 min_area = 800
+
+roi_pts = np.array([
+    [147, 400],
+    [151, 427],
+    [146, 487],
+    [148, 524],
+    [143, 557],
+    [191, 551],
+    [222, 560],
+    [269, 561],
+    [302, 553],
+    [345, 555],
+    [376, 556],
+    [434, 546],
+    [468, 550],
+    [504, 545],
+    [564, 541],
+    [609, 543],
+    [651, 542],
+    [701, 544],
+    [737, 538],
+    [779, 536],
+    [811, 535],
+    [832, 506],
+    [836, 475],
+    [843, 471],
+    [858, 457],
+    [858, 440],
+    [855, 413],
+    [846, 391],
+    [841, 352],
+    [836, 329],
+    [819, 319],
+    [799, 271],
+    [808, 238],
+    [809, 201],
+    [799, 192],
+    [786, 191],
+    [759, 194],
+    [738, 194],
+    [692, 196],
+    [659, 200],
+    [612, 201],
+    [572, 197],
+    [517, 194],
+    [463, 197],
+    [408, 208],
+    [393, 236],
+    [363, 236],
+    [329, 233],
+    [273, 230],
+    [264, 232],
+    [249, 259],
+    [230, 273],
+    [196, 289],
+    [179, 292],
+    [150, 291],
+    [128, 315],
+    [142, 339],
+    [146, 363],
+    [146, 381],
+], dtype=np.int32)
+
+
 blinker = NonBlockingBlinker(blink_interval=0.5)  # Create the non-blocking blinker
 while True:
     ret, frame = cap.read()
@@ -34,7 +98,11 @@ while True:
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, None)  # type: ignore
     mask = cv2.dilate(mask, None, iterations=2)  # type: ignore
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    roi_mask = np.zeros_like(mask, dtype=np.uint8)
+    cv2.fillPoly(roi_mask, [roi_pts], 255)
+    filtered_motion = cv2.bitwise_and(mask, roi_mask)
+
+    contours, _ = cv2.findContours(filtered_motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     disp = frame.copy()
     motion_detected = False
     for c in contours:
@@ -65,6 +133,7 @@ while True:
                 1.0, (0, 255, 0), 2, cv2.LINE_AA)
     
     cv2.imshow("frame", disp)
+    cv2.imshow("ROI mask", roi_mask)
 
     
     if cv2.waitKey(1) == ord('q'):
