@@ -2,6 +2,9 @@ import cv2
 from datetime import datetime
 import pytz
 import numpy as np
+import sys
+sys.path.append('/home/aneesh/code/CCTV')
+from utilities.warn import NonBlockingBlinker
 
 
 URL = "http://192.168.1.116:81/stream"  
@@ -20,6 +23,7 @@ cv2.namedWindow("frame")
 mog2 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
 
 min_area = 800
+blinker = NonBlockingBlinker(blink_interval=0.5)  # Create the non-blocking blinker
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -45,6 +49,14 @@ while True:
         cv2.putText(disp, f"motion {area:.0f}", (x, max(0, y - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
     
+    
+    if motion_detected:
+        # Start the blinker if not already active
+        if not blinker.is_active:
+            blinker.start(duration=1)
+    
+    # Update the blinker state every frame (non-blocking)
+    blinker.update()
     
     current_time = datetime.now(ist)
     formatted_time = current_time.strftime("%Y-%m-%d %I:%M:%S %p")
