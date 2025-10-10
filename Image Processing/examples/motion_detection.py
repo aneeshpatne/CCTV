@@ -91,7 +91,7 @@ blinker = NonBlockingBlinker(blink_interval=0.5)  # Create the non-blocking blin
 while True:
     ret, frame = cap.read()
     if not ret:
-        raise RuntimeError("Stopped Receiving Frames")
+        print("Stopped Receiving Frames")
     
     fg_mask = mog2.apply(frame)
     _, mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
