@@ -19,7 +19,7 @@ def show_coordinates(event, x, y, flags, param):
         clicked_points.append((x, y))  
 
 cv2.namedWindow("frame")
-cv2.setMouseCallback("frame", show_coordinates, {"clicked_points": clicked_points})
+cv2.setMouseCallback("frame", show_coordinates)
 
 while True:
     ret, frame = cap.read()
