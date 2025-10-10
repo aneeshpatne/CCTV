@@ -11,9 +11,10 @@ while True:
     ret, frame = cap.read()
     if not ret:
         raise RuntimeError("Stopped Receiving Frames")
-    cv2.imshow("frame", frame)
     if cv2.waitKey(1) == ord('q'):
         break
+    cv2.putText(frame, "Aneesh Cam", (10 , 25), cv2.FONT_HERSHEY_SIMPLEX, 1.0,(0, 255, 0),  2, cv2.LINE_AA )
+    cv2.imshow("frame", frame)
 
  
 cap.release()
