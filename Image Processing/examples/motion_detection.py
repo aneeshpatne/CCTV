@@ -119,11 +119,9 @@ while True:
     
     
     if motion_detected:
-        # Start the blinker if not already active
         if not blinker.is_active:
             blinker.start(duration=1)
     
-    # Update the blinker state every frame (non-blocking)
     blinker.update()
     
     current_time = datetime.now(ist)
