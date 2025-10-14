@@ -39,14 +39,14 @@ ffmpeg_cmd = [
     '-s', f'{width}x{height}', '-r', str(fps), '-i','-',
     '-vf','format=yuv420p',
     '-c:v','libx264',
-    '-preset','veryfast',          # was ultrafast
+    '-preset','veryfast',          
     '-tune','zerolatency',
-    '-crf','26',                   # was 30 (try 26; 24 for even sharper)
-    '-profile:v','main',           # better compression than baseline; still widely supported
-    '-g', str(fps),                # was fps*2
+    '-crf','26',                   
+    '-profile:v','main',          
+    '-g', str(fps),                
     '-bf','0','-refs','1','-sc_threshold','0',
-    '-maxrate','2500k',            # was 1000k
-    '-bufsize','1200k',            # was 500k
+    '-maxrate','2500k',           
+    '-bufsize','1200k',            
     '-pix_fmt','yuv420p',
     '-f','rtsp','-rtsp_transport','tcp', rtsp_url
 ]
