@@ -11,7 +11,7 @@ IST = pytz.timezone("Asia/Kolkata")
 # Output
 BASE_DIR = "/srv/cctv/esp_cam1"
 SEGMENT_SECONDS = 600                    # 10 min chunks
-BITRATE = "2.5M"                         # predictable storage
+BITRATE = "4M"                         # predictable storage
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"  # needs a local RTSP server (e.g., MediaMTX)
 
 # Motion
@@ -70,24 +70,48 @@ def detect_motion(frame):
 # ---- FFmpeg launcher (tee: segment to disk + RTSP publish) ----
 ffmpeg_proc = None
 def start_ffmpeg(width, height, fps):
-    # one encode -> two sinks (segment mp4 + rtsp)
-    # Using tee muxer with per-sink options; use_fifo makes sinks independent
     out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
-    tee_spec = (
-        f"[f=segment:segment_time={SEGMENT_SECONDS}:reset_timestamps=1:strftime=1:"
-        f"segment_format=mp4:segment_format_options=movflags=+faststart]'{out_pattern}'|"
-        f"[f=rtsp:rtsp_transport=tcp]'{RTSP_OUT}'"
-    )
+    
     cmd = [
-        "ffmpeg","-nostdin","-hide_banner","-y",
-        "-f","rawvideo","-pix_fmt","bgr24","-s", f"{width}x{height}","-r", str(fps),"-i","-",
-        "-vf","format=yuv420p",
-        "-c:v","libx264","-preset","veryfast","-tune","zerolatency",
-        "-b:v", BITRATE, "-maxrate", BITRATE, "-bufsize","1200k",
-        "-g", str(int(fps)),"-bf","0","-sc_threshold","0",
-        "-f","tee","-use_fifo","1", tee_spec
+        "ffmpeg", "-nostdin", "-hide_banner", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", 
+        "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+        
+        # Output 1: HIGH QUALITY for local recording
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",              # High quality (18-23 range)
+        "-g", str(int(fps)),
+        "-bf", "2",
+        "-f", "segment",
+        "-segment_time", str(SEGMENT_SECONDS),
+        "-segment_format", "mp4",
+        "-segment_format_options", "movflags=+faststart",
+        "-reset_timestamps", "1",
+        "-strftime", "1",
+        out_pattern,
+        
+        # Output 2: LOWER QUALITY/BITRATE for RTSP streaming
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "veryfast",     # Faster encoding
+        "-tune", "zerolatency",    # Low latency for streaming
+        "-b:v", "1.5M",            # Lower bitrate
+        "-maxrate", "1.5M",
+        "-bufsize", "3M",
+        "-g", str(int(fps)),
+        "-bf", "0",                # No B-frames for low latency
+        "-sc_threshold", "0",
+        "-f", "rtsp",
+        "-rtsp_transport", "tcp",
+        RTSP_OUT
     ]
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0)
+    
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, 
+                           stdout=subprocess.DEVNULL, 
+                           stderr=subprocess.DEVNULL, 
+                           bufsize=0)
 
 # ---- Threads ----
 frame_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=FRAME_QUEUE_MAX)
