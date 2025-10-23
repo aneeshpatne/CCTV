@@ -5,14 +5,14 @@ from datetime import datetime
 import pytz
 
 # ====== CONFIG ======
-URL = "http://192.168.1.116:81/stream"   # ESP MJPEG (single source)
+URL = "http://192.168.1.116:81/stream"   
 IST = pytz.timezone("Asia/Kolkata")
 
 # Output
 BASE_DIR = "/srv/cctv/esp_cam1"
-SEGMENT_SECONDS = 600                    # 10 min chunks
-BITRATE = "4M"                         # predictable storage
-RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"  # needs a local RTSP server (e.g., MediaMTX)
+SEGMENT_SECONDS = 600                  
+BITRATE = "4M"                        
+RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"  
 
 # Motion
 MIN_AREA = 800
