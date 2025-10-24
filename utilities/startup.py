@@ -13,6 +13,8 @@ from tools.reset import reset
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 count = 1
+
+
 def startup():
     global count
     while True:
@@ -48,5 +50,7 @@ def startup():
             i += 1
         logger.info(f"Resolution Set Successfully to {i}")
         break
-        
-startup()
+
+
+if __name__ == "__main__":
+    startup()

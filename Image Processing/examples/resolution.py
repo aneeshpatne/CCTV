@@ -1,250 +1,219 @@
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from utilities.startup import startup
 
+# CRITICAL: Set FFMPEG options BEFORE importing cv2
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    "rw_timeout;5000000|"
-    "timeout;5000000|"
+    "rtsp_transport;tcp|"
+    "timeout;5000000|"         # 5s connection timeout (μs) - MUST be set before cv2 import
+    "stimeout;5000000|"        # 5s socket timeout (μs)
+    "rw_timeout;5000000|"      # 5s read/write timeout (μs)
+    "listen_timeout;5000000|"  # 5s listen timeout (μs)
     "reconnect;1|"
     "reconnect_streamed;1|"
     "reconnect_at_eof;1|"
     "reconnect_on_network_error;1|"
-    "reconnect_delay_max;2000"
+    "reconnect_delay_max;2|"   # 2ms max reconnect delay
+    "max_delay;5000000"        # 5s max delay
 )
 
-import cv2
-from datetime import datetime
-import pytz
-import time
 import threading
+import time
+import signal
+from datetime import datetime
+
+import cv2
+import numpy as np
+import pytz
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from utilities.startup import startup
 
 URL = "http://192.168.1.119:81/stream"
 IST = pytz.timezone('Asia/Kolkata')
-
-# Load no signal image
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'no_signal.png')
+FRAME_RETRY_DELAY = 0.5
+FRAME_READ_TIMEOUT = 5.0  # seconds
+CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
+
 no_signal_img = cv2.imread(NO_SIGNAL_PATH)
 if no_signal_img is None:
     print(f"Warning: Could not load no_signal.png from {NO_SIGNAL_PATH}")
-    # Create a simple black frame as fallback
-    no_signal_img = cv2.zeros((480, 640, 3), dtype=cv2.uint8)
-    cv2.putText(no_signal_img, "NO SIGNAL", (200, 240), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3, cv2.LINE_AA)
+    no_signal_img = np.zeros((480, 640, 3), dtype=np.uint8)
+    cv2.putText(no_signal_img, "NO SIGNAL", (160, 260), cv2.FONT_HERSHEY_SIMPLEX,
+                1.4, (0, 0, 255), 3, cv2.LINE_AA)
 
-# Startup state tracking
 startup_complete = threading.Event()
 startup_thread = None
+startup_lock = threading.Lock()
 
-# Connection state tracking
-connection_attempt_active = threading.Event()
-connection_result = {'cap': None, 'success': False}
-connection_lock = threading.Lock()
+# Capture opening state
+capture_result = {'cap': None, 'done': False}
+capture_lock = threading.Lock()
 
-def run_startup():
-    """Run startup in a separate thread"""
-    attempt = 1
-    while not startup_complete.is_set():
-        try:
-            print(f"Running startup attempt {attempt}...")
-            startup()
-            startup_complete.set()
-            print("Startup completed successfully!")
-        except Exception as e:
-            print(f"Startup failed with error: {e}")
-            print("Will retry startup in 5s...")
-            time.sleep(5)
-            attempt += 1
-            # Loop will retry until success
 
-def open_capture_thread():
-    """Open capture in a separate thread to avoid blocking"""
-    global connection_result
+def start_startup(force: bool = False) -> None:
+    global startup_thread
+    with startup_lock:
+        if force:
+            startup_complete.clear()
+        if startup_complete.is_set():
+            return
+        if startup_thread is None or not startup_thread.is_alive():
+            def _runner() -> None:
+                attempt = 1
+                while not startup_complete.is_set():
+                    try:
+                        print(f"Running startup attempt {attempt}...")
+                        startup()
+                        startup_complete.set()
+                        print("Startup completed successfully!")
+                    except Exception as exc:
+                        print(f"Startup failed with error: {exc}")
+                        print("Retrying startup in 5 s...")
+                        time.sleep(5)
+                        attempt += 1
+
+            startup_thread = threading.Thread(target=_runner, daemon=True)
+            startup_thread.start()
+
+
+def backoff(attempt: int) -> float:
+    return min(5.0, 0.5 * (2 ** attempt))
+
+
+def show_placeholder(message: str) -> None:
+    base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+    frame = base.copy()
+    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %p")
+    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 165, 255), 2, cv2.LINE_AA)
+    cv2.imshow("frame", frame)
+
+
+def _open_capture_thread():
+    """Open capture in background thread."""
     try:
         cap = cv2.VideoCapture(URL, cv2.CAP_FFMPEG)
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
         
-        with connection_lock:
-            connection_result['cap'] = cap
-            connection_result['success'] = cap.isOpened()
+        with capture_lock:
+            capture_result['cap'] = cap
+            capture_result['done'] = True
     except Exception as e:
-        print(f"Exception during capture open: {e}")
-        with connection_lock:
-            connection_result['cap'] = None
-            connection_result['success'] = False
-    finally:
-        connection_attempt_active.clear()
+        print(f"Exception opening capture: {e}")
+        with capture_lock:
+            capture_result['cap'] = None
+            capture_result['done'] = True
 
-def start_connection_attempt():
-    """Start a non-blocking connection attempt"""
-    connection_attempt_active.set()
-    with connection_lock:
-        connection_result['cap'] = None
-        connection_result['success'] = False
+
+def open_capture_with_timeout() -> cv2.VideoCapture:
+    """Open capture with timeout - if it takes too long, abort."""
+    global capture_result
     
-    thread = threading.Thread(target=open_capture_thread, daemon=True)
+    # Reset state
+    with capture_lock:
+        capture_result = {'cap': None, 'done': False}
+    
+    # Start opening in background
+    thread = threading.Thread(target=_open_capture_thread, daemon=True)
     thread.start()
-    return thread
+    
+    # Wait with timeout
+    start_time = time.time()
+    while time.time() - start_time < CAPTURE_OPEN_TIMEOUT:
+        with capture_lock:
+            if capture_result['done']:
+                return capture_result['cap']
+        time.sleep(0.1)
+    
+    # Timeout - abandon the thread and return None
+    print(f"Capture open timed out after {CAPTURE_OPEN_TIMEOUT}s")
+    return None
 
-def backoff(a): 
-    return min(5.0, 0.5 * (2 ** a))
 
-attempt = 0
-cap = None
-last_backoff_start = None
-connection_thread = None
+def main() -> None:
+    attempt = 0
+    cap = None
 
-# Start startup in a separate thread (non-blocking)
-print("Starting camera initialization in background...")
-startup_thread = threading.Thread(target=run_startup, daemon=True)
-startup_thread.start()
+    # Ensure SIGALRM interrupts blocking frame reads after FRAME_READ_TIMEOUT seconds.
+    class FrameReadTimeout(Exception):
+        pass
 
-try:
-    while True:
-        # Check if we should quit
-        key = cv2.waitKey(1)
-        if key == ord('q'):
-            break
-        
-        # Always update display with timestamp
-        ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %p")
-        
-        # If startup is still running, show no signal image and do nothing else
-        if not startup_complete.is_set():
-            display_frame = no_signal_img.copy()
-            cv2.putText(display_frame, "Initializing Camera...", (10, 60), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
-            cv2.putText(display_frame, ts, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow("frame", display_frame)
-            
-            # Clean up any existing connection while waiting for startup
-            if cap is not None:
-                cap.release()
-                cap = None
-            # Cancel any pending connection attempts
-            connection_attempt_active.clear()
-            attempt = 0
-            last_backoff_start = None
-            continue
-        
-        # Check if we're in a backoff period
-        if last_backoff_start is not None:
-            elapsed = time.time() - last_backoff_start
-            backoff_duration = backoff(attempt - 1)
-            
-            if elapsed < backoff_duration:
-                # Still in backoff, show no signal
-                display_frame = no_signal_img.copy()
-                remaining = int(backoff_duration - elapsed) + 1
-                cv2.putText(display_frame, f"Reconnecting in {remaining}s...", (10, 60), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
-                cv2.putText(display_frame, ts, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                            0.7, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.imshow("frame", display_frame)
-                continue
-            else:
-                # Backoff period over
-                last_backoff_start = None
-        
-        # Check if connection attempt is in progress
-        if connection_attempt_active.is_set():
-            display_frame = no_signal_img.copy()
-            cv2.putText(display_frame, f"Connecting... (attempt {attempt})", (10, 60), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
-            cv2.putText(display_frame, ts, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow("frame", display_frame)
-            continue
-        
-        # Check if we need to process connection result
-        with connection_lock:
-            if connection_result['cap'] is not None:
+    def _timeout_handler(_signum, _frame):
+        raise FrameReadTimeout()
+
+    signal.signal(signal.SIGALRM, _timeout_handler)
+
+    print("Starting camera initialization in background...")
+    start_startup(force=True)
+    show_placeholder("Initializing camera...")
+    cv2.waitKey(1)
+
+    try:
+        while True:
+            if cv2.waitKey(1) == ord('q'):
+                break
+
+            if not startup_complete.is_set():
                 if cap is not None:
                     cap.release()
-                cap = connection_result['cap']
-                success = connection_result['success']
-                connection_result['cap'] = None
-                connection_result['success'] = False
-                
-                if not success:
-                    print(f"Connection attempt {attempt} failed - cap.isOpened() = False")
+                    cap = None
+                show_placeholder("Initializing camera...")
+                time.sleep(0.05)
+                continue
+
+            if cap is None or not cap.isOpened():
+                if cap is not None:
                     cap.release()
+                show_placeholder(f"Connecting (attempt {attempt + 1})...")
+                cap = open_capture_with_timeout()
+                if cap is None or not cap.isOpened():
+                    print(f"Failed to open stream on attempt {attempt + 1}")
+                    if cap is not None:
+                        cap.release()
                     cap = None
                     attempt += 1
-                    last_backoff_start = time.time()
-                    
-                    # Trigger startup IMMEDIATELY on connection failure
-                    print("Triggering startup due to connection failure...")
-                    startup_complete.clear()
-                    startup_thread = threading.Thread(target=run_startup, daemon=True)
-                    startup_thread.start()
-                else:
-                    print("Connection established (cap.isOpened() = True)")
-                    # Don't reset attempt counter yet - wait for first successful frame read
-                    # attempt = 0
-        
-        # Ensure we have a valid capture object
-        if cap is None or not cap.isOpened():
-            # CRITICAL: Do not attempt connection until startup is complete
-            if not startup_complete.is_set():
-                # Show no signal while waiting for startup
-                display_frame = no_signal_img.copy()
-                cv2.putText(display_frame, "Waiting for initialization...", (10, 60), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
-                cv2.putText(display_frame, ts, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                            0.7, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.imshow("frame", display_frame)
-                continue
-            
-            # Start connection attempt if not already in progress
-            if not connection_attempt_active.is_set():
-                print(f"Starting connection attempt {attempt + 1}...")
-                attempt += 1
-                connection_thread = start_connection_attempt()
-            
-            # Show no signal while waiting
-            display_frame = no_signal_img.copy()
-            cv2.putText(display_frame, "Waiting for connection...", (10, 60), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
-            cv2.putText(display_frame, ts, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow("frame", display_frame)
-            continue
-        
-        # Try to read frame
-        ret, frame = cap.read()
-        
-        if not ret or frame is None:
-            print("Frame read failed - signal lost!")
-            cap.release()
-            cap = None  # Force reconnection
-            
-            # Trigger startup IMMEDIATELY on signal loss
-            print("Triggering startup due to signal loss...")
-            startup_complete.clear()
-            startup_thread = threading.Thread(target=run_startup, daemon=True)
-            startup_thread.start()
-            
-            # Show no signal and loop back to wait for startup
-            display_frame = no_signal_img.copy()
-            cv2.putText(display_frame, "Signal Lost - Restarting...", (10, 60), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
-            cv2.putText(display_frame, ts, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow("frame", display_frame)
-            continue
-        
-        # Success - reset attempt counter
-        attempt = 0
-        
-        # Display frame with timestamp
-        cv2.putText(frame, ts, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 
-                    1.0, (0, 255, 0), 2, cv2.LINE_AA)
-        cv2.imshow("frame", frame)
+                    time.sleep(backoff(attempt))
+                    start_startup(force=True)
+                    continue
+                print("Connection established.")
+                attempt = 0
 
-finally:
-    if cap is not None:
-        cap.release()
-    cv2.destroyAllWindows()
+            try:
+                signal.setitimer(signal.ITIMER_REAL, FRAME_READ_TIMEOUT)
+                ret, frame = cap.read()
+            except FrameReadTimeout:
+                print("Frame read timed out - forcing restart.")
+                ret, frame = False, None
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+
+            if not ret or frame is None:
+                print("Frame read failed - signal lost.")
+                cap.release()
+                cap = None
+                start_startup(force=True)
+                show_placeholder("Signal lost - restarting...")
+                time.sleep(FRAME_RETRY_DELAY)
+                continue
+
+            ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %p")
+            cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.imshow("frame", frame)
+
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
