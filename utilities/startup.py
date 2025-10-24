@@ -21,8 +21,9 @@ def startup():
         print("[STARTUP] Camera Initiated")
         print("[STARTUP] Initial Quality: ", stat)
         i = int(stat) 
-        while i < 13:
+        while i < 12:
             print("[STARTUP] Current Resolution: ", i)
+            print("[STARTUP] Attempting to set Current Resolution to: ", i + 1)
             change_quality(i + 1)
             time.sleep(2)
             stat = status()
