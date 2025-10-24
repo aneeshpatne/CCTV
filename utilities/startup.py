@@ -5,17 +5,34 @@ import time
 
 from tools.status import status
 from tools.stream_status import check_mjpeg_stream
-from tools.adjustResolution import adjustResolution
+from tools.changeQuality import change_quality
 
+count = 1
 def startup():
+    global count
     while True:
         cam_stat = check_mjpeg_stream()
-        print(cam_stat[0])
         stat = status()
-        print(stat)
         if cam_stat == False or stat == None:
-            print("Camera Connection Failed Retrying")
+            print("[STARTUP] Camera Connection Failed Retrying, Attempt Number:" , count)
+            count +=1
             time.sleep(2)
-    
-
+            continue
+        print("[STARTUP] Camera Initiated")
+        print("[STARTUP] Initial Quality: ", stat)
+        i = int(stat) 
+        while i < 13:
+            print("[STARTUP] Current Resolution: ", i)
+            change_quality(i + 1)
+            time.sleep(2)
+            stat = status()
+            cam_stat = check_mjpeg_stream()
+            if cam_stat == False or stat == None or int(stat) != i + 1:
+                print("[STARTUP] Resolution Change Failed")
+                i = 6
+                continue
+            i += 1
+        print("[STARTUP] Resolution Set Successfully", i )
+        break
+        
 startup()
