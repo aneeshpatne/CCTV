@@ -79,6 +79,7 @@ capture_lock = threading.Lock()
 ffmpeg_proc = None
 ffmpeg_lock = threading.Lock()
 last_frame_time = 0.0
+expected_frame_size = None  # (width, height) that FFmpeg expects
 
 
 def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
@@ -121,6 +122,7 @@ def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen
 
         # single encode shared by both tee legs
         "-an",
+        "-map", "0:v",            # map video stream to output
         "-vf", "format=yuv420p",
         "-c:v", "libx264",
         "-preset", "medium",
@@ -172,18 +174,25 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
 
 def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
     """Write frame to FFmpeg, with rate limiting and restart on error."""
-    global ffmpeg_proc, last_frame_time
+    global ffmpeg_proc, last_frame_time, expected_frame_size
     
     if not ENABLE_RECORDING:
         return True
     
     with ffmpeg_lock:
+        h, w = frame.shape[:2]
+        
         # Initialize FFmpeg if needed
         if ffmpeg_proc is None:
-            h, w = frame.shape[:2]
             ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
             if ffmpeg_proc is None:
                 return False
+            expected_frame_size = (w, h)
+        
+        # Check if frame size matches what FFmpeg expects
+        if expected_frame_size and (w, h) != expected_frame_size:
+            # Resize frame to match expected size
+            frame = cv2.resize(frame, expected_frame_size)
         
         # Rate limit to target FPS
         now = time.time()
@@ -203,8 +212,12 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         except (BrokenPipeError, IOError) as e:
             print(f"FFmpeg write error: {e}, restarting...")
             stop_ffmpeg(ffmpeg_proc)
-            h, w = frame.shape[:2]
-            ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
+            # Restart with same expected size
+            if expected_frame_size:
+                ffmpeg_proc = start_ffmpeg(expected_frame_size[0], expected_frame_size[1], RECORD_FPS)
+            else:
+                ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
+                expected_frame_size = (w, h)
             return ffmpeg_proc is not None
 
 
@@ -265,6 +278,26 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
         cv2.imshow("frame", frame)
+    
+    return frame
+
+
+def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.ndarray:
+    """Create a no-signal frame matching the specified dimensions for FFmpeg."""
+    # Create or resize no_signal base to match camera dimensions
+    if no_signal_img is not None:
+        base = cv2.resize(no_signal_img, (width, height))
+    else:
+        base = np.zeros((height, width, 3), dtype=np.uint8)
+        cv2.putText(base, "NO SIGNAL", (width//4, height//2), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.4, (0, 0, 255), 3, cv2.LINE_AA)
+    
+    frame = base.copy()
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 165, 255), 2, cv2.LINE_AA)
     
     return frame
 
