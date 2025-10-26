@@ -213,6 +213,13 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
     with ffmpeg_lock:
         h, w = frame.shape[:2]
         
+        # Check if FFmpeg process is still alive
+        if ffmpeg_proc is not None and ffmpeg_proc.poll() is not None:
+            # Process has died, restart it
+            print(f"FFmpeg process died (exit code: {ffmpeg_proc.poll()}), restarting...")
+            stop_ffmpeg(ffmpeg_proc)
+            ffmpeg_proc = None
+        
         # Initialize FFmpeg if needed
         if ffmpeg_proc is None:
             ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
