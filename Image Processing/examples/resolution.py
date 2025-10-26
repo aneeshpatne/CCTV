@@ -82,58 +82,71 @@ last_frame_time = 0.0
 
 
 def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
-    """Start FFmpeg process for recording and optional RTSP streaming."""
+    """Start FFmpeg: segments to disk + (optional) RTSP publish via MediaMTX.
+       - Recording is resilient even if RTSP flaps (tee:onfail=ignore).
+       - Uses UDP for RTSP to reduce latency.
+       - Writes stderr to ffmpeg.log for debugging.
+    """
     os.makedirs(BASE_DIR, exist_ok=True)
     out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
-    
+
+    # ---- Build tee destinations ------------------------------------------------
+    # Recording leg: mp4 segmenter with timestamped filenames
+    seg_opts = (
+        f"f=segment:"
+        f"segment_time={SEGMENT_SECONDS}:"
+        f"reset_timestamps=1:"
+        f"strftime=1:"
+        f"segment_time_delta=0.05:"
+        f"movflags=+faststart"
+    )
+    record_dest = f"[{seg_opts}]{out_pattern}"
+
+    # Optional RTSP leg (UDP, ignore failures so process doesn't exit)
+    tee_dests = record_dest
+    if ENABLE_RTSP:
+        rtsp_opts = "f=rtsp:rtsp_transport=udp:onfail=ignore"
+        rtsp_dest = f"[{rtsp_opts}]{RTSP_OUT}"
+        tee_dests = record_dest + "|" + rtsp_dest
+
+    # ---- FFmpeg command --------------------------------------------------------
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
-        "-f", "rawvideo", "-pix_fmt", "bgr24", 
-        "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
-        
-        # Output 1: HIGH QUALITY for local recording
+
+        # raw frames over stdin
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-fflags", "+genpts",     # generate continuous PTS for pipe input
+        "-i", "-",
+
+        # single encode shared by both tee legs
+        "-an",
         "-vf", "format=yuv420p",
         "-c:v", "libx264",
         "-preset", "medium",
-        "-crf", "20",              # High quality (18-23 range)
-        "-g", str(int(fps)),
+        "-crf", "20",             # quality for recording leg (18–23 typical)
+        "-g", str(int(fps)),      # 1-second GOP (helps cutting/latency)
         "-bf", "2",
-        "-f", "segment",
-        "-segment_time", str(SEGMENT_SECONDS),
-        "-segment_format", "mp4",
-        "-segment_format_options", "movflags=+faststart",
-        "-reset_timestamps", "1",
-        "-strftime", "1",
-        out_pattern,
+
+        # split to recording + (optional) rtsp; RTSP failures won't kill process
+        "-f", "tee",
+        tee_dests,
     ]
-    
-    # Add RTSP output if enabled
-    if ENABLE_RTSP:
-        cmd.extend([
-            # Output 2: LOWER QUALITY/BITRATE for RTSP streaming
-            "-vf", "format=yuv420p",
-            "-c:v", "libx264",
-            "-preset", "veryfast",     # Faster encoding
-            "-tune", "zerolatency",    # Low latency for streaming
-            "-b:v", "1.5M",            # Lower bitrate
-            "-maxrate", "1.5M",
-            "-bufsize", "3M",
-            "-g", str(int(fps)),
-            "-bf", "0",                # No B-frames for low latency
-            "-sc_threshold", "0",
-            "-f", "rtsp",
-            "-rtsp_transport", "tcp",
-            RTSP_OUT
-        ])
-    
+
+    # ---- Spawn process with logging -------------------------------------------
     try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, 
-                               stdout=subprocess.DEVNULL, 
-                               stderr=subprocess.DEVNULL, 
-                               bufsize=0)
+        log_path = os.path.join(BASE_DIR, "ffmpeg.log")
+        logf = open(log_path, "ab", buffering=0)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=logf,          # keep stderr for diagnostics
+            bufsize=0
+        )
         print(f"FFmpeg recording started: {BASE_DIR}")
         if ENABLE_RTSP:
-            print(f"RTSP streaming to: {RTSP_OUT}")
+            print(f"RTSP streaming to: {RTSP_OUT} (UDP)")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg: {e}")
