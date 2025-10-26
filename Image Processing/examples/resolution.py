@@ -135,7 +135,7 @@ def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen
             "-bf", "0",               # NO B-frames for WebRTC
             "-sc_threshold", "0",
             "-f", "rtsp",
-            "-rtsp_transport", "udp",
+            "-rtsp_transport", "tcp",  # TCP is more resilient; MediaMTX/WebRTC friendly
             RTSP_OUT
         ]
     else:
@@ -206,56 +206,62 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
 def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
     """Write frame to FFmpeg, with rate limiting and restart on error."""
     global ffmpeg_proc, last_frame_time, expected_frame_size
-    
+
     if not ENABLE_RECORDING:
         return True
-    
+
     with ffmpeg_lock:
         h, w = frame.shape[:2]
-        
-        # Check if FFmpeg process is still alive
+        new_size = (w, h)
+
+        # Has FFmpeg exited? If so, restart.
         if ffmpeg_proc is not None and ffmpeg_proc.poll() is not None:
-            # Process has died, restart it
-            print(f"FFmpeg process died (exit code: {ffmpeg_proc.poll()}), restarting...")
+            exit_code = ffmpeg_proc.poll()
+            print(f"FFmpeg process exited (code {exit_code}); restarting...")
             stop_ffmpeg(ffmpeg_proc)
             ffmpeg_proc = None
-        
-        # Initialize FFmpeg if needed
+
+        # Detect resolution changes; restart encoder if needed so RTP/MP4 stay consistent.
+        if expected_frame_size is None:
+            expected_frame_size = new_size
+        elif new_size != expected_frame_size:
+            print(
+                f"Frame size changed from {expected_frame_size[0]}x{expected_frame_size[1]} to {w}x{h}; "
+                "restarting FFmpeg."
+            )
+            if ffmpeg_proc is not None:
+                stop_ffmpeg(ffmpeg_proc)
+                ffmpeg_proc = None
+            expected_frame_size = new_size
+
+        # Start FFmpeg if we don't have a running process
         if ffmpeg_proc is None:
-            ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
+            ffmpeg_proc = start_ffmpeg(expected_frame_size[0], expected_frame_size[1], RECORD_FPS)
             if ffmpeg_proc is None:
                 return False
-            expected_frame_size = (w, h)
-        
-        # Check if frame size matches what FFmpeg expects
-        if expected_frame_size and (w, h) != expected_frame_size:
-            # Resize frame to match expected size
+
+        # If the current frame size still differs (extreme edge case), resize to expected size.
+        if (w, h) != expected_frame_size:
             frame = cv2.resize(frame, expected_frame_size)
-        
+
         # Rate limit to target FPS
         now = time.time()
         if last_frame_time > 0:
             elapsed = now - last_frame_time
             target_interval = 1.0 / RECORD_FPS
             if elapsed < target_interval:
-                sleep_time = target_interval - elapsed
-                time.sleep(sleep_time)
+                time.sleep(target_interval - elapsed)
         last_frame_time = time.time()
-        
-        # Write frame
+
+        # Write frame to FFmpeg stdin
         try:
             if ffmpeg_proc.stdin:
                 ffmpeg_proc.stdin.write(frame.tobytes())
             return True
         except (BrokenPipeError, IOError) as e:
-            print(f"FFmpeg write error: {e}, restarting...")
+            print(f"FFmpeg write error: {e}; restarting...")
             stop_ffmpeg(ffmpeg_proc)
-            # Restart with same expected size
-            if expected_frame_size:
-                ffmpeg_proc = start_ffmpeg(expected_frame_size[0], expected_frame_size[1], RECORD_FPS)
-            else:
-                ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
-                expected_frame_size = (w, h)
+            ffmpeg_proc = start_ffmpeg(expected_frame_size[0], expected_frame_size[1], RECORD_FPS)
             return ffmpeg_proc is not None
 
 
@@ -340,6 +346,24 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
     return frame
 
 
+def record_no_signal_frame(message: str) -> None:
+    """Show (if requested) and record a no-signal frame sized for the encoder."""
+    display_frame = show_no_signal_frame(message)
+
+    if not ENABLE_RECORDING:
+        return
+
+    if expected_frame_size:
+        frame_for_record = get_no_signal_frame_for_size(
+            expected_frame_size[0], expected_frame_size[1], message
+        )
+    else:
+        frame_for_record = display_frame
+
+    if frame_for_record is not None:
+        write_frame_to_ffmpeg(frame_for_record)
+
+
 def _open_capture_thread():
     """Open capture in background thread."""
     try:
@@ -387,7 +411,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
-    global ffmpeg_proc
+    global ffmpeg_proc, expected_frame_size
     attempt = 0
     cap = None
 
@@ -432,9 +456,7 @@ def main() -> None:
                     cap = None
                 
                 # Show and record "no signal" frame during initialization
-                no_signal_frame = show_no_signal_frame("Initializing camera...")
-                if ENABLE_RECORDING and no_signal_frame is not None:
-                    write_frame_to_ffmpeg(no_signal_frame)
+                record_no_signal_frame("Initializing camera...")
                 
                 time.sleep(0.05)
                 continue
@@ -444,9 +466,7 @@ def main() -> None:
                     cap.release()
                 
                 # Show and record "no signal" frame during connection attempts
-                no_signal_frame = show_no_signal_frame(f"Connecting (attempt {attempt + 1})...")
-                if ENABLE_RECORDING and no_signal_frame is not None:
-                    write_frame_to_ffmpeg(no_signal_frame)
+                record_no_signal_frame(f"Connecting (attempt {attempt + 1})...")
                 
                 cap = open_capture_with_timeout()
                 if cap is None or not cap.isOpened():
@@ -477,9 +497,7 @@ def main() -> None:
                 start_startup(force=True)
                 
                 # Show and record "no signal" frame
-                no_signal_frame = show_no_signal_frame("Signal lost - restarting...")
-                if ENABLE_RECORDING and no_signal_frame is not None:
-                    write_frame_to_ffmpeg(no_signal_frame)
+                record_no_signal_frame("Signal lost - restarting...")
                 
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
@@ -555,6 +573,7 @@ def main() -> None:
             with ffmpeg_lock:
                 stop_ffmpeg(ffmpeg_proc)
                 ffmpeg_proc = None
+                expected_frame_size = None
         cv2.destroyAllWindows()
         print("Cleanup complete.")
 
