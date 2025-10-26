@@ -10,7 +10,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 # Output
 BASE_DIR = "/srv/cctv/esp_cam1"
-SEGMENT_SECONDS = 600                  
+SEGMENT_SECONDS = 300                  
 BITRATE = "4M"                        
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"  
 

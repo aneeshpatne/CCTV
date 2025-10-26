@@ -14,6 +14,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 import threading
 import time
 import signal
+import subprocess
 from datetime import datetime
 from typing import Optional
 
@@ -31,6 +32,18 @@ NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'no_signal.png')
 FRAME_RETRY_DELAY = 0.5
 FRAME_READ_TIMEOUT = 5.0  # seconds
 CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
+
+# Recording configuration
+ENABLE_RECORDING = True
+BASE_DIR = "/srv/cctv/esp_cam1"
+SEGMENT_SECONDS = 60  # 5 minutes per segment
+RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
+ENABLE_RTSP = True  # Set to True if you want RTSP streaming
+RECORD_FPS = 10  # Target FPS for recording
+
+# Display configuration
+SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
+SHOW_LOCAL_VIEW = False    # Show CV2 preview windows
 
 # Motion detection configuration
 MIN_AREA = 800
@@ -61,6 +74,126 @@ startup_lock = threading.Lock()
 # Capture opening state
 capture_result = {'cap': None, 'done': False}
 capture_lock = threading.Lock()
+
+# Recording state
+ffmpeg_proc = None
+ffmpeg_lock = threading.Lock()
+last_frame_time = 0.0
+
+
+def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
+    """Start FFmpeg process for recording and optional RTSP streaming."""
+    os.makedirs(BASE_DIR, exist_ok=True)
+    out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
+    
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-y",
+        "-f", "rawvideo", "-pix_fmt", "bgr24", 
+        "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+        
+        # Output 1: HIGH QUALITY for local recording
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",              # High quality (18-23 range)
+        "-g", str(int(fps)),
+        "-bf", "2",
+        "-f", "segment",
+        "-segment_time", str(SEGMENT_SECONDS),
+        "-segment_format", "mp4",
+        "-segment_format_options", "movflags=+faststart",
+        "-reset_timestamps", "1",
+        "-strftime", "1",
+        out_pattern,
+    ]
+    
+    # Add RTSP output if enabled
+    if ENABLE_RTSP:
+        cmd.extend([
+            # Output 2: LOWER QUALITY/BITRATE for RTSP streaming
+            "-vf", "format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "veryfast",     # Faster encoding
+            "-tune", "zerolatency",    # Low latency for streaming
+            "-b:v", "1.5M",            # Lower bitrate
+            "-maxrate", "1.5M",
+            "-bufsize", "3M",
+            "-g", str(int(fps)),
+            "-bf", "0",                # No B-frames for low latency
+            "-sc_threshold", "0",
+            "-f", "rtsp",
+            "-rtsp_transport", "tcp",
+            RTSP_OUT
+        ])
+    
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, 
+                               stdout=subprocess.DEVNULL, 
+                               stderr=subprocess.DEVNULL, 
+                               bufsize=0)
+        print(f"FFmpeg recording started: {BASE_DIR}")
+        if ENABLE_RTSP:
+            print(f"RTSP streaming to: {RTSP_OUT}")
+        return proc
+    except Exception as e:
+        print(f"Failed to start FFmpeg: {e}")
+        return None
+
+
+def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
+    """Stop FFmpeg process gracefully."""
+    if proc is None:
+        return
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait(timeout=3)
+        print("FFmpeg recording stopped")
+    except Exception as e:
+        print(f"Error stopping FFmpeg: {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
+    """Write frame to FFmpeg, with rate limiting and restart on error."""
+    global ffmpeg_proc, last_frame_time
+    
+    if not ENABLE_RECORDING:
+        return True
+    
+    with ffmpeg_lock:
+        # Initialize FFmpeg if needed
+        if ffmpeg_proc is None:
+            h, w = frame.shape[:2]
+            ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
+            if ffmpeg_proc is None:
+                return False
+        
+        # Rate limit to target FPS
+        now = time.time()
+        if last_frame_time > 0:
+            elapsed = now - last_frame_time
+            target_interval = 1.0 / RECORD_FPS
+            if elapsed < target_interval:
+                sleep_time = target_interval - elapsed
+                time.sleep(sleep_time)
+        last_frame_time = time.time()
+        
+        # Write frame
+        try:
+            if ffmpeg_proc.stdin:
+                ffmpeg_proc.stdin.write(frame.tobytes())
+            return True
+        except (BrokenPipeError, IOError) as e:
+            print(f"FFmpeg write error: {e}, restarting...")
+            stop_ffmpeg(ffmpeg_proc)
+            h, w = frame.shape[:2]
+            ffmpeg_proc = start_ffmpeg(w, h, RECORD_FPS)
+            return ffmpeg_proc is not None
+
 
 
 def start_startup(force: bool = False) -> None:
@@ -94,6 +227,8 @@ def backoff(attempt: int) -> float:
 
 
 def show_placeholder(message: str) -> None:
+    if not SHOW_LOCAL_VIEW:
+        return  # Don't show placeholder if local view is disabled
     base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
     frame = base.copy()
     ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %p")
@@ -151,6 +286,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
+    global ffmpeg_proc
     attempt = 0
     cap = None
 
@@ -169,14 +305,25 @@ def main() -> None:
     signal.signal(signal.SIGALRM, _timeout_handler)
 
     print("Starting camera initialization in background...")
+    if ENABLE_RECORDING:
+        print(f"Recording enabled: {BASE_DIR}")
+        print(f"Segment duration: {SEGMENT_SECONDS}s, FPS: {RECORD_FPS}")
+    if not SHOW_LOCAL_VIEW:
+        print("Local view disabled - running in headless mode")
+        print("Press Ctrl+C to stop")
     start_startup(force=True)
     show_placeholder("Initializing camera...")
     cv2.waitKey(1)
 
     try:
         while True:
-            if cv2.waitKey(1) == ord('q'):
-                break
+            # Only check for 'q' key if showing local view
+            if SHOW_LOCAL_VIEW:
+                if cv2.waitKey(1) == ord('q'):
+                    break
+            else:
+                # Small sleep to prevent tight loop when not showing view
+                time.sleep(0.01)
 
             if not startup_complete.is_set():
                 if cap is not None:
@@ -241,12 +388,14 @@ def main() -> None:
                 if area < MIN_AREA:
                     continue
                 motion_detected = True
-                x, y, w, h = cv2.boundingRect(c)
-                cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                cx, cy = x + w // 2, y + h // 2
-                cv2.circle(disp, (cx, cy), 3, (0, 255, 255), -1)
-                cv2.putText(disp, f"motion {area:.0f}", (x, max(0, y - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                # Only draw motion boxes if flag is enabled
+                if SHOW_MOTION_BOXES:
+                    x, y, w, h = cv2.boundingRect(c)
+                    cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                    cx, cy = x + w // 2, y + h // 2
+                    cv2.circle(disp, (cx, cy), 3, (0, 255, 255), -1)
+                    cv2.putText(disp, f"motion {area:.0f}", (x, max(0, y - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
             # Drive non-blocking blinker on motion
             if motion_detected and not blinker.is_active:
@@ -259,14 +408,31 @@ def main() -> None:
             cv2.putText(disp, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.9, (0, 255, 0), 2, cv2.LINE_AA)
 
-            # Display
-            cv2.imshow("frame", disp)
-            cv2.imshow("ROI mask", roi_mask)
+            # Draw ROI polygon on display only if flag is enabled
+            if SHOW_MOTION_BOXES:
+                cv2.polylines(disp, [ROI_PTS], isClosed=True, color=(0, 255, 255), 
+                             thickness=1, lineType=cv2.LINE_AA)
+
+            # Record frame with overlay (IN-PLACE recording with motion detection)
+            if ENABLE_RECORDING:
+                write_frame_to_ffmpeg(disp)
+
+            # Display only if flag is enabled
+            if SHOW_LOCAL_VIEW:
+                cv2.imshow("frame", disp)
+                cv2.imshow("ROI mask", roi_mask)
 
     finally:
+        # Cleanup
+        print("\nShutting down...")
         if cap is not None:
             cap.release()
+        if ffmpeg_proc is not None:
+            with ffmpeg_lock:
+                stop_ffmpeg(ffmpeg_proc)
+                ffmpeg_proc = None
         cv2.destroyAllWindows()
+        print("Cleanup complete.")
 
 
 if __name__ == "__main__":
