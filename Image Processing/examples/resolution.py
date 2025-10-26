@@ -252,6 +252,23 @@ def show_placeholder(message: str) -> None:
     cv2.imshow("frame", frame)
 
 
+def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
+    """Create and optionally display a no-signal frame. Always returns the frame for recording."""
+    base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
+    frame = base.copy()
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 165, 255), 2, cv2.LINE_AA)
+    
+    # Show in window if enabled
+    if SHOW_LOCAL_VIEW:
+        cv2.imshow("frame", frame)
+    
+    return frame
+
+
 def _open_capture_thread():
     """Open capture in background thread."""
     try:
@@ -342,14 +359,24 @@ def main() -> None:
                 if cap is not None:
                     cap.release()
                     cap = None
-                show_placeholder("Initializing camera...")
+                
+                # Show and record "no signal" frame during initialization
+                no_signal_frame = show_no_signal_frame("Initializing camera...")
+                if ENABLE_RECORDING and no_signal_frame is not None:
+                    write_frame_to_ffmpeg(no_signal_frame)
+                
                 time.sleep(0.05)
                 continue
 
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
-                show_placeholder(f"Connecting (attempt {attempt + 1})...")
+                
+                # Show and record "no signal" frame during connection attempts
+                no_signal_frame = show_no_signal_frame(f"Connecting (attempt {attempt + 1})...")
+                if ENABLE_RECORDING and no_signal_frame is not None:
+                    write_frame_to_ffmpeg(no_signal_frame)
+                
                 cap = open_capture_with_timeout()
                 if cap is None or not cap.isOpened():
                     print(f"Failed to open stream on attempt {attempt + 1}")
@@ -377,7 +404,12 @@ def main() -> None:
                 cap.release()
                 cap = None
                 start_startup(force=True)
-                show_placeholder("Signal lost - restarting...")
+                
+                # Show and record "no signal" frame
+                no_signal_frame = show_no_signal_frame("Signal lost - restarting...")
+                if ENABLE_RECORDING and no_signal_frame is not None:
+                    write_frame_to_ffmpeg(no_signal_frame)
+                
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
 
@@ -413,7 +445,15 @@ def main() -> None:
             # Drive non-blocking blinker on motion
             if motion_detected and not blinker.is_active:
                 blinker.start(duration=1)
-            blinker.update()
+            
+            # Update blinker, but catch errors if camera is not responding
+            try:
+                blinker.update()
+            except Exception as e:
+                # Camera might be having issues - trigger startup in background
+                # but let the frame reading logic handle the actual reconnect
+                print(f"Warning: Blinker update failed (camera may be crashed): {e}")
+                start_startup(force=True)
 
             # Timestamp and motion label
             ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
