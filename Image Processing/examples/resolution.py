@@ -84,56 +84,87 @@ expected_frame_size = None  # (width, height) that FFmpeg expects
 
 def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
     """Start FFmpeg: segments to disk + (optional) RTSP publish via MediaMTX.
-       - Recording is resilient even if RTSP flaps (tee:onfail=ignore).
+       - Recording uses B-frames for better compression
+       - RTSP/WebRTC uses baseline profile without B-frames for compatibility
        - Uses UDP for RTSP to reduce latency.
        - Writes stderr to ffmpeg.log for debugging.
     """
     os.makedirs(BASE_DIR, exist_ok=True)
     out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
 
-    # ---- Build tee destinations ------------------------------------------------
-    # Recording leg: mp4 segmenter with timestamped filenames
-    seg_opts = (
-        f"f=segment:"
-        f"segment_time={SEGMENT_SECONDS}:"
-        f"reset_timestamps=1:"
-        f"strftime=1:"
-        f"segment_time_delta=0.05:"
-        f"movflags=+faststart"
-    )
-    record_dest = f"[{seg_opts}]{out_pattern}"
-
-    # Optional RTSP leg (UDP, ignore failures so process doesn't exit)
-    tee_dests = record_dest
-    if ENABLE_RTSP:
-        rtsp_opts = "f=rtsp:rtsp_transport=udp:onfail=ignore"
-        rtsp_dest = f"[{rtsp_opts}]{RTSP_OUT}"
-        tee_dests = record_dest + "|" + rtsp_dest
-
     # ---- FFmpeg command --------------------------------------------------------
-    cmd = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-y",
+    if ENABLE_RTSP:
+        # Dual output: high-quality recording + WebRTC-compatible RTSP
+        cmd = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
-        # raw frames over stdin
-        "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", str(fps),
-        "-fflags", "+genpts",     # generate continuous PTS for pipe input
-        "-i", "-",
+            # raw frames over stdin
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps),
+            "-fflags", "+genpts",
+            "-i", "-",
 
-        # single encode shared by both tee legs
-        "-an",
-        "-map", "0:v",            # map video stream to output
-        "-vf", "format=yuv420p",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "20",             # quality for recording leg (18–23 typical)
-        "-g", str(int(fps)),      # 1-second GOP (helps cutting/latency)
-        "-bf", "2",
+            # Output 1: HIGH QUALITY recording with B-frames
+            "-map", "0:v",
+            "-vf", "format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "20",
+            "-g", str(int(fps)),
+            "-bf", "2",              # B-frames OK for recording
+            "-f", "segment",
+            "-segment_time", str(SEGMENT_SECONDS),
+            "-segment_format", "mp4",
+            "-segment_format_options", "movflags=+faststart",
+            "-reset_timestamps", "1",
+            "-strftime", "1",
+            out_pattern,
 
-        # split to recording + (optional) rtsp; RTSP failures won't kill process
-        "-f", "tee",
-        tee_dests,
-    ]
+            # Output 2: WebRTC-compatible RTSP (no B-frames, baseline profile)
+            "-map", "0:v",
+            "-vf", "format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",  # baseline = no B-frames
+            "-level", "3.1",
+            "-b:v", "1.5M",
+            "-maxrate", "1.5M",
+            "-bufsize", "3M",
+            "-g", str(int(fps)),
+            "-bf", "0",               # NO B-frames for WebRTC
+            "-sc_threshold", "0",
+            "-f", "rtsp",
+            "-rtsp_transport", "udp",
+            RTSP_OUT
+        ]
+    else:
+        # Recording only
+        cmd = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-y",
+
+            # raw frames over stdin
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps),
+            "-fflags", "+genpts",
+            "-i", "-",
+
+            # High quality recording
+            "-map", "0:v",
+            "-vf", "format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "20",
+            "-g", str(int(fps)),
+            "-bf", "2",
+            "-f", "segment",
+            "-segment_time", str(SEGMENT_SECONDS),
+            "-segment_format", "mp4",
+            "-segment_format_options", "movflags=+faststart",
+            "-reset_timestamps", "1",
+            "-strftime", "1",
+            out_pattern,
+        ]
 
     # ---- Spawn process with logging -------------------------------------------
     try:
