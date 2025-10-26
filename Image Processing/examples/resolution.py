@@ -76,99 +76,46 @@ capture_result = {'cap': None, 'done': False}
 capture_lock = threading.Lock()
 
 # Recording state
-ffmpeg_proc = None
+ffmpeg_record_proc: Optional[subprocess.Popen] = None
+ffmpeg_rtsp_proc: Optional[subprocess.Popen] = None
 ffmpeg_lock = threading.Lock()
 last_frame_time = 0.0
-expected_frame_size = None  # (width, height) that FFmpeg expects
+expected_frame_size: Optional[tuple[int, int]] = None  # (width, height) that FFmpeg expects
 
 
-def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
-    """Start FFmpeg: segments to disk + (optional) RTSP publish via MediaMTX.
-       - Recording uses B-frames for better compression
-       - RTSP/WebRTC uses baseline profile without B-frames for compatibility
-       - Uses UDP for RTSP to reduce latency.
-       - Writes stderr to ffmpeg.log for debugging.
-    """
+def start_ffmpeg_record(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
+    """Start FFmpeg process responsible for local segmented recording."""
     os.makedirs(BASE_DIR, exist_ok=True)
     out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
 
-    # ---- FFmpeg command --------------------------------------------------------
-    if ENABLE_RTSP:
-        # Dual output: high-quality recording + WebRTC-compatible RTSP
-        cmd = [
-            "ffmpeg", "-nostdin", "-hide_banner", "-y",
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
-            # raw frames over stdin
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-fflags", "+genpts",
-            "-i", "-",
+        # raw frames over stdin
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-fflags", "+genpts",
+        "-i", "-",
 
-            # Output 1: HIGH QUALITY recording with B-frames
-            "-map", "0:v",
-            "-vf", "format=yuv420p",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "20",
-            "-g", str(int(fps)),
-            "-bf", "2",              # B-frames OK for recording
-            "-f", "segment",
-            "-segment_time", str(SEGMENT_SECONDS),
-            "-segment_format", "mp4",
-            "-segment_format_options", "movflags=+faststart",
-            "-reset_timestamps", "1",
-            "-strftime", "1",
-            out_pattern,
-
-            # Output 2: WebRTC-compatible RTSP (no B-frames, baseline profile)
-            "-map", "0:v",
-            "-vf", "format=yuv420p",
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            "-profile:v", "baseline",  # baseline = no B-frames
-            "-level", "3.1",
-            "-b:v", "1.5M",
-            "-maxrate", "1.5M",
-            "-bufsize", "3M",
-            "-g", str(int(fps)),
-            "-bf", "0",               # NO B-frames for WebRTC
-            "-sc_threshold", "0",
-            "-f", "rtsp",
-            "-rtsp_transport", "tcp",  # TCP is more resilient; MediaMTX/WebRTC friendly
-            RTSP_OUT
-        ]
-    else:
-        # Recording only
-        cmd = [
-            "ffmpeg", "-nostdin", "-hide_banner", "-y",
-
-            # raw frames over stdin
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-fflags", "+genpts",
-            "-i", "-",
-
-            # High quality recording
-            "-map", "0:v",
-            "-vf", "format=yuv420p",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "20",
-            "-g", str(int(fps)),
-            "-bf", "2",
-            "-f", "segment",
-            "-segment_time", str(SEGMENT_SECONDS),
-            "-segment_format", "mp4",
-            "-segment_format_options", "movflags=+faststart",
-            "-reset_timestamps", "1",
-            "-strftime", "1",
-            out_pattern,
-        ]
+        "-map", "0:v",
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "20",
+        "-g", str(int(fps)),
+        "-bf", "2",
+        "-f", "segment",
+        "-segment_time", str(SEGMENT_SECONDS),
+        "-segment_format", "mp4",
+        "-segment_format_options", "movflags=+faststart",
+        "-reset_timestamps", "1",
+        "-strftime", "1",
+        out_pattern,
+    ]
 
     # ---- Spawn process with logging -------------------------------------------
     try:
-        log_path = os.path.join(BASE_DIR, "ffmpeg.log")
+        log_path = os.path.join(BASE_DIR, "ffmpeg_record.log")
         logf = open(log_path, "ab", buffering=0)
         proc = subprocess.Popen(
             cmd,
@@ -177,12 +124,55 @@ def start_ffmpeg(width: int, height: int, fps: int) -> Optional[subprocess.Popen
             stderr=logf,          # keep stderr for diagnostics
             bufsize=0
         )
-        print(f"FFmpeg recording started: {BASE_DIR}")
-        if ENABLE_RTSP:
-            print(f"RTSP streaming to: {RTSP_OUT} (UDP)")
+        print(f"FFmpeg recording started: {out_pattern}")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg: {e}")
+        return None
+
+
+def start_ffmpeg_rtsp(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
+    """Start FFmpeg process responsible for RTSP/WebRTC restream."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-y",
+
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}", "-r", str(fps),
+        "-fflags", "+genpts",
+        "-i", "-",
+
+        "-map", "0:v",
+        "-vf", "format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-tune", "zerolatency",
+        "-profile:v", "baseline",
+        "-level", "3.1",
+        "-b:v", "1.5M",
+        "-maxrate", "1.5M",
+        "-bufsize", "3M",
+        "-g", str(int(fps)),
+        "-bf", "0",
+        "-sc_threshold", "0",
+        "-rtsp_transport", "tcp",
+        "-f", "rtsp",
+        RTSP_OUT,
+    ]
+
+    try:
+        log_path = os.path.join(BASE_DIR, "ffmpeg_rtsp.log")
+        logf = open(log_path, "ab", buffering=0)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=logf,
+            bufsize=0
+        )
+        print(f"FFmpeg RTSP started: {RTSP_OUT}")
+        return proc
+    except Exception as e:
+        print(f"Failed to start FFmpeg RTSP: {e}")
         return None
 
 
@@ -204,47 +194,59 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
 
 
 def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
-    """Write frame to FFmpeg, with rate limiting and restart on error."""
-    global ffmpeg_proc, last_frame_time, expected_frame_size
+    """Push a frame into the recording/RTSP FFmpeg pipelines, restarting them when needed."""
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, last_frame_time, expected_frame_size
 
-    if not ENABLE_RECORDING:
+    if not ENABLE_RECORDING and not ENABLE_RTSP:
         return True
 
     with ffmpeg_lock:
         h, w = frame.shape[:2]
         new_size = (w, h)
 
-        # Has FFmpeg exited? If so, restart.
-        if ffmpeg_proc is not None and ffmpeg_proc.poll() is not None:
-            exit_code = ffmpeg_proc.poll()
-            print(f"FFmpeg process exited (code {exit_code}); restarting...")
-            stop_ffmpeg(ffmpeg_proc)
-            ffmpeg_proc = None
-
-        # Detect resolution changes; restart encoder if needed so RTP/MP4 stay consistent.
+        # Track the canonical size expected by the encoders
         if expected_frame_size is None:
             expected_frame_size = new_size
         elif new_size != expected_frame_size:
             print(
                 f"Frame size changed from {expected_frame_size[0]}x{expected_frame_size[1]} to {w}x{h}; "
-                "restarting FFmpeg."
+                "restarting FFmpeg pipelines."
             )
-            if ffmpeg_proc is not None:
-                stop_ffmpeg(ffmpeg_proc)
-                ffmpeg_proc = None
+            if ffmpeg_record_proc is not None:
+                stop_ffmpeg(ffmpeg_record_proc)
+                ffmpeg_record_proc = None
+            if ffmpeg_rtsp_proc is not None:
+                stop_ffmpeg(ffmpeg_rtsp_proc)
+                ffmpeg_rtsp_proc = None
             expected_frame_size = new_size
 
-        # Start FFmpeg if we don't have a running process
-        if ffmpeg_proc is None:
-            ffmpeg_proc = start_ffmpeg(expected_frame_size[0], expected_frame_size[1], RECORD_FPS)
-            if ffmpeg_proc is None:
-                return False
+        target_width, target_height = expected_frame_size
 
-        # If the current frame size still differs (extreme edge case), resize to expected size.
+        # Ensure recording process is alive when recording enabled
+        if ENABLE_RECORDING:
+            if ffmpeg_record_proc is not None and ffmpeg_record_proc.poll() is not None:
+                exit_code = ffmpeg_record_proc.poll()
+                print(f"Recording FFmpeg exited (code {exit_code}); restarting...")
+                stop_ffmpeg(ffmpeg_record_proc)
+                ffmpeg_record_proc = None
+            if ffmpeg_record_proc is None:
+                ffmpeg_record_proc = start_ffmpeg_record(target_width, target_height, RECORD_FPS)
+
+        # Ensure RTSP process is alive when enabled
+        if ENABLE_RTSP:
+            if ffmpeg_rtsp_proc is not None and ffmpeg_rtsp_proc.poll() is not None:
+                exit_code = ffmpeg_rtsp_proc.poll()
+                print(f"RTSP FFmpeg exited (code {exit_code}); restarting...")
+                stop_ffmpeg(ffmpeg_rtsp_proc)
+                ffmpeg_rtsp_proc = None
+            if ffmpeg_rtsp_proc is None:
+                ffmpeg_rtsp_proc = start_ffmpeg_rtsp(target_width, target_height, RECORD_FPS)
+
+        # If the current frame size differs from the expected size, resize once for both outputs
         if (w, h) != expected_frame_size:
             frame = cv2.resize(frame, expected_frame_size)
 
-        # Rate limit to target FPS
+        # Rate limit to target FPS (shared across both pipes)
         now = time.time()
         if last_frame_time > 0:
             elapsed = now - last_frame_time
@@ -253,16 +255,27 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 time.sleep(target_interval - elapsed)
         last_frame_time = time.time()
 
-        # Write frame to FFmpeg stdin
-        try:
-            if ffmpeg_proc.stdin:
-                ffmpeg_proc.stdin.write(frame.tobytes())
-            return True
-        except (BrokenPipeError, IOError) as e:
-            print(f"FFmpeg write error: {e}; restarting...")
-            stop_ffmpeg(ffmpeg_proc)
-            ffmpeg_proc = start_ffmpeg(expected_frame_size[0], expected_frame_size[1], RECORD_FPS)
-            return ffmpeg_proc is not None
+        frame_bytes = frame.tobytes()
+
+        def _write(proc: Optional[subprocess.Popen], label: str,
+                   starter) -> Optional[subprocess.Popen]:
+            if proc is None:
+                return None
+            try:
+                if proc.stdin:
+                    proc.stdin.write(frame_bytes)
+            except (BrokenPipeError, IOError) as err:
+                print(f"FFmpeg {label} pipe error ({err}); restarting...")
+                stop_ffmpeg(proc)
+                return starter(target_width, target_height, RECORD_FPS)
+            return proc
+
+        if ENABLE_RECORDING:
+            ffmpeg_record_proc = _write(ffmpeg_record_proc, "recording", start_ffmpeg_record)
+        if ENABLE_RTSP:
+            ffmpeg_rtsp_proc = _write(ffmpeg_rtsp_proc, "rtsp", start_ffmpeg_rtsp)
+
+        return True
 
 
 
@@ -411,7 +424,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
-    global ffmpeg_proc, expected_frame_size
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size
     attempt = 0
     cap = None
 
@@ -569,11 +582,14 @@ def main() -> None:
         print("\nShutting down...")
         if cap is not None:
             cap.release()
-        if ffmpeg_proc is not None:
-            with ffmpeg_lock:
-                stop_ffmpeg(ffmpeg_proc)
-                ffmpeg_proc = None
-                expected_frame_size = None
+        with ffmpeg_lock:
+            if ffmpeg_record_proc is not None:
+                stop_ffmpeg(ffmpeg_record_proc)
+                ffmpeg_record_proc = None
+            if ffmpeg_rtsp_proc is not None:
+                stop_ffmpeg(ffmpeg_rtsp_proc)
+                ffmpeg_rtsp_proc = None
+            expected_frame_size = None
         cv2.destroyAllWindows()
         print("Cleanup complete.")
 
