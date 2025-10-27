@@ -51,6 +51,11 @@ def startup():
             cam_stat = check_mjpeg_stream()[0]
             if cam_stat == False or stat == None or int(stat) != i + 1:
                 logger.warning("Resolution Change Failed")
+                try:
+                    logger.info("Resetting camera clock to 15 after failure")
+                    change_clock(15)
+                except RequestException as err:
+                    logger.warning(f"Setting camera clock failed: {err}")
                 i = 10
                 time.sleep(5)
                 continue
