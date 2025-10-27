@@ -30,13 +30,8 @@ def startup():
             continue
         i = 1
         logger.info("Camera Initiated")
-        try:
-            logger.info("Setting camera clock to 15")
-            change_clock(15)
-        except RequestException as err:
-            logger.warning(f"Setting camera clock failed: {err}")
         logger.info(f"Initial Quality: {stat}")
-        i = max(int(stat), 10) 
+        i = max(int(stat), 10)
         while i < 12:
             logger.info(f"Current Resolution: {i}")
             logger.info(f"Attempting to set Current Resolution to: {i + 1}")
@@ -51,16 +46,17 @@ def startup():
             cam_stat = check_mjpeg_stream()[0]
             if cam_stat == False or stat == None or int(stat) != i + 1:
                 logger.warning("Resolution Change Failed")
-                try:
-                    logger.info("Resetting camera clock to 15 after failure")
-                    change_clock(15)
-                except RequestException as err:
-                    logger.warning(f"Setting camera clock failed: {err}")
                 i = 10
                 time.sleep(5)
                 continue
             i += 1
+        time.sleep(5)
         logger.info(f"Resolution Set Successfully to {i}")
+        try:
+            logger.info("Setting camera clock to 15")
+            change_clock(15)
+        except RequestException as err:
+            logger.warning(f"Setting camera clock failed: {err}")
         break
 
 
