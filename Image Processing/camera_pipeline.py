@@ -96,7 +96,7 @@ def apply_cctv_overlay(base_frame: np.ndarray, message: str) -> np.ndarray:
     timestamp = datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
     header_text = f"{CAMERA_LABEL}  {timestamp}"
     cv2.putText(frame, header_text, (14, 32), cv2.FONT_HERSHEY_SIMPLEX,
-                0.8, (0, 255, 0), 2, cv2.LINE_AA)
+                0.8, (235, 235, 235), 2, cv2.LINE_AA)
 
     rec_x = max(frame.shape[1] - 120, 12)
     cv2.circle(frame, (rec_x, 30), 8, (0, 0, 255), -1)
@@ -105,7 +105,7 @@ def apply_cctv_overlay(base_frame: np.ndarray, message: str) -> np.ndarray:
 
     status_text = message.upper()
     cv2.putText(frame, status_text, (14, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (0, 165, 255), 2, cv2.LINE_AA)
+                0.7, (20, 200, 255), 2, cv2.LINE_AA)
 
     return frame
 
@@ -566,11 +566,8 @@ def main() -> None:
                 print(f"Warning: Blinker update failed (camera may be crashed): {e}")
                 start_startup(force=True)
 
-            # Timestamp and motion label
-            ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-            label = f"{ts}{' Motion Detected' if motion_detected else ''}"
-            cv2.putText(disp, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9, (0, 255, 0), 2, cv2.LINE_AA)
+            status_message = "Motion Detected" if motion_detected else "Monitoring"
+            disp = apply_cctv_overlay(disp, status_message)
 
             # Draw ROI polygon on display only if flag is enabled
             if SHOW_MOTION_BOXES:
