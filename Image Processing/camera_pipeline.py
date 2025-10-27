@@ -4,7 +4,7 @@ import sys
 # CRITICAL: Set FFMPEG options BEFORE importing cv2
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "protocol_whitelist;file,http,https,tcp|"
-    "analyzeduration;0|"     # don't spend time analyzing
+    "analyzeduration;0|"
     "probesize;32|"          # tiny probe
     "fflags;nobuffer|"       # minimize internal buffering
     "flags;low_delay|"       # lower latency
@@ -22,13 +22,13 @@ import cv2
 import numpy as np
 import pytz
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
 
 URL = "http://192.168.1.119:81/stream"
 IST = pytz.timezone('Asia/Kolkata')
-NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'no_signal.png')
+NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'examples', 'no_signal.png')
 FRAME_RETRY_DELAY = 0.5
 FRAME_READ_TIMEOUT = 5.0  # seconds
 CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
@@ -36,7 +36,7 @@ CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
 # Recording configuration
 ENABLE_RECORDING = True
 BASE_DIR = "/srv/cctv/esp_cam1"
-SEGMENT_SECONDS = 60  # 5 minutes per segment
+SEGMENT_SECONDS = 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
 RECORD_FPS = 10  # Target FPS for recording
@@ -278,7 +278,6 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         return True
 
 
-
 def start_startup(force: bool = False) -> None:
     global startup_thread
     with startup_lock:
@@ -331,11 +330,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
                 0.75, (0, 255, 0), 2, cv2.LINE_AA)
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
                 0.75, (0, 165, 255), 2, cv2.LINE_AA)
-    
+
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
         cv2.imshow("frame", frame)
-    
+
     return frame
 
 
@@ -348,14 +347,14 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
         base = np.zeros((height, width, 3), dtype=np.uint8)
         cv2.putText(base, "NO SIGNAL", (width//4, height//2), cv2.FONT_HERSHEY_SIMPLEX,
                     1.4, (0, 0, 255), 3, cv2.LINE_AA)
-    
+
     frame = base.copy()
     ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                 0.75, (0, 255, 0), 2, cv2.LINE_AA)
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
                 0.75, (0, 165, 255), 2, cv2.LINE_AA)
-    
+
     return frame
 
 
@@ -387,7 +386,7 @@ def _open_capture_thread():
             cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
         if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
             cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
-        
+
         with capture_lock:
             capture_result['cap'] = cap
             capture_result['done'] = True
@@ -401,15 +400,15 @@ def _open_capture_thread():
 def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
     """Open capture with timeout - if it takes too long, abort."""
     global capture_result
-    
+
     # Reset state
     with capture_lock:
         capture_result = {'cap': None, 'done': False}
-    
+
     # Start opening in background
     thread = threading.Thread(target=_open_capture_thread, daemon=True)
     thread.start()
-    
+
     # Wait with timeout
     start_time = time.time()
     while time.time() - start_time < CAPTURE_OPEN_TIMEOUT:
@@ -417,7 +416,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
             if capture_result['done']:
                 return capture_result['cap']
         time.sleep(0.1)
-    
+
     # Timeout - abandon the thread and return None
     print(f"Capture open timed out after {CAPTURE_OPEN_TIMEOUT}s")
     return None
@@ -467,20 +466,20 @@ def main() -> None:
                 if cap is not None:
                     cap.release()
                     cap = None
-                
+
                 # Show and record "no signal" frame during initialization
                 record_no_signal_frame("Initializing camera...")
-                
+
                 time.sleep(0.05)
                 continue
 
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
-                
+
                 # Show and record "no signal" frame during connection attempts
                 record_no_signal_frame(f"Connecting (attempt {attempt + 1})...")
-                
+
                 cap = open_capture_with_timeout()
                 if cap is None or not cap.isOpened():
                     print(f"Failed to open stream on attempt {attempt + 1}")
@@ -508,10 +507,10 @@ def main() -> None:
                 cap.release()
                 cap = None
                 start_startup(force=True)
-                
+
                 # Show and record "no signal" frame
                 record_no_signal_frame("Signal lost - restarting...")
-                
+
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
 
@@ -547,7 +546,7 @@ def main() -> None:
             # Drive non-blocking blinker on motion
             if motion_detected and not blinker.is_active:
                 blinker.start(duration=1)
-            
+
             # Update blinker, but catch errors if camera is not responding
             try:
                 blinker.update()
@@ -565,8 +564,8 @@ def main() -> None:
 
             # Draw ROI polygon on display only if flag is enabled
             if SHOW_MOTION_BOXES:
-                cv2.polylines(disp, [ROI_PTS], isClosed=True, color=(0, 255, 255), 
-                             thickness=1, lineType=cv2.LINE_AA)
+                cv2.polylines(disp, [ROI_PTS], isClosed=True, color=(0, 255, 255),
+                              thickness=1, lineType=cv2.LINE_AA)
 
             # Record frame with overlay (IN-PLACE recording with motion detection)
             if ENABLE_RECORDING:
