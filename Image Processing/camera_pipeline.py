@@ -82,33 +82,6 @@ ffmpeg_lock = threading.Lock()
 last_frame_time = 0.0
 expected_frame_size: Optional[tuple[int, int]] = None  # (width, height) that FFmpeg expects
 
-CAMERA_LABEL = "CAM 01"
-OVERLAY_BAND_HEIGHT = 90
-
-
-def apply_cctv_overlay(base_frame: np.ndarray, message: str) -> np.ndarray:
-    """Render a CCTV-style overlay with timestamp and status text."""
-    frame = base_frame.copy()
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], OVERLAY_BAND_HEIGHT), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
-
-    timestamp = datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
-    header_text = f"{CAMERA_LABEL}  {timestamp}"
-    cv2.putText(frame, header_text, (14, 32), cv2.FONT_HERSHEY_SIMPLEX,
-                0.8, (235, 235, 235), 2, cv2.LINE_AA)
-
-    rec_x = max(frame.shape[1] - 120, 12)
-    cv2.circle(frame, (rec_x, 30), 8, (0, 0, 255), -1)
-    cv2.putText(frame, "REC", (rec_x + 18, 34), cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, (0, 0, 255), 2, cv2.LINE_AA)
-
-    status_text = message.upper()
-    cv2.putText(frame, status_text, (14, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, (20, 200, 255), 2, cv2.LINE_AA)
-
-    return frame
-
 
 def start_ffmpeg_record(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
     """Start FFmpeg process responsible for local segmented recording."""
@@ -339,14 +312,24 @@ def show_placeholder(message: str) -> None:
     if not SHOW_LOCAL_VIEW:
         return  # Don't show placeholder if local view is disabled
     base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
-    frame = apply_cctv_overlay(base, message)
+    frame = base.copy()
+    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %p")
+    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 165, 255), 2, cv2.LINE_AA)
     cv2.imshow("frame", frame)
 
 
 def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     """Create and optionally display a no-signal frame. Always returns the frame for recording."""
     base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
-    frame = apply_cctv_overlay(base, message)
+    frame = base.copy()
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 165, 255), 2, cv2.LINE_AA)
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -365,7 +348,14 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
         cv2.putText(base, "NO SIGNAL", (width//4, height//2), cv2.FONT_HERSHEY_SIMPLEX,
                     1.4, (0, 0, 255), 3, cv2.LINE_AA)
 
-    return apply_cctv_overlay(base, message)
+    frame = base.copy()
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                0.75, (0, 165, 255), 2, cv2.LINE_AA)
+
+    return frame
 
 
 def record_no_signal_frame(message: str) -> None:
@@ -566,8 +556,11 @@ def main() -> None:
                 print(f"Warning: Blinker update failed (camera may be crashed): {e}")
                 start_startup(force=True)
 
-            status_message = "Motion Detected" if motion_detected else "Monitoring"
-            disp = apply_cctv_overlay(disp, status_message)
+            # Timestamp and motion label
+            ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+            label = f"{ts}{' Motion Detected' if motion_detected else ''}"
+            cv2.putText(disp, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (0, 255, 0), 2, cv2.LINE_AA)
 
             # Draw ROI polygon on display only if flag is enabled
             if SHOW_MOTION_BOXES:
