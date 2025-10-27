@@ -3,11 +3,13 @@ import os
 import logging
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import time
+from requests.exceptions import RequestException
 
 from tools.status import status
 from tools.stream_status import check_mjpeg_stream
 from tools.changeQuality import change_quality
 from tools.reset import reset
+from tools.changeClock import change_clock
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -28,6 +30,11 @@ def startup():
             continue
         i = 1
         logger.info("Camera Initiated")
+        try:
+            logger.info("Setting camera clock to 15")
+            change_clock(15)
+        except RequestException as err:
+            logger.warning(f"Setting camera clock failed: {err}")
         logger.info(f"Initial Quality: {stat}")
         i = max(int(stat), 10) 
         while i < 12:
