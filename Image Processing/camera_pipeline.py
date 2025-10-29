@@ -35,8 +35,8 @@ CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
 
 # Recording configuration
 ENABLE_RECORDING = True
-BASE_DIR = "/srv/cctv/esp_cam1"
-SEGMENT_SECONDS = 60  # 1 minute per segment
+BASE_DIR = "/media/aneesh/SSD/recordings/esp_cam1"
+SEGMENT_SECONDS = 3 * 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
 RECORD_FPS = 10  # Target FPS for recording
