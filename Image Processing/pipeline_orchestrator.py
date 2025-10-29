@@ -130,32 +130,76 @@ def restart_camera_pipeline() -> Optional[subprocess.Popen]:
     return start_camera_pipeline()
 
 
-def _delete_directory_contents(directory: Path) -> None:
-    """Remove all files and subdirectories inside the given directory."""
-    if not directory.exists():
-        return
-
-    for entry in directory.iterdir():
-        try:
-            if entry.is_dir():
-                shutil.rmtree(entry)
-            else:
-                entry.unlink()
-        except FileNotFoundError:
-            continue
-        except Exception:
-            logging.exception("[cleanup] Failed to remove %s", entry)
-            raise
-
-
 def _get_usage_percent(path: Path) -> int:
+    """Get disk usage percentage for the filesystem containing the given path."""
     usage = shutil.disk_usage(path)
     percent = int((usage.used / usage.total) * 100)
     return percent
 
 
+def _delete_oldest_files_until_threshold(directory: Path, target_percent: int) -> None:
+    """Delete oldest files in directory until disk usage drops below target_percent."""
+    if not directory.exists():
+        logging.warning("[cleanup] Directory %s does not exist", directory)
+        return
+
+    # Get all video files sorted by modification time (oldest first)
+    files = []
+    for entry in directory.rglob("*.mp4"):
+        if entry.is_file():
+            try:
+                mtime = entry.stat().st_mtime
+                size = entry.stat().st_size
+                files.append((mtime, size, entry))
+            except (FileNotFoundError, PermissionError):
+                continue
+
+    if not files:
+        logging.warning("[cleanup] No video files found to delete in %s", directory)
+        return
+
+    # Sort by modification time (oldest first)
+    files.sort(key=lambda x: x[0])
+
+    deleted_count = 0
+    deleted_size = 0
+
+    for mtime, size, file_path in files:
+        current_usage = _get_usage_percent(directory)
+        
+        if current_usage < target_percent:
+            logging.info(
+                "[cleanup] Target usage reached: %s%% < %s%%. Deleted %d files (%d MB).",
+                current_usage,
+                target_percent,
+                deleted_count,
+                deleted_size // (1024 * 1024),
+            )
+            return
+
+        try:
+            file_path.unlink()
+            deleted_count += 1
+            deleted_size += size
+            logging.info("[cleanup] Deleted old file: %s (%d MB)", file_path.name, size // (1024 * 1024))
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logging.exception("[cleanup] Failed to delete %s", file_path)
+            continue
+
+    # Final check after deleting all files
+    final_usage = _get_usage_percent(directory)
+    logging.info(
+        "[cleanup] Cleanup complete. Deleted %d files (%d MB). Final usage: %s%%",
+        deleted_count,
+        deleted_size // (1024 * 1024),
+        final_usage,
+    )
+
+
 def check_storage_and_cleanup() -> None:
-    """Ensure recording storage is below threshold; purge if necessary."""
+    """Check storage and delete old files if needed (runs in background thread)."""
     if not RECORDINGS_DIR.exists():
         logging.warning("[cleanup] Recordings directory %s not found; skipping.", RECORDINGS_DIR)
         return
@@ -173,23 +217,16 @@ def check_storage_and_cleanup() -> None:
         return
 
     logging.warning(
-        "[cleanup] Disk usage %s%% exceeds threshold %s%%. Purging recordings directory.",
+        "[cleanup] Disk usage %s%% exceeds threshold %s%%. Starting cleanup (camera keeps running).",
         usage_percent,
         DISK_USAGE_THRESHOLD,
     )
 
-    was_running = _is_camera_running()
-    stop_camera_pipeline()
-
     try:
-        _delete_directory_contents(RECORDINGS_DIR)
+        # Delete old files without stopping camera - already running in background thread
+        _delete_oldest_files_until_threshold(RECORDINGS_DIR, DISK_USAGE_THRESHOLD)
     except Exception:
-        logging.exception("[cleanup] Failed to purge recordings directory")
-    else:
-        logging.info("[cleanup] Recordings directory purged successfully.")
-
-    if was_running:
-        start_camera_pipeline()
+        logging.exception("[cleanup] Failed during cleanup operation")
 
 
 class StorageMonitor(threading.Thread):
