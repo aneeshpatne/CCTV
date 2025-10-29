@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 BASE_DIR = Path(__file__).resolve().parent
 CAMERA_SCRIPT = BASE_DIR / "camera_pipeline.py"
-RECORDINGS_DIR = Path("/srv/cctv/esp_cam1")
+RECORDINGS_DIR = Path("/media/aneesh/SSD/recordings/esp_cam1")
 DISK_USAGE_THRESHOLD = 90  # percent
 CHECK_INTERVAL_SECONDS = 5 * 60
 STOP_TIMEOUT_SECONDS = 5.0
@@ -166,8 +166,10 @@ def check_storage_and_cleanup() -> None:
         logging.exception("[cleanup] Unable to calculate disk usage for %s", RECORDINGS_DIR)
         return
 
+    # Always log disk usage so you can see it's working
+    logging.info("[cleanup] Disk usage check: %s%% (threshold: %s%%)", usage_percent, DISK_USAGE_THRESHOLD)
+
     if usage_percent < DISK_USAGE_THRESHOLD:
-        logging.debug("[cleanup] Disk usage %s%% below threshold %s%%.", usage_percent, DISK_USAGE_THRESHOLD)
         return
 
     logging.warning(
