@@ -1,10 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import os
 import socket
+import subprocess
+import tempfile
+import hashlib
 
 app = FastAPI(title="CCTV Video Server", version="1.0")
 
@@ -19,6 +22,10 @@ app.add_middleware(
 
 # Configure your CCTV footage directory
 CCTV_FOLDER = "/media/aneesh/SSD/recordings/esp_cam1"
+TEMP_FOLDER = "/tmp/cctv_merged"  # Temporary folder for merged videos
+
+# Create temp folder if it doesn't exist
+Path(TEMP_FOLDER).mkdir(parents=True, exist_ok=True)
 
 @app.get("/")
 async def root():
@@ -38,6 +45,77 @@ async def root():
     }
 
 
+def find_videos_in_range(start_time: datetime, end_time: datetime) -> list[Path]:
+    """Find all videos within a time range."""
+    folder = Path(CCTV_FOLDER)
+    videos = []
+    
+    for file in folder.glob("recording_*.mp4"):
+        try:
+            timestamp_str = file.stem.replace("recording_", "")
+            dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+            
+            if start_time <= dt <= end_time:
+                videos.append((dt, file))
+        except ValueError:
+            continue
+    
+    # Sort by timestamp
+    videos.sort(key=lambda x: x[0])
+    return [v[1] for v in videos]
+
+
+def merge_videos(video_files: list[Path], output_path: Path) -> bool:
+    """Merge multiple video files using ffmpeg."""
+    if not video_files:
+        return False
+    
+    # Create a text file listing all videos
+    list_file = output_path.parent / f"{output_path.stem}_list.txt"
+    
+    try:
+        with open(list_file, 'w') as f:
+            for video in video_files:
+                # Escape single quotes and write in ffmpeg concat format
+                f.write(f"file '{str(video)}'\n")
+        
+        # Use ffmpeg to concatenate videos
+        cmd = [
+            'ffmpeg',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(list_file),
+            '-c', 'copy',  # Copy without re-encoding (faster)
+            '-y',  # Overwrite output file
+            str(output_path)
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Clean up list file
+        list_file.unlink()
+        
+        return result.returncode == 0
+        
+    except Exception as e:
+        if list_file.exists():
+            list_file.unlink()
+        raise e
+
+
+def cleanup_old_merged_videos():
+    """Clean up merged videos older than 1 hour."""
+    temp_folder = Path(TEMP_FOLDER)
+    current_time = datetime.now().timestamp()
+    
+    for file in temp_folder.glob("merged_*.mp4"):
+        if current_time - file.stat().st_mtime > 3600:  # 1 hour
+            try:
+                file.unlink()
+            except:
+                pass
+
+
 def find_video_by_timestamp(timestamp: datetime) -> Path:
     """
     Find video file matching the given timestamp.
@@ -53,18 +131,152 @@ def find_video_by_timestamp(timestamp: datetime) -> Path:
     return filepath
 
 
+@app.get("/video/by-hour")
+async def get_video_by_hour(timestamp: str, background_tasks: BackgroundTasks):
+    """
+    Get merged video for a specific hour.
+    
+    Args:
+        timestamp: ISO format datetime (e.g., "2025-10-29T10:00:00")
+                  Will return all videos from that hour (10:00:00 to 10:59:59)
+    
+    Example:
+        /video/by-hour?timestamp=2025-10-29T10:00:00
+    """
+    try:
+        # Parse timestamp
+        try:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except:
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        
+        # Get hour range
+        start_time = dt.replace(minute=0, second=0, microsecond=0)
+        end_time = start_time + timedelta(hours=1) - timedelta(seconds=1)
+        
+        # Find videos in this hour
+        videos = find_videos_in_range(start_time, end_time)
+        
+        if not videos:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No videos found for hour: {start_time.strftime('%Y-%m-%d %H:00')}"
+            )
+        
+        # If only one video, return it directly
+        if len(videos) == 1:
+            return FileResponse(
+                path=str(videos[0]),
+                media_type="video/mp4",
+                filename=videos[0].name
+            )
+        
+        # Generate unique filename for merged video
+        hour_str = start_time.strftime("%Y%m%d_%H")
+        merged_filename = f"merged_hour_{hour_str}.mp4"
+        merged_path = Path(TEMP_FOLDER) / merged_filename
+        
+        # Check if merged video already exists
+        if not merged_path.exists():
+            # Merge videos
+            if not merge_videos(videos, merged_path):
+                raise HTTPException(status_code=500, detail="Failed to merge videos")
+        
+        # Schedule cleanup of old merged videos
+        background_tasks.add_task(cleanup_old_merged_videos)
+        
+        return FileResponse(
+            path=str(merged_path),
+            media_type="video/mp4",
+            filename=merged_filename
+        )
+        
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid timestamp format. Use ISO format (2025-10-29T10:00:00)"
+        )
+
+
+@app.get("/video/by-day")
+async def get_video_by_day(timestamp: str, background_tasks: BackgroundTasks):
+    """
+    Get merged video for a specific day.
+    
+    Args:
+        timestamp: ISO format datetime (e.g., "2025-10-29T00:00:00")
+                  Will return all videos from that day (00:00:00 to 23:59:59)
+    
+    Example:
+        /video/by-day?timestamp=2025-10-29T00:00:00
+    """
+    try:
+        # Parse timestamp
+        try:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except:
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        
+        # Get day range
+        start_time = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_time = start_time + timedelta(days=1) - timedelta(seconds=1)
+        
+        # Find videos in this day
+        videos = find_videos_in_range(start_time, end_time)
+        
+        if not videos:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No videos found for day: {start_time.strftime('%Y-%m-%d')}"
+            )
+        
+        # If only one video, return it directly
+        if len(videos) == 1:
+            return FileResponse(
+                path=str(videos[0]),
+                media_type="video/mp4",
+                filename=videos[0].name
+            )
+        
+        # Generate unique filename for merged video
+        day_str = start_time.strftime("%Y%m%d")
+        merged_filename = f"merged_day_{day_str}.mp4"
+        merged_path = Path(TEMP_FOLDER) / merged_filename
+        
+        # Check if merged video already exists
+        if not merged_path.exists():
+            # Merge videos
+            if not merge_videos(videos, merged_path):
+                raise HTTPException(status_code=500, detail="Failed to merge videos")
+        
+        # Schedule cleanup of old merged videos
+        background_tasks.add_task(cleanup_old_merged_videos)
+        
+        return FileResponse(
+            path=str(merged_path),
+            media_type="video/mp4",
+            filename=merged_filename
+        )
+        
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid timestamp format. Use ISO format (2025-10-29T00:00:00)"
+        )
+
+
 @app.get("/video/by-timestamp")
 async def get_video_by_timestamp(timestamp: str):
     """
     Get video by timestamp.
     
     Args:
-        timestamp: ISO format datetime string (e.g., "2024-10-29T10:58:04")
+        timestamp: ISO format datetime string (e.g., "2025-10-29T10:53:42")
                   or custom format "YYYY-MM-DD HH:MM:SS"
     
     Example:
-        /video/by-timestamp?timestamp=2024-10-29T10:58:04
-        /video/by-timestamp?timestamp=2024-10-29 10:58:04
+        /video/by-timestamp?timestamp=2025-10-29T10:53:42
+        /video/by-timestamp?timestamp=2025-10-29 10:53:42
     """
     try:
         # Try parsing ISO format first
@@ -86,7 +298,7 @@ async def get_video_by_timestamp(timestamp: str):
     except ValueError as e:
         raise HTTPException(
             status_code=400, 
-            detail=f"Invalid timestamp format. Use ISO format (2024-10-29T10:58:04) or YYYY-MM-DD HH:MM:SS"
+            detail=f"Invalid timestamp format. Use ISO format (2025-10-29T10:53:42) or YYYY-MM-DD HH:MM:SS"
         )
 
 
