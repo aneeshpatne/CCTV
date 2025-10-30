@@ -335,55 +335,70 @@ def start_rssi_monitor() -> None:
 
 
 def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
-    """Draw WiFi signal strength bars on frame.
+    """Draw WiFi signal strength indicator with CCTV-style background.
     
     Args:
         frame: Frame to draw on (modified in-place)
         rssi: Signal strength in dBm (e.g., -50) or None
     """
     # Position in top-right corner
-    x_base = frame.shape[1] - 80
-    y_base = 40
-    bar_width = 8
-    bar_spacing = 3
-    bar_height_base = 6
+    badge_w = 120
+    badge_h = 30
+    badge_x = frame.shape[1] - badge_w - 10
+    badge_y = 10
     
-    # Determine signal strength (4 bars max)
-    # Excellent: >= -50 dBm (4 bars)
-    # Good: >= -60 dBm (3 bars)
-    # Fair: >= -70 dBm (2 bars)
-    # Weak: >= -80 dBm (1 bar)
-    # Very weak/none: < -80 dBm or None (0 bars)
+    # Draw semi-transparent dark background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
+                 (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
+    # Determine signal strength and color
     if rssi is None:
         bars_filled = 0
         color = (0, 0, 255)  # Red for no signal
         text = "N/A"
+        border_color = (0, 0, 255)
     elif rssi >= -50:
         bars_filled = 4
         color = (0, 255, 0)  # Green for excellent
         text = f"{rssi} dBm"
+        border_color = (0, 255, 0)
     elif rssi >= -60:
         bars_filled = 3
         color = (0, 255, 0)  # Green for good
         text = f"{rssi} dBm"
+        border_color = (0, 255, 0)
     elif rssi >= -70:
         bars_filled = 2
         color = (0, 255, 255)  # Yellow for fair
         text = f"{rssi} dBm"
+        border_color = (0, 255, 255)
     elif rssi >= -80:
         bars_filled = 1
         color = (0, 165, 255)  # Orange for weak
         text = f"{rssi} dBm"
+        border_color = (0, 165, 255)
     else:
         bars_filled = 0
         color = (0, 0, 255)  # Red for very weak
         text = f"{rssi} dBm"
+        border_color = (0, 0, 255)
     
-    # Draw 4 bars
+    # Draw border with color based on signal strength
+    cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
+                 border_color, 1)
+    
+    # Draw 4 bars inside badge
+    bar_width = 6
+    bar_spacing = 3
+    bar_height_base = 5
+    x_base = badge_x + 12
+    y_base = badge_y + badge_h - 8
+    
     for i in range(4):
         x = x_base + i * (bar_width + bar_spacing)
-        bar_height = bar_height_base + (i + 1) * 6
+        bar_height = bar_height_base + (i + 1) * 3
         y_top = y_base - bar_height
         
         if i < bars_filled:
@@ -391,11 +406,11 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
             cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), color, -1)
         else:
             # Empty bar (outline only)
-            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (100, 100, 100), 1)
+            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (80, 80, 80), 1)
     
-    # Draw RSSI value text below bars
-    cv2.putText(frame, text, (x_base - 10, y_base + 15), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+    # Draw RSSI value text
+    cv2.putText(frame, text, (badge_x + 50, badge_y + 19), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
 
 
 def backoff(attempt: int) -> float:
@@ -667,7 +682,7 @@ def main() -> None:
             # Draw timestamp with CCTV-style background
             time_x = 10
             time_y = 10
-            time_w = 420
+            time_w = 330
             time_h = 30
             
             # Draw semi-transparent dark background for timestamp
@@ -680,26 +695,16 @@ def main() -> None:
             cv2.rectangle(disp, (time_x, time_y), (time_x + time_w, time_y + time_h),
                          (0, 255, 0), 1)
             
-            # Draw REC indicator dot (blinking red dot)
-            rec_dot_x = time_x + 12
-            rec_dot_y = time_y + time_h // 2
-            if int(time.time() * 2) % 2 == 0:  # Blink every 0.5 seconds
-                cv2.circle(disp, (rec_dot_x, rec_dot_y), 5, (0, 0, 255), -1)
-            
-            # Draw "REC" text
-            cv2.putText(disp, "REC", (time_x + 25, time_y + 21),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-            
             # Draw timestamp text
-            cv2.putText(disp, ts, (time_x + 65, time_y + 21),
+            cv2.putText(disp, ts, (time_x + 15, time_y + 21),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
             
             # Draw subtle motion detection badge if motion detected (beside timestamp)
             if motion_detected:
                 # Calculate position next to timestamp
-                badge_x = 450  # Position to the right of timestamp
+                badge_x = 350  # Position to the right of timestamp
                 badge_y = 10
-                badge_w = 200
+                badge_w = 210
                 badge_h = 30
                 
                 # Draw semi-transparent dark background rectangle
