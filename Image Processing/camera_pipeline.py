@@ -668,39 +668,32 @@ def main() -> None:
             cv2.putText(disp, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.9, (0, 255, 0), 2, cv2.LINE_AA)
             
-            # Draw stylish motion detection badge if motion detected
+            # Draw subtle motion detection badge if motion detected (beside timestamp)
             if motion_detected:
-                # Calculate position for motion badge (to the right of timestamp)
-                badge_x = 10
-                badge_y = 60
-                badge_w = 200
-                badge_h = 35
+                # Calculate position next to timestamp
+                badge_x = 450  # Position to the right of timestamp
+                badge_y = 10
+                badge_w = 240
+                badge_h = 30
                 
-                # Draw semi-transparent red background rectangle
+                # Draw semi-transparent dark background rectangle
                 overlay = disp.copy()
                 cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                             (0, 0, 255), -1)
-                cv2.addWeighted(overlay, 0.6, disp, 0.4, 0, disp)
+                             (40, 40, 40), -1)
+                cv2.addWeighted(overlay, 0.5, disp, 0.5, 0, disp)
                 
-                # Draw border
+                # Draw subtle border
                 cv2.rectangle(disp, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                             (0, 0, 255), 2)
+                             (100, 200, 255), 1)
                 
-                # Draw warning symbol (triangle with !)
-                warning_x = badge_x + 15
-                warning_y = badge_y + badge_h // 2
-                triangle_pts = np.array([
-                    [warning_x, warning_y - 10],
-                    [warning_x - 8, warning_y + 8],
-                    [warning_x + 8, warning_y + 8]
-                ], np.int32)
-                cv2.fillPoly(disp, [triangle_pts], (0, 255, 255))
-                cv2.putText(disp, "!", (warning_x - 3, warning_y + 6),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                # Draw small warning dot
+                dot_x = badge_x + 12
+                dot_y = badge_y + badge_h // 2
+                cv2.circle(disp, (dot_x, dot_y), 5, (100, 200, 255), -1)
                 
                 # Draw "MOTION DETECTED" text
-                cv2.putText(disp, "MOTION DETECTED", (badge_x + 35, badge_y + 23),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(disp, "MOTION DETECTED", (badge_x + 25, badge_y + 21),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 220, 255), 1, cv2.LINE_AA)
 
             # Draw WiFi signal strength indicator
             with rssi_lock:
