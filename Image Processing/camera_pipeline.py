@@ -25,6 +25,7 @@ import pytz
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
+from tools.get_rssi import get_rssi
 
 URL = "http://192.168.1.119:81/stream"
 IST = pytz.timezone('Asia/Kolkata')
@@ -74,6 +75,12 @@ startup_lock = threading.Lock()
 # Capture opening state
 capture_result = {'cap': None, 'done': False}
 capture_lock = threading.Lock()
+
+# RSSI monitoring state
+rssi_value = None
+rssi_lock = threading.Lock()
+rssi_thread = None
+rssi_update_interval = 60  # Update RSSI once per minute
 
 # Recording state
 ffmpeg_record_proc: Optional[subprocess.Popen] = None
@@ -304,6 +311,93 @@ def start_startup(force: bool = False) -> None:
             startup_thread.start()
 
 
+def start_rssi_monitor() -> None:
+    """Start background thread to monitor RSSI once per minute."""
+    global rssi_thread
+    
+    def _rssi_monitor() -> None:
+        global rssi_value
+        while True:
+            try:
+                new_rssi = get_rssi(timeout=2.0)
+                with rssi_lock:
+                    rssi_value = new_rssi
+                if new_rssi is not None:
+                    print(f"RSSI updated: {new_rssi} dBm")
+            except Exception as e:
+                print(f"RSSI monitoring error: {e}")
+            time.sleep(rssi_update_interval)
+    
+    if rssi_thread is None or not rssi_thread.is_alive():
+        rssi_thread = threading.Thread(target=_rssi_monitor, daemon=True)
+        rssi_thread.start()
+        print(f"RSSI monitor started (updates every {rssi_update_interval}s)")
+
+
+def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
+    """Draw WiFi signal strength bars on frame.
+    
+    Args:
+        frame: Frame to draw on (modified in-place)
+        rssi: Signal strength in dBm (e.g., -50) or None
+    """
+    # Position in top-right corner
+    x_base = frame.shape[1] - 100
+    y_base = 50
+    bar_width = 12
+    bar_spacing = 4
+    bar_height_base = 10
+    
+    # Determine signal strength (4 bars max)
+    # Excellent: >= -50 dBm (4 bars)
+    # Good: >= -60 dBm (3 bars)
+    # Fair: >= -70 dBm (2 bars)
+    # Weak: >= -80 dBm (1 bar)
+    # Very weak/none: < -80 dBm or None (0 bars)
+    
+    if rssi is None:
+        bars_filled = 0
+        color = (0, 0, 255)  # Red for no signal
+        text = "N/A"
+    elif rssi >= -50:
+        bars_filled = 4
+        color = (0, 255, 0)  # Green for excellent
+        text = f"{rssi}"
+    elif rssi >= -60:
+        bars_filled = 3
+        color = (0, 255, 0)  # Green for good
+        text = f"{rssi}"
+    elif rssi >= -70:
+        bars_filled = 2
+        color = (0, 255, 255)  # Yellow for fair
+        text = f"{rssi}"
+    elif rssi >= -80:
+        bars_filled = 1
+        color = (0, 165, 255)  # Orange for weak
+        text = f"{rssi}"
+    else:
+        bars_filled = 0
+        color = (0, 0, 255)  # Red for very weak
+        text = f"{rssi}"
+    
+    # Draw 4 bars
+    for i in range(4):
+        x = x_base + i * (bar_width + bar_spacing)
+        bar_height = bar_height_base + (i + 1) * 8
+        y_top = y_base - bar_height
+        
+        if i < bars_filled:
+            # Filled bar
+            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), color, -1)
+        else:
+            # Empty bar (outline only)
+            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (100, 100, 100), 1)
+    
+    # Draw RSSI value text below bars
+    cv2.putText(frame, text, (x_base - 5, y_base + 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+
 def backoff(attempt: int) -> float:
     return min(5.0, 0.5 * (2 ** attempt))
 
@@ -331,6 +425,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
                 0.75, (0, 165, 255), 2, cv2.LINE_AA)
 
+    # Draw WiFi signal strength indicator
+    with rssi_lock:
+        current_rssi = rssi_value
+    draw_wifi_signal(frame, current_rssi)
+
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
         cv2.imshow("frame", frame)
@@ -354,6 +453,11 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
                 0.75, (0, 255, 0), 2, cv2.LINE_AA)
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
                 0.75, (0, 165, 255), 2, cv2.LINE_AA)
+
+    # Draw WiFi signal strength indicator
+    with rssi_lock:
+        current_rssi = rssi_value
+    draw_wifi_signal(frame, current_rssi)
 
     return frame
 
@@ -449,6 +553,7 @@ def main() -> None:
         print("Local view disabled - running in headless mode")
         print("Press Ctrl+C to stop")
     start_startup(force=True)
+    start_rssi_monitor()  # Start RSSI monitoring thread
     show_placeholder("Initializing camera...")
     cv2.waitKey(1)
 
@@ -561,6 +666,11 @@ def main() -> None:
             label = f"{ts}{' Motion Detected' if motion_detected else ''}"
             cv2.putText(disp, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                         0.9, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # Draw WiFi signal strength indicator
+            with rssi_lock:
+                current_rssi = rssi_value
+            draw_wifi_signal(disp, current_rssi)
 
             # Draw ROI polygon on display only if flag is enabled
             if SHOW_MOTION_BOXES:
