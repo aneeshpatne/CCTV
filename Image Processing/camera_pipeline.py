@@ -664,9 +664,35 @@ def main() -> None:
             # Timestamp and motion label
             ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
             
-            # Draw timestamp
-            cv2.putText(disp, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.9, (0, 255, 0), 2, cv2.LINE_AA)
+            # Draw timestamp with CCTV-style background
+            time_x = 10
+            time_y = 10
+            time_w = 420
+            time_h = 30
+            
+            # Draw semi-transparent dark background for timestamp
+            overlay = disp.copy()
+            cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                         (20, 20, 20), -1)
+            cv2.addWeighted(overlay, 0.6, disp, 0.4, 0, disp)
+            
+            # Draw subtle border
+            cv2.rectangle(disp, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                         (0, 255, 0), 1)
+            
+            # Draw REC indicator dot (blinking red dot)
+            rec_dot_x = time_x + 12
+            rec_dot_y = time_y + time_h // 2
+            if int(time.time() * 2) % 2 == 0:  # Blink every 0.5 seconds
+                cv2.circle(disp, (rec_dot_x, rec_dot_y), 5, (0, 0, 255), -1)
+            
+            # Draw "REC" text
+            cv2.putText(disp, "REC", (time_x + 25, time_y + 21),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+            
+            # Draw timestamp text
+            cv2.putText(disp, ts, (time_x + 65, time_y + 21),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
             
             # Draw subtle motion detection badge if motion detected (beside timestamp)
             if motion_detected:
