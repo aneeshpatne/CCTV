@@ -342,11 +342,11 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
         rssi: Signal strength in dBm (e.g., -50) or None
     """
     # Position in top-right corner
-    x_base = frame.shape[1] - 100
-    y_base = 50
-    bar_width = 12
-    bar_spacing = 4
-    bar_height_base = 10
+    x_base = frame.shape[1] - 80
+    y_base = 40
+    bar_width = 8
+    bar_spacing = 3
+    bar_height_base = 6
     
     # Determine signal strength (4 bars max)
     # Excellent: >= -50 dBm (4 bars)
@@ -362,28 +362,28 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
     elif rssi >= -50:
         bars_filled = 4
         color = (0, 255, 0)  # Green for excellent
-        text = f"{rssi}"
+        text = f"{rssi} dBm"
     elif rssi >= -60:
         bars_filled = 3
         color = (0, 255, 0)  # Green for good
-        text = f"{rssi}"
+        text = f"{rssi} dBm"
     elif rssi >= -70:
         bars_filled = 2
         color = (0, 255, 255)  # Yellow for fair
-        text = f"{rssi}"
+        text = f"{rssi} dBm"
     elif rssi >= -80:
         bars_filled = 1
         color = (0, 165, 255)  # Orange for weak
-        text = f"{rssi}"
+        text = f"{rssi} dBm"
     else:
         bars_filled = 0
         color = (0, 0, 255)  # Red for very weak
-        text = f"{rssi}"
+        text = f"{rssi} dBm"
     
     # Draw 4 bars
     for i in range(4):
         x = x_base + i * (bar_width + bar_spacing)
-        bar_height = bar_height_base + (i + 1) * 8
+        bar_height = bar_height_base + (i + 1) * 6
         y_top = y_base - bar_height
         
         if i < bars_filled:
@@ -394,8 +394,8 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
             cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (100, 100, 100), 1)
     
     # Draw RSSI value text below bars
-    cv2.putText(frame, text, (x_base - 5, y_base + 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    cv2.putText(frame, text, (x_base - 10, y_base + 15), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
 
 def backoff(attempt: int) -> float:
