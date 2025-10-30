@@ -673,7 +673,7 @@ def main() -> None:
                 # Calculate position next to timestamp
                 badge_x = 450  # Position to the right of timestamp
                 badge_y = 10
-                badge_w = 240
+                badge_w = 210
                 badge_h = 30
                 
                 # Draw semi-transparent dark background rectangle
