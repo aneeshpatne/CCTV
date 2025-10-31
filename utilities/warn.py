@@ -48,7 +48,7 @@ class NonBlockingBlinker:
 def warning_blink(duration=5, interval=0.5):
     start_time = time.time()
     while time.time() - start_time < duration:
-        adJustLED(20)  
+        adJustLED(200)  
         time.sleep(interval)
         adJustLED(0)     
         time.sleep(interval)
