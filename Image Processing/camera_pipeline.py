@@ -1069,7 +1069,7 @@ def main() -> None:
             time_x = 10
             time_y = 10
             time_w = 305
-            time_h = 30
+            time_h = 35
             
             # Draw semi-transparent dark background for timestamp
             overlay = disp.copy()
