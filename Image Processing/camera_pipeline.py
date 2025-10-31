@@ -720,7 +720,7 @@ def show_placeholder(message: str) -> None:
     time_x = 10
     time_y = 10
     time_w = 305
-    time_h = 30
+    time_h = 35
     
     # Draw semi-transparent dark background for timestamp
     overlay = frame.copy()
@@ -733,7 +733,7 @@ def show_placeholder(message: str) -> None:
                  (0, 255, 0), 1)
     
     # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 21),
+    cv2.putText(frame, ts, (time_x + 15, time_y + 23),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
     
     # Draw message below
@@ -752,7 +752,7 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     time_x = 10
     time_y = 10
     time_w = 305
-    time_h = 30
+    time_h = 35
     
     # Draw semi-transparent dark background for timestamp
     overlay = frame.copy()
@@ -765,7 +765,7 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
                  (0, 255, 0), 1)
     
     # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 21),
+    cv2.putText(frame, ts, (time_x + 15, time_y + 23),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
     
     # Draw message below
@@ -812,7 +812,7 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
     time_x = 10
     time_y = 10
     time_w = 305
-    time_h = 30
+    time_h = 35
     
     # Draw semi-transparent dark background for timestamp
     overlay = frame.copy()
@@ -825,7 +825,7 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
                  (0, 255, 0), 1)
     
     # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 21),
+    cv2.putText(frame, ts, (time_x + 15, time_y + 23),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
     
     # Draw message below
@@ -1082,7 +1082,7 @@ def main() -> None:
                          (0, 255, 0), 1)
             
             # Draw timestamp text
-            cv2.putText(disp, ts, (time_x + 15, time_y + 21),
+            cv2.putText(disp, ts, (time_x + 15, time_y + 23),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
             
             # Draw camera cleanup message if colorbar toggle is active
