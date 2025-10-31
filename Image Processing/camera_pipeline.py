@@ -899,7 +899,7 @@ def main() -> None:
                 badge_x = 325  # Position to the right of timestamp
                 badge_y = 10
                 badge_w = 190
-                badge_h = 30
+                badge_h = 35
                 
                 # Draw semi-transparent dark background rectangle
                 overlay = disp.copy()
@@ -917,7 +917,7 @@ def main() -> None:
                 cv2.circle(disp, (dot_x, dot_y), 5, (100, 200, 255), -1)
                 
                 # Draw "MOTION DETECTED" text
-                cv2.putText(disp, "MOTION DETECTED", (badge_x + 25, badge_y + 21),
+                cv2.putText(disp, "MOTION DETECTED", (badge_x + 25, badge_y + 23),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 220, 255), 1, cv2.LINE_AA)
 
             # Draw WiFi signal strength indicator
