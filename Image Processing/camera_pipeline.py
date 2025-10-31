@@ -47,6 +47,7 @@ RECORD_FPS = 10  # Target FPS for recording
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
 SHOW_LOCAL_VIEW = False    # Show CV2 preview windows
+SHOW_MEMORY_BADGE = True   # Show ESP32 memory usage badge
 
 # Motion detection configuration
 MIN_AREA = 800
@@ -503,7 +504,7 @@ def draw_memory_badge(frame: np.ndarray, mem_percent: float | None) -> None:
         mem_percent: Percentage of free memory (0-100) or None
     """
     # Position to the left of FPS badge
-    badge_w = 95
+    badge_w = 110
     badge_h = 35
     fps_badge_x = frame.shape[1] - 160 - 10 - 85 - 5  # FPS badge position
     badge_x = fps_badge_x - badge_w - 5  # 5px gap
@@ -694,10 +695,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
         current_fps = fps_value
     draw_fps_badge(frame, current_fps)
     
-    # Draw Memory badge (to the left of FPS)
-    with memory_lock:
-        current_memory = memory_percent
-    draw_memory_badge(frame, current_memory)
+    # Draw Memory badge (to the left of FPS) if enabled
+    if SHOW_MEMORY_BADGE:
+        with memory_lock:
+            current_memory = memory_percent
+        draw_memory_badge(frame, current_memory)
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -753,10 +755,11 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
         current_fps = fps_value
     draw_fps_badge(frame, current_fps)
     
-    # Draw Memory badge (to the left of FPS)
-    with memory_lock:
-        current_memory = memory_percent
-    draw_memory_badge(frame, current_memory)
+    # Draw Memory badge (to the left of FPS) if enabled
+    if SHOW_MEMORY_BADGE:
+        with memory_lock:
+            current_memory = memory_percent
+        draw_memory_badge(frame, current_memory)
 
     return frame
 
@@ -853,7 +856,8 @@ def main() -> None:
         print("Press Ctrl+C to stop")
     start_startup(force=True)
     start_rssi_monitor()  # Start RSSI monitoring thread
-    start_memory_monitor()  # Start memory monitoring thread
+    if SHOW_MEMORY_BADGE:
+        start_memory_monitor()  # Start memory monitoring thread
     start_motion_logger()  # Start motion logging thread
     show_placeholder("Initializing camera...")
     cv2.waitKey(1)
@@ -1026,10 +1030,11 @@ def main() -> None:
                 current_fps = fps_value
             draw_fps_badge(disp, current_fps)
             
-            # Draw Memory badge (to the left of FPS)
-            with memory_lock:
-                current_memory = memory_percent
-            draw_memory_badge(disp, current_memory)
+            # Draw Memory badge (to the left of FPS) if enabled
+            if SHOW_MEMORY_BADGE:
+                with memory_lock:
+                    current_memory = memory_percent
+                draw_memory_badge(disp, current_memory)
             
             # Draw WiFi signal (stays in same position)
             draw_wifi_signal(disp, current_rssi)
