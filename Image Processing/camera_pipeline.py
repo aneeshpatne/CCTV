@@ -83,6 +83,12 @@ rssi_lock = threading.Lock()
 rssi_thread = None
 rssi_update_interval = 60  # Update RSSI once per minute
 
+# FPS tracking state
+fps_value = 0.0
+fps_lock = threading.Lock()
+fps_frame_times = []
+FPS_SAMPLE_WINDOW = 30  # Calculate FPS over last 30 frames
+
 # Motion detection logging state
 motion_log_queue = []
 motion_log_lock = threading.Lock()
@@ -342,6 +348,27 @@ def start_rssi_monitor() -> None:
         print(f"RSSI monitor started (updates every {rssi_update_interval}s)")
 
 
+def update_fps() -> None:
+    """Update FPS calculation based on frame timestamps."""
+    global fps_value, fps_frame_times
+    
+    current_time = time.time()
+    
+    with fps_lock:
+        # Add current frame time
+        fps_frame_times.append(current_time)
+        
+        # Keep only recent frames (last N frames)
+        if len(fps_frame_times) > FPS_SAMPLE_WINDOW:
+            fps_frame_times.pop(0)
+        
+        # Calculate FPS if we have enough samples
+        if len(fps_frame_times) >= 2:
+            time_span = fps_frame_times[-1] - fps_frame_times[0]
+            if time_span > 0:
+                fps_value = (len(fps_frame_times) - 1) / time_span
+
+
 def start_motion_logger() -> None:
     """Start background thread to log motion events to database."""
     global motion_log_thread
@@ -385,6 +412,44 @@ def queue_motion_log(timestamp: datetime) -> None:
         with motion_log_lock:
             motion_log_queue.append(timestamp)
         last_motion_log_time = current_time
+
+
+def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
+    """Draw FPS badge in CCTV style.
+    
+    Args:
+        frame: Frame to draw on (modified in-place)
+        fps: Current frames per second
+    """
+    # Position to the left of WiFi badge
+    badge_w = 90
+    badge_h = 30
+    wifi_badge_x = frame.shape[1] - 120 - 10  # WiFi badge position
+    badge_x = wifi_badge_x - badge_w - 5  # 5px gap
+    badge_y = 10
+    
+    # Draw semi-transparent dark background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
+                 (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    
+    # Determine color based on FPS
+    if fps >= 8:
+        color = (0, 255, 0)  # Green for good
+    elif fps >= 5:
+        color = (0, 255, 255)  # Yellow for fair
+    else:
+        color = (0, 0, 255)  # Red for poor
+    
+    # Draw border with color based on FPS
+    cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
+                 color, 1)
+    
+    # Draw FPS text
+    fps_text = f"FPS: {fps:.1f}"
+    cv2.putText(frame, fps_text, (badge_x + 8, badge_y + 19), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
 
 
 def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
@@ -537,6 +602,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     with rssi_lock:
         current_rssi = rssi_value
     draw_wifi_signal(frame, current_rssi)
+    
+    # Draw FPS badge (to the left of WiFi)
+    with fps_lock:
+        current_fps = fps_value
+    draw_fps_badge(frame, current_fps)
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -586,6 +656,11 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
     with rssi_lock:
         current_rssi = rssi_value
     draw_wifi_signal(frame, current_rssi)
+    
+    # Draw FPS badge (to the left of WiFi)
+    with fps_lock:
+        current_fps = fps_value
+    draw_fps_badge(frame, current_fps)
 
     return frame
 
@@ -748,6 +823,9 @@ def main() -> None:
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
 
+            # Update FPS calculation
+            update_fps()
+
             # Motion detection on the current frame
             fg_mask = mog2.apply(frame)
             _, mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
@@ -845,6 +923,13 @@ def main() -> None:
             # Draw WiFi signal strength indicator
             with rssi_lock:
                 current_rssi = rssi_value
+            
+            # Draw FPS badge (to the left of WiFi)
+            with fps_lock:
+                current_fps = fps_value
+            draw_fps_badge(disp, current_fps)
+            
+            # Draw WiFi signal (stays in same position)
             draw_wifi_signal(disp, current_rssi)
 
             # Draw ROI polygon on display only if flag is enabled
