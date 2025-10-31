@@ -42,7 +42,7 @@ BASE_DIR = "/media/aneesh/SSD/recordings/esp_cam1"
 SEGMENT_SECONDS = 3 * 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
-RECORD_FPS = 10  # Target FPS for recording
+USE_DYNAMIC_FPS = True  # Match source FPS dynamically instead of enforcing fixed rate
 
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
@@ -114,11 +114,11 @@ colorbar_lock = threading.Lock()
 ffmpeg_record_proc: Optional[subprocess.Popen] = None
 ffmpeg_rtsp_proc: Optional[subprocess.Popen] = None
 ffmpeg_lock = threading.Lock()
-last_frame_time = 0.0
 expected_frame_size: Optional[tuple[int, int]] = None  # (width, height) that FFmpeg expects
+current_fps: Optional[float] = None  # Dynamically calculated FPS for FFmpeg
 
 
-def start_ffmpeg_record(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
+def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
     """Start FFmpeg process responsible for local segmented recording."""
     os.makedirs(BASE_DIR, exist_ok=True)
     out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
@@ -128,7 +128,7 @@ def start_ffmpeg_record(width: int, height: int, fps: int) -> Optional[subproces
 
         # raw frames over stdin
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", str(fps),
+        "-s", f"{width}x{height}", "-r", f"{fps:.2f}",
         "-fflags", "+genpts",
         "-i", "-",
 
@@ -137,7 +137,7 @@ def start_ffmpeg_record(width: int, height: int, fps: int) -> Optional[subproces
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "20",
-        "-g", str(int(fps)),
+        "-g", str(max(1, int(fps))),
         "-bf", "2",
         "-f", "segment",
         "-segment_time", str(SEGMENT_SECONDS),
@@ -159,20 +159,20 @@ def start_ffmpeg_record(width: int, height: int, fps: int) -> Optional[subproces
             stderr=logf,          # keep stderr for diagnostics
             bufsize=0
         )
-        print(f"FFmpeg recording started: {out_pattern}")
+        print(f"FFmpeg recording started at {fps:.2f} FPS: {out_pattern}")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg: {e}")
         return None
 
 
-def start_ffmpeg_rtsp(width: int, height: int, fps: int) -> Optional[subprocess.Popen]:
+def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
     """Start FFmpeg process responsible for RTSP/WebRTC restream."""
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", str(fps),
+        "-s", f"{width}x{height}", "-r", f"{fps:.2f}",
         "-fflags", "+genpts",
         "-i", "-",
 
@@ -186,7 +186,7 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: int) -> Optional[subprocess.
         "-b:v", "1.5M",
         "-maxrate", "1.5M",
         "-bufsize", "3M",
-        "-g", str(int(fps)),
+        "-g", str(max(1, int(fps))),
         "-bf", "0",
         "-sc_threshold", "0",
         "-rtsp_transport", "tcp",
@@ -204,7 +204,7 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: int) -> Optional[subprocess.
             stderr=logf,
             bufsize=0
         )
-        print(f"FFmpeg RTSP started: {RTSP_OUT}")
+        print(f"FFmpeg RTSP started at {fps:.2f} FPS: {RTSP_OUT}")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg RTSP: {e}")
@@ -230,7 +230,7 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
 
 def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
     """Push a frame into the recording/RTSP FFmpeg pipelines, restarting them when needed."""
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, last_frame_time, expected_frame_size
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
 
     if not ENABLE_RECORDING and not ENABLE_RTSP:
         return True
@@ -239,14 +239,28 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         h, w = frame.shape[:2]
         new_size = (w, h)
 
+        # Get current FPS from the FPS tracker
+        with fps_lock:
+            measured_fps = fps_value if fps_value > 0 else 10.0  # fallback to 10 if not calculated yet
+
+        # Check if we need to restart FFmpeg due to size or FPS change
+        fps_changed = False
+        if USE_DYNAMIC_FPS and current_fps is not None:
+            # Restart if FPS changes by more than 1 FPS to avoid constant restarts from small fluctuations
+            if abs(measured_fps - current_fps) > 1.0:
+                fps_changed = True
+                print(f"FPS changed from {current_fps:.2f} to {measured_fps:.2f}; restarting FFmpeg pipelines.")
+
         # Track the canonical size expected by the encoders
         if expected_frame_size is None:
             expected_frame_size = new_size
-        elif new_size != expected_frame_size:
-            print(
-                f"Frame size changed from {expected_frame_size[0]}x{expected_frame_size[1]} to {w}x{h}; "
-                "restarting FFmpeg pipelines."
-            )
+            current_fps = measured_fps
+        elif new_size != expected_frame_size or fps_changed:
+            if new_size != expected_frame_size:
+                print(
+                    f"Frame size changed from {expected_frame_size[0]}x{expected_frame_size[1]} to {w}x{h}; "
+                    "restarting FFmpeg pipelines."
+                )
             if ffmpeg_record_proc is not None:
                 stop_ffmpeg(ffmpeg_record_proc)
                 ffmpeg_record_proc = None
@@ -254,8 +268,10 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             expected_frame_size = new_size
+            current_fps = measured_fps
 
         target_width, target_height = expected_frame_size
+        target_fps = current_fps if current_fps is not None else measured_fps
 
         # Ensure recording process is alive when recording enabled
         if ENABLE_RECORDING:
@@ -265,7 +281,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 stop_ffmpeg(ffmpeg_record_proc)
                 ffmpeg_record_proc = None
             if ffmpeg_record_proc is None:
-                ffmpeg_record_proc = start_ffmpeg_record(target_width, target_height, RECORD_FPS)
+                ffmpeg_record_proc = start_ffmpeg_record(target_width, target_height, target_fps)
 
         # Ensure RTSP process is alive when enabled
         if ENABLE_RTSP:
@@ -275,20 +291,11 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             if ffmpeg_rtsp_proc is None:
-                ffmpeg_rtsp_proc = start_ffmpeg_rtsp(target_width, target_height, RECORD_FPS)
+                ffmpeg_rtsp_proc = start_ffmpeg_rtsp(target_width, target_height, target_fps)
 
         # If the current frame size differs from the expected size, resize once for both outputs
         if (w, h) != expected_frame_size:
             frame = cv2.resize(frame, expected_frame_size)
-
-        # Rate limit to target FPS (shared across both pipes)
-        now = time.time()
-        if last_frame_time > 0:
-            elapsed = now - last_frame_time
-            target_interval = 1.0 / RECORD_FPS
-            if elapsed < target_interval:
-                time.sleep(target_interval - elapsed)
-        last_frame_time = time.time()
 
         frame_bytes = frame.tobytes()
 
@@ -302,7 +309,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             except (BrokenPipeError, IOError) as err:
                 print(f"FFmpeg {label} pipe error ({err}); restarting...")
                 stop_ffmpeg(proc)
-                return starter(target_width, target_height, RECORD_FPS)
+                return starter(target_width, target_height, target_fps)
             return proc
 
         if ENABLE_RECORDING:
@@ -909,7 +916,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
     attempt = 0
     cap = None
 
@@ -930,7 +937,10 @@ def main() -> None:
     print("Starting camera initialization in background...")
     if ENABLE_RECORDING:
         print(f"Recording enabled: {BASE_DIR}")
-        print(f"Segment duration: {SEGMENT_SECONDS}s, FPS: {RECORD_FPS}")
+        if USE_DYNAMIC_FPS:
+            print(f"Segment duration: {SEGMENT_SECONDS}s, FPS: Dynamic (matches source)")
+        else:
+            print(f"Segment duration: {SEGMENT_SECONDS}s, FPS: 10 (fixed)")
     if not SHOW_LOCAL_VIEW:
         print("Local view disabled - running in headless mode")
         print("Press Ctrl+C to stop")
