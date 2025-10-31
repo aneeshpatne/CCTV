@@ -448,8 +448,8 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
     
     # Draw FPS text
     fps_text = f"FPS: {fps:.1f}"
-    cv2.putText(frame, fps_text, (badge_x + 8, badge_y + 19), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, fps_text, (badge_x + 8, badge_y + 21), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
 
 
 def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
@@ -527,8 +527,8 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
             cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (80, 80, 80), 1)
     
     # Draw RSSI value text
-    cv2.putText(frame, text, (badge_x + 50, badge_y + 19), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, text, (badge_x + 50, badge_y + 21), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
 
 
 def backoff(attempt: int) -> float:
