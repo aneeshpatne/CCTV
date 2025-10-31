@@ -422,9 +422,9 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
         fps: Current frames per second
     """
     # Position to the left of WiFi badge
-    badge_w = 90
-    badge_h = 30
-    wifi_badge_x = frame.shape[1] - 120 - 10  # WiFi badge position
+    badge_w = 100
+    badge_h = 35
+    wifi_badge_x = frame.shape[1] - 140 - 10  # WiFi badge position
     badge_x = wifi_badge_x - badge_w - 5  # 5px gap
     badge_y = 10
     
@@ -446,9 +446,9 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
     cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
                  color, 1)
     
-    # Draw FPS text
-    fps_text = f"FPS: {fps:.1f}"
-    cv2.putText(frame, fps_text, (badge_x + 8, badge_y + 21), 
+    # Draw FPS text (no decimal)
+    fps_text = f"FPS: {int(fps)}"
+    cv2.putText(frame, fps_text, (badge_x + 10, badge_y + 23), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
 
 
@@ -460,8 +460,8 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
         rssi: Signal strength in dBm (e.g., -50) or None
     """
     # Position in top-right corner
-    badge_w = 120
-    badge_h = 30
+    badge_w = 140
+    badge_h = 35
     badge_x = frame.shape[1] - badge_w - 10
     badge_y = 10
     
@@ -527,7 +527,7 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
             cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (80, 80, 80), 1)
     
     # Draw RSSI value text
-    cv2.putText(frame, text, (badge_x + 50, badge_y + 21), 
+    cv2.putText(frame, text, (badge_x + 52, badge_y + 23), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
 
 
