@@ -15,6 +15,7 @@ import threading
 import time
 import signal
 import subprocess
+import requests
 from datetime import datetime
 from typing import Optional
 
@@ -82,6 +83,12 @@ rssi_value = None
 rssi_lock = threading.Lock()
 rssi_thread = None
 rssi_update_interval = 60  # Update RSSI once per minute
+
+# Memory monitoring state
+memory_percent = None
+memory_lock = threading.Lock()
+memory_thread = None
+memory_update_interval = 10  # Update memory every 10 seconds
 
 # FPS tracking state
 fps_value = 0.0
@@ -348,6 +355,42 @@ def start_rssi_monitor() -> None:
         print(f"RSSI monitor started (updates every {rssi_update_interval}s)")
 
 
+def start_memory_monitor() -> None:
+    """Start background thread to monitor ESP32 memory every 10 seconds."""
+    global memory_thread
+    
+    def _memory_monitor() -> None:
+        global memory_percent
+        while True:
+            try:
+                response = requests.get("http://192.168.1.119/syshealth", timeout=3.0)
+                if response.status_code == 200:
+                    data = response.json()
+                    free_heap = data.get('freeHeap', 0)
+                    total_heap = data.get('totalHeap', 1)
+                    
+                    # Calculate percentage of free memory
+                    mem_pct = (free_heap / total_heap) * 100 if total_heap > 0 else 0
+                    
+                    with memory_lock:
+                        memory_percent = mem_pct
+                    
+                    print(f"Memory updated: {mem_pct:.1f}% free ({free_heap}/{total_heap} bytes)")
+            except requests.exceptions.Timeout:
+                print("Memory monitoring: request timeout")
+            except requests.exceptions.RequestException as e:
+                print(f"Memory monitoring error: {e}")
+            except Exception as e:
+                print(f"Memory monitoring unexpected error: {e}")
+            
+            time.sleep(memory_update_interval)
+    
+    if memory_thread is None or not memory_thread.is_alive():
+        memory_thread = threading.Thread(target=_memory_monitor, daemon=True)
+        memory_thread.start()
+        print(f"Memory monitor started (updates every {memory_update_interval}s)")
+
+
 def update_fps() -> None:
     """Update FPS calculation based on frame timestamps."""
     global fps_value, fps_frame_times
@@ -449,6 +492,49 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
     # Draw FPS text (no decimal)
     fps_text = f"FPS: {int(fps)}"
     cv2.putText(frame, fps_text, (badge_x + 10, badge_y + 23), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
+
+
+def draw_memory_badge(frame: np.ndarray, mem_percent: float | None) -> None:
+    """Draw Memory badge in CCTV style.
+    
+    Args:
+        frame: Frame to draw on (modified in-place)
+        mem_percent: Percentage of free memory (0-100) or None
+    """
+    # Position to the left of FPS badge
+    badge_w = 95
+    badge_h = 35
+    fps_badge_x = frame.shape[1] - 160 - 10 - 85 - 5  # FPS badge position
+    badge_x = fps_badge_x - badge_w - 5  # 5px gap
+    badge_y = 10
+    
+    # Draw semi-transparent dark background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
+                 (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    
+    # Determine color and text based on memory percentage
+    if mem_percent is None:
+        color = (128, 128, 128)  # Gray for no data
+        text = "MEM: N/A"
+    elif mem_percent > 30:
+        color = (0, 255, 0)  # Green for healthy
+        text = f"MEM: {int(mem_percent)}%"
+    elif mem_percent > 15:
+        color = (0, 255, 255)  # Yellow for warning
+        text = f"MEM: {int(mem_percent)}%"
+    else:
+        color = (0, 0, 255)  # Red for critical
+        text = f"MEM: {int(mem_percent)}%"
+    
+    # Draw border with color based on memory
+    cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
+                 color, 1)
+    
+    # Draw memory text
+    cv2.putText(frame, text, (badge_x + 8, badge_y + 23), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
 
 
@@ -607,6 +693,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     with fps_lock:
         current_fps = fps_value
     draw_fps_badge(frame, current_fps)
+    
+    # Draw Memory badge (to the left of FPS)
+    with memory_lock:
+        current_memory = memory_percent
+    draw_memory_badge(frame, current_memory)
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -661,6 +752,11 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
     with fps_lock:
         current_fps = fps_value
     draw_fps_badge(frame, current_fps)
+    
+    # Draw Memory badge (to the left of FPS)
+    with memory_lock:
+        current_memory = memory_percent
+    draw_memory_badge(frame, current_memory)
 
     return frame
 
@@ -757,6 +853,7 @@ def main() -> None:
         print("Press Ctrl+C to stop")
     start_startup(force=True)
     start_rssi_monitor()  # Start RSSI monitoring thread
+    start_memory_monitor()  # Start memory monitoring thread
     start_motion_logger()  # Start motion logging thread
     show_placeholder("Initializing camera...")
     cv2.waitKey(1)
@@ -928,6 +1025,11 @@ def main() -> None:
             with fps_lock:
                 current_fps = fps_value
             draw_fps_badge(disp, current_fps)
+            
+            # Draw Memory badge (to the left of FPS)
+            with memory_lock:
+                current_memory = memory_percent
+            draw_memory_badge(disp, current_memory)
             
             # Draw WiFi signal (stays in same position)
             draw_wifi_signal(disp, current_rssi)
