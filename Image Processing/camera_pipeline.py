@@ -104,6 +104,12 @@ motion_log_thread = None
 motion_debounce_seconds = 60  # Log motion at most once per minute
 last_motion_log_time = 0.0
 
+# Colorbar toggle state
+colorbar_thread = None
+colorbar_interval = 2 * 60 * 60  # Toggle colorbar every 2 hours
+colorbar_active = False
+colorbar_lock = threading.Lock()
+
 # Recording state
 ffmpeg_record_proc: Optional[subprocess.Popen] = None
 ffmpeg_rtsp_proc: Optional[subprocess.Popen] = None
@@ -441,6 +447,71 @@ def start_motion_logger() -> None:
         print("Motion logger thread started")
 
 
+def toggle_colorbar_once() -> None:
+    """Toggle colorbar on then off with 10 second delay."""
+    global colorbar_active
+    
+    try:
+        # Set flag to show "cleanup ongoing" message
+        with colorbar_lock:
+            colorbar_active = True
+        
+        # Turn colorbar ON
+        print("Toggling colorbar ON...")
+        response = requests.get("http://192.168.1.119/control?var=colorbar&val=1", timeout=5.0)
+        if response.status_code == 200:
+            print("Colorbar turned ON successfully")
+        else:
+            print(f"Failed to turn colorbar ON: status {response.status_code}")
+        
+        # Wait 10 seconds
+        time.sleep(10)
+        
+        # Turn colorbar OFF
+        print("Toggling colorbar OFF...")
+        response = requests.get("http://192.168.1.119/control?var=colorbar&val=0", timeout=5.0)
+        if response.status_code == 200:
+            print("Colorbar turned OFF successfully")
+        else:
+            print(f"Failed to turn colorbar OFF: status {response.status_code}")
+        
+    except requests.exceptions.Timeout:
+        print("Colorbar toggle: request timeout")
+    except requests.exceptions.RequestException as e:
+        print(f"Colorbar toggle error: {e}")
+    except Exception as e:
+        print(f"Colorbar toggle unexpected error: {e}")
+    finally:
+        # Clear flag after toggle complete
+        with colorbar_lock:
+            colorbar_active = False
+
+
+def start_colorbar_toggle() -> None:
+    """Start background thread to toggle colorbar every 2 hours."""
+    global colorbar_thread
+    
+    def _colorbar_toggle() -> None:
+        # Wait for startup to complete before first toggle
+        print("Colorbar toggle thread: waiting for startup to complete...")
+        startup_complete.wait()
+        
+        # Perform initial toggle after startup
+        print("Startup complete - performing initial colorbar toggle...")
+        toggle_colorbar_once()
+        
+        # Continue toggling every 2 hours
+        while True:
+            time.sleep(colorbar_interval)
+            print(f"Performing periodic colorbar toggle (every {colorbar_interval/3600:.1f} hours)...")
+            toggle_colorbar_once()
+    
+    if colorbar_thread is None or not colorbar_thread.is_alive():
+        colorbar_thread = threading.Thread(target=_colorbar_toggle, daemon=True)
+        colorbar_thread.start()
+        print(f"Colorbar toggle thread started (runs every {colorbar_interval/3600:.1f} hours)")
+
+
 def queue_motion_log(timestamp: datetime) -> None:
     """Queue a motion event for logging with debounce.
     
@@ -497,14 +568,14 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
 
 
 def draw_memory_badge(frame: np.ndarray, mem_percent: float | None) -> None:
-    """Draw Memory badge in CCTV style.
+    """Draw Memory badge with RAM symbol in CCTV style.
     
     Args:
         frame: Frame to draw on (modified in-place)
         mem_percent: Percentage of free memory (0-100) or None
     """
     # Position to the left of FPS badge
-    badge_w = 110
+    badge_w = 50
     badge_h = 35
     fps_badge_x = frame.shape[1] - 160 - 10 - 85 - 5  # FPS badge position
     badge_x = fps_badge_x - badge_w - 5  # 5px gap
@@ -516,27 +587,36 @@ def draw_memory_badge(frame: np.ndarray, mem_percent: float | None) -> None:
                  (20, 20, 20), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
-    # Determine color and text based on memory percentage
+    # Determine color based on memory percentage
     if mem_percent is None:
         color = (128, 128, 128)  # Gray for no data
-        text = "MEM: N/A"
     elif mem_percent > 30:
         color = (0, 255, 0)  # Green for healthy
-        text = f"MEM: {int(mem_percent)}%"
     elif mem_percent > 15:
         color = (0, 255, 255)  # Yellow for warning
-        text = f"MEM: {int(mem_percent)}%"
     else:
         color = (0, 0, 255)  # Red for critical
-        text = f"MEM: {int(mem_percent)}%"
     
     # Draw border with color based on memory
     cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
                  color, 1)
     
-    # Draw memory text
-    cv2.putText(frame, text, (badge_x + 8, badge_y + 23), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
+    # Draw RAM chip symbol (simplified rectangle with lines)
+    icon_x = badge_x + badge_w // 2 - 10
+    icon_y = badge_y + badge_h // 2 - 6
+    
+    # Main chip body
+    cv2.rectangle(frame, (icon_x, icon_y), (icon_x + 20, icon_y + 12), color, 1)
+    
+    # Pins on left side
+    for i in range(3):
+        pin_y = icon_y + 2 + i * 4
+        cv2.line(frame, (icon_x - 2, pin_y), (icon_x, pin_y), color, 1)
+    
+    # Pins on right side
+    for i in range(3):
+        pin_y = icon_y + 2 + i * 4
+        cv2.line(frame, (icon_x + 20, pin_y), (icon_x + 22, pin_y), color, 1)
 
 
 def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
@@ -859,6 +939,7 @@ def main() -> None:
     if SHOW_MEMORY_BADGE:
         start_memory_monitor()  # Start memory monitoring thread
     start_motion_logger()  # Start motion logging thread
+    start_colorbar_toggle()  # Start colorbar toggle thread
     show_placeholder("Initializing camera...")
     cv2.waitKey(1)
 
@@ -993,6 +1074,17 @@ def main() -> None:
             # Draw timestamp text
             cv2.putText(disp, ts, (time_x + 15, time_y + 21),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
+            
+            # Draw camera cleanup message if colorbar toggle is active
+            with colorbar_lock:
+                is_cleanup_active = colorbar_active
+            
+            if is_cleanup_active:
+                cleanup_x = 10
+                cleanup_y = 55
+                cleanup_text = "Camera Frame Cleanup Ongoing..."
+                cv2.putText(disp, cleanup_text, (cleanup_x, cleanup_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
             
             # Draw subtle motion detection badge if motion detected (beside timestamp)
             if motion_detected:
