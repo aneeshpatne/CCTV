@@ -475,11 +475,31 @@ def show_placeholder(message: str) -> None:
         return  # Don't show placeholder if local view is disabled
     base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
     frame = base.copy()
-    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %p")
-    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    
+    # Draw timestamp with CCTV-style background (matching normal frames)
+    time_x = 10
+    time_y = 10
+    time_w = 305
+    time_h = 30
+    
+    # Draw semi-transparent dark background for timestamp
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                 (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    
+    # Draw subtle border
+    cv2.rectangle(frame, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                 (0, 255, 0), 1)
+    
+    # Draw timestamp text
+    cv2.putText(frame, ts, (time_x + 15, time_y + 21),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
+    
+    # Draw message below
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.75, (0, 165, 255), 2, cv2.LINE_AA)
+                0.65, (180, 220, 255), 1, cv2.LINE_AA)
     cv2.imshow("frame", frame)
 
 
@@ -488,10 +508,30 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
     frame = base.copy()
     ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    
+    # Draw timestamp with CCTV-style background (matching normal frames)
+    time_x = 10
+    time_y = 10
+    time_w = 305
+    time_h = 30
+    
+    # Draw semi-transparent dark background for timestamp
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                 (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    
+    # Draw subtle border
+    cv2.rectangle(frame, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                 (0, 255, 0), 1)
+    
+    # Draw timestamp text
+    cv2.putText(frame, ts, (time_x + 15, time_y + 21),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
+    
+    # Draw message below
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.75, (0, 165, 255), 2, cv2.LINE_AA)
+                0.65, (180, 220, 255), 1, cv2.LINE_AA)
 
     # Draw WiFi signal strength indicator
     with rssi_lock:
@@ -517,10 +557,30 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
 
     frame = base.copy()
     ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-    cv2.putText(frame, ts, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                0.75, (0, 255, 0), 2, cv2.LINE_AA)
+    
+    # Draw timestamp with CCTV-style background (matching normal frames)
+    time_x = 10
+    time_y = 10
+    time_w = 305
+    time_h = 30
+    
+    # Draw semi-transparent dark background for timestamp
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                 (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    
+    # Draw subtle border
+    cv2.rectangle(frame, (time_x, time_y), (time_x + time_w, time_y + time_h),
+                 (0, 255, 0), 1)
+    
+    # Draw timestamp text
+    cv2.putText(frame, ts, (time_x + 15, time_y + 21),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
+    
+    # Draw message below
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.75, (0, 165, 255), 2, cv2.LINE_AA)
+                0.65, (180, 220, 255), 1, cv2.LINE_AA)
 
     # Draw WiFi signal strength indicator
     with rssi_lock:
