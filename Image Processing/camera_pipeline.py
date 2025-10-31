@@ -682,7 +682,7 @@ def main() -> None:
             # Draw timestamp with CCTV-style background
             time_x = 10
             time_y = 10
-            time_w = 330
+            time_w = 305
             time_h = 30
             
             # Draw semi-transparent dark background for timestamp
@@ -702,9 +702,9 @@ def main() -> None:
             # Draw subtle motion detection badge if motion detected (beside timestamp)
             if motion_detected:
                 # Calculate position next to timestamp
-                badge_x = 350  # Position to the right of timestamp
+                badge_x = 325  # Position to the right of timestamp
                 badge_y = 10
-                badge_w = 210
+                badge_w = 190
                 badge_h = 30
                 
                 # Draw semi-transparent dark background rectangle
