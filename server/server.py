@@ -8,6 +8,16 @@ import socket
 import subprocess
 import tempfile
 import hashlib
+import sys
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from utilities.motion_db import (
+    get_motion_events_by_hours,
+    get_motion_events_by_date,
+    get_motion_events_by_range,
+    get_total_motion_count
+)
 
 app = FastAPI(title="CCTV Video Server", version="1.0")
 
@@ -41,6 +51,9 @@ async def root():
             "last_videos": "/video/last?minutes=15|30|60",
             "by_timestamp": "/video/by-timestamp?timestamp=YYYY-MM-DDTHH:MM:SS",
             "stream_file": "/video/stream/{filename}",
+            "motion_logs": "/motion/logs?hours=1|12|24",
+            "motion_by_day": "/motion/day?date=YYYY-MM-DD",
+            "motion_by_range": "/motion/range?start=ISO&end=ISO",
             "docs": "/docs"
         }
     }
@@ -487,6 +500,138 @@ async def list_videos():
         videos.sort(key=lambda x: x['timestamp'], reverse=True)
         return {"videos": videos, "count": len(videos)}
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# MOTION DETECTION API ENDPOINTS
+# ============================================================================
+
+@app.get("/motion/logs")
+async def get_motion_logs(hours: int = 24):
+    """
+    Get motion detection events from the last N hours.
+    
+    Args:
+        hours: Number of hours to look back (default: 24)
+                Common values: 1 (last hour), 12 (last 12 hours), 24 (last day)
+    
+    Example:
+        /motion/logs?hours=1   # Last hour
+        /motion/logs?hours=12  # Last 12 hours
+        /motion/logs?hours=24  # Last 24 hours (default)
+    """
+    try:
+        events = get_motion_events_by_hours(hours)
+        return {
+            "hours": hours,
+            "count": len(events),
+            "events": [e.to_dict() for e in events]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/motion/day")
+async def get_motion_by_day(date: str):
+    """
+    Get motion detection events for a specific day.
+    
+    Args:
+        date: Date in YYYY-MM-DD format
+    
+    Example:
+        /motion/day?date=2025-10-31
+    """
+    try:
+        # Parse date
+        dt = datetime.strptime(date, "%Y-%m-%d")
+        events = get_motion_events_by_date(dt)
+        
+        return {
+            "date": date,
+            "count": len(events),
+            "events": [e.to_dict() for e in events]
+        }
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date format. Use YYYY-MM-DD (e.g., 2025-10-31)"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/motion/range")
+async def get_motion_by_range(start: str, end: str):
+    """
+    Get motion detection events within a specific time range.
+    
+    Args:
+        start: Start timestamp in ISO format (e.g., 2025-10-31T10:00:00)
+        end: End timestamp in ISO format (e.g., 2025-10-31T12:00:00)
+    
+    Example:
+        /motion/range?start=2025-10-31T10:00:00&end=2025-10-31T12:00:00
+    """
+    try:
+        # Parse timestamps
+        try:
+            start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+        except:
+            start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
+        
+        try:
+            end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+        except:
+            end_dt = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
+        
+        if start_dt >= end_dt:
+            raise HTTPException(
+                status_code=400,
+                detail="Start time must be before end time"
+            )
+        
+        events = get_motion_events_by_range(start_dt, end_dt)
+        
+        return {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+            "count": len(events),
+            "events": [e.to_dict() for e in events]
+        }
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid timestamp format. Use ISO format (2025-10-31T10:00:00)"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/motion/stats")
+async def get_motion_stats():
+    """
+    Get overall motion detection statistics.
+    
+    Example:
+        /motion/stats
+    """
+    try:
+        total = get_total_motion_count()
+        
+        # Get counts for different time periods
+        last_hour = len(get_motion_events_by_hours(1))
+        last_12_hours = len(get_motion_events_by_hours(12))
+        last_24_hours = len(get_motion_events_by_hours(24))
+        
+        return {
+            "total_events": total,
+            "last_hour": last_hour,
+            "last_12_hours": last_12_hours,
+            "last_24_hours": last_24_hours
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

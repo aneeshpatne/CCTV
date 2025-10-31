@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
+from utilities.motion_db import log_motion_event
 
 URL = "http://192.168.1.119:81/stream"
 IST = pytz.timezone('Asia/Kolkata')
@@ -81,6 +82,13 @@ rssi_value = None
 rssi_lock = threading.Lock()
 rssi_thread = None
 rssi_update_interval = 60  # Update RSSI once per minute
+
+# Motion detection logging state
+motion_log_queue = []
+motion_log_lock = threading.Lock()
+motion_log_thread = None
+motion_debounce_seconds = 60  # Log motion at most once per minute
+last_motion_log_time = 0.0
 
 # Recording state
 ffmpeg_record_proc: Optional[subprocess.Popen] = None
@@ -334,6 +342,51 @@ def start_rssi_monitor() -> None:
         print(f"RSSI monitor started (updates every {rssi_update_interval}s)")
 
 
+def start_motion_logger() -> None:
+    """Start background thread to log motion events to database."""
+    global motion_log_thread
+    
+    def _motion_logger() -> None:
+        while True:
+            try:
+                # Check if there are any motion events to log
+                with motion_log_lock:
+                    if motion_log_queue:
+                        timestamp = motion_log_queue.pop(0)
+                        try:
+                            log_motion_event(timestamp)
+                            print(f"Motion logged to database: {timestamp.strftime('%Y-%m-%d %I:%M:%S %p')}")
+                        except Exception as e:
+                            print(f"Failed to log motion to database: {e}")
+                
+                time.sleep(1)  # Check queue every second
+            except Exception as e:
+                print(f"Motion logger error: {e}")
+                time.sleep(5)
+    
+    if motion_log_thread is None or not motion_log_thread.is_alive():
+        motion_log_thread = threading.Thread(target=_motion_logger, daemon=True)
+        motion_log_thread.start()
+        print("Motion logger thread started")
+
+
+def queue_motion_log(timestamp: datetime) -> None:
+    """Queue a motion event for logging with debounce.
+    
+    Args:
+        timestamp: Timestamp of the motion event
+    """
+    global last_motion_log_time
+    
+    current_time = time.time()
+    
+    # Debounce: only log if at least motion_debounce_seconds have passed
+    if current_time - last_motion_log_time >= motion_debounce_seconds:
+        with motion_log_lock:
+            motion_log_queue.append(timestamp)
+        last_motion_log_time = current_time
+
+
 def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
     """Draw WiFi signal strength indicator with CCTV-style background.
     
@@ -569,6 +622,7 @@ def main() -> None:
         print("Press Ctrl+C to stop")
     start_startup(force=True)
     start_rssi_monitor()  # Start RSSI monitoring thread
+    start_motion_logger()  # Start motion logging thread
     show_placeholder("Initializing camera...")
     cv2.waitKey(1)
 
@@ -666,6 +720,8 @@ def main() -> None:
             # Drive non-blocking blinker on motion
             if motion_detected and not blinker.is_active:
                 blinker.start(duration=1)
+                # Queue motion event for logging (with debounce)
+                queue_motion_log(datetime.now(IST))
 
             # Update blinker, but catch errors if camera is not responding
             try:
