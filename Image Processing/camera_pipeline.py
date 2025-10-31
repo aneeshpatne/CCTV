@@ -422,9 +422,9 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
         fps: Current frames per second
     """
     # Position to the left of WiFi badge
-    badge_w = 100
+    badge_w = 85
     badge_h = 35
-    wifi_badge_x = frame.shape[1] - 140 - 10  # WiFi badge position
+    wifi_badge_x = frame.shape[1] - 160 - 10  # WiFi badge position
     badge_x = wifi_badge_x - badge_w - 5  # 5px gap
     badge_y = 10
     
@@ -435,8 +435,8 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
     # Determine color based on FPS
-    if fps >= 8:
-        color = (0, 255, 0)  # Green for good
+    if fps >= 7:
+        color = (0, 255, 0)  # Green for good (target FPS)
     elif fps >= 5:
         color = (0, 255, 255)  # Yellow for fair
     else:
@@ -460,7 +460,7 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
         rssi: Signal strength in dBm (e.g., -50) or None
     """
     # Position in top-right corner
-    badge_w = 140
+    badge_w = 160
     badge_h = 35
     badge_x = frame.shape[1] - badge_w - 10
     badge_y = 10
