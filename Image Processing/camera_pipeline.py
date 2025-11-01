@@ -74,29 +74,22 @@ if no_signal_img is None:
 startup_complete = threading.Event()
 startup_thread = None
 startup_lock = threading.Lock()
-startup_in_progress = False  # Flag to prevent multiple simultaneous startup calls
 
 # Capture opening state
 capture_result = {'cap': None, 'done': False}
 capture_lock = threading.Lock()
-main_capture = None  # Reference to main loop's capture for forced cleanup
-main_capture_lock = threading.Lock()
 
 # RSSI monitoring state
 rssi_value = None
 rssi_lock = threading.Lock()
 rssi_thread = None
 rssi_update_interval = 10  # Update RSSI every 10 seconds
-rssi_stop_flag = threading.Event()  # Flag to stop RSSI monitor
-rssi_consecutive_failures = 0  # Track consecutive failures
 
 # Memory monitoring state
 memory_percent = None
 memory_lock = threading.Lock()
 memory_thread = None
 memory_update_interval = 10  # Update memory every 10 seconds
-memory_stop_flag = threading.Event()  # Flag to stop memory monitor
-memory_consecutive_failures = 0  # Track consecutive failures
 
 # FPS tracking state
 fps_value = 0.0
@@ -328,34 +321,14 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
 
 
 def start_startup(force: bool = False) -> None:
-    global startup_thread, startup_in_progress
+    global startup_thread
     with startup_lock:
-        # Prevent multiple simultaneous startup calls
-        if startup_in_progress and not force:
-            print("Startup already in progress, skipping duplicate call")
-            return
-        
         if force:
             startup_complete.clear()
-            startup_in_progress = True
-            
-            # Force close the main capture stream immediately
-            with main_capture_lock:
-                if main_capture is not None:
-                    try:
-                        print("Force closing stream for startup...")
-                        main_capture.release()
-                    except Exception as e:
-                        print(f"Error closing stream: {e}")
-            
-            # Stop monitoring threads when forcing a restart
-            stop_monitors()
-        
         if startup_complete.is_set():
             return
         if startup_thread is None or not startup_thread.is_alive():
             def _runner() -> None:
-                global startup_in_progress
                 attempt = 1
                 while not startup_complete.is_set():
                     try:
@@ -363,9 +336,6 @@ def start_startup(force: bool = False) -> None:
                         startup()
                         startup_complete.set()
                         print("Startup completed successfully!")
-                        # Mark startup as no longer in progress
-                        with startup_lock:
-                            startup_in_progress = False
                         # Now start monitoring threads after startup succeeds
                         start_rssi_monitor()
                         if SHOW_MEMORY_BADGE:
@@ -380,65 +350,24 @@ def start_startup(force: bool = False) -> None:
             startup_thread.start()
 
 
-def stop_monitors() -> None:
-    """Stop RSSI and memory monitoring threads."""
-    global rssi_consecutive_failures, memory_consecutive_failures
-    
-    print("Stopping monitoring threads...")
-    rssi_stop_flag.set()
-    memory_stop_flag.set()
-    
-    # Reset failure counters
-    rssi_consecutive_failures = 0
-    memory_consecutive_failures = 0
-    
-    # Wait a bit for threads to notice the flag
-    time.sleep(0.5)
-
-
 def start_rssi_monitor() -> None:
     """Start background thread to monitor RSSI every 10 seconds."""
-    global rssi_thread, rssi_consecutive_failures
+    global rssi_thread
     
     def _rssi_monitor() -> None:
-        global rssi_value, rssi_consecutive_failures
-        while not rssi_stop_flag.is_set():
+        global rssi_value
+        while True:
             try:
                 new_rssi = get_rssi(timeout=2.0)
+                with rssi_lock:
+                    rssi_value = new_rssi
                 if new_rssi is not None:
-                    with rssi_lock:
-                        rssi_value = new_rssi
-                    rssi_consecutive_failures = 0  # Reset on success
                     print(f"RSSI updated: {new_rssi} dBm")
-                else:
-                    # None returned means request failed
-                    rssi_consecutive_failures += 1
-                    print(f"RSSI request returned None (failure {rssi_consecutive_failures})")
-                    print("RSSI: failure detected - triggering startup restart")
-                    rssi_stop_flag.set()  # Stop this monitor
-                    memory_stop_flag.set()  # Stop other monitor too
-                    start_startup(force=True)  # Trigger startup
-                    break
             except Exception as e:
-                rssi_consecutive_failures += 1
-                print(f"RSSI monitoring error: {e} (failure {rssi_consecutive_failures})")
-                print("RSSI: failure detected - triggering startup restart")
-                rssi_stop_flag.set()  # Stop this monitor
-                memory_stop_flag.set()  # Stop other monitor too
-                start_startup(force=True)  # Trigger startup
-                break
-            
-            # Sleep in small intervals to check stop flag more frequently
-            for _ in range(rssi_update_interval):
-                if rssi_stop_flag.is_set():
-                    break
-                time.sleep(1)
-        
-        print("RSSI monitor stopped")
+                print(f"RSSI monitoring error: {e}")
+            time.sleep(rssi_update_interval)
     
     if rssi_thread is None or not rssi_thread.is_alive():
-        rssi_stop_flag.clear()  # Clear stop flag before starting
-        rssi_consecutive_failures = 0  # Reset failure counter
         rssi_thread = threading.Thread(target=_rssi_monitor, daemon=True)
         rssi_thread.start()
         print(f"RSSI monitor started (updates every {rssi_update_interval}s)")
@@ -446,11 +375,11 @@ def start_rssi_monitor() -> None:
 
 def start_memory_monitor() -> None:
     """Start background thread to monitor ESP32 memory every 10 seconds."""
-    global memory_thread, memory_consecutive_failures
+    global memory_thread
     
     def _memory_monitor() -> None:
-        global memory_percent, memory_consecutive_failures
-        while not memory_stop_flag.is_set():
+        global memory_percent
+        while True:
             try:
                 response = requests.get("http://192.168.1.119/syshealth", timeout=3.0)
                 if response.status_code == 200:
@@ -464,52 +393,17 @@ def start_memory_monitor() -> None:
                     with memory_lock:
                         memory_percent = mem_pct
                     
-                    memory_consecutive_failures = 0  # Reset on success
                     print(f"Memory updated: {mem_pct:.1f}% free ({free_heap}/{total_heap} bytes)")
-                else:
-                    memory_consecutive_failures += 1
-                    print(f"Memory monitoring: bad status {response.status_code} (failure {memory_consecutive_failures})")
-                    print("Memory: failure detected - triggering startup restart")
-                    memory_stop_flag.set()  # Stop this monitor
-                    rssi_stop_flag.set()  # Stop other monitor too
-                    start_startup(force=True)  # Trigger startup
-                    break
             except requests.exceptions.Timeout:
-                memory_consecutive_failures += 1
-                print(f"Memory monitoring: request timeout (failure {memory_consecutive_failures})")
-                print("Memory: failure detected - triggering startup restart")
-                memory_stop_flag.set()  # Stop this monitor
-                rssi_stop_flag.set()  # Stop other monitor too
-                start_startup(force=True)  # Trigger startup
-                break
+                print("Memory monitoring: request timeout")
             except requests.exceptions.RequestException as e:
-                memory_consecutive_failures += 1
-                print(f"Memory monitoring error: {e} (failure {memory_consecutive_failures})")
-                print("Memory: failure detected - triggering startup restart")
-                memory_stop_flag.set()  # Stop this monitor
-                rssi_stop_flag.set()  # Stop other monitor too
-                start_startup(force=True)  # Trigger startup
-                break
+                print(f"Memory monitoring error: {e}")
             except Exception as e:
-                memory_consecutive_failures += 1
-                print(f"Memory monitoring unexpected error: {e} (failure {memory_consecutive_failures})")
-                print("Memory: failure detected - triggering startup restart")
-                memory_stop_flag.set()  # Stop this monitor
-                rssi_stop_flag.set()  # Stop other monitor too
-                start_startup(force=True)  # Trigger startup
-                break
+                print(f"Memory monitoring unexpected error: {e}")
             
-            # Sleep in small intervals to check stop flag more frequently
-            for _ in range(memory_update_interval):
-                if memory_stop_flag.is_set():
-                    break
-                time.sleep(1)
-        
-        print("Memory monitor stopped")
+            time.sleep(memory_update_interval)
     
     if memory_thread is None or not memory_thread.is_alive():
-        memory_stop_flag.clear()  # Clear stop flag before starting
-        memory_consecutive_failures = 0  # Reset failure counter
         memory_thread = threading.Thread(target=_memory_monitor, daemon=True)
         memory_thread.start()
         print(f"Memory monitor started (updates every {memory_update_interval}s)")
@@ -1026,7 +920,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, main_capture
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
     attempt = 0
     cap = None
 
@@ -1073,8 +967,6 @@ def main() -> None:
 
             if not startup_complete.is_set():
                 if cap is not None:
-                    with main_capture_lock:
-                        main_capture = None
                     cap.release()
                     cap = None
 
@@ -1086,8 +978,6 @@ def main() -> None:
 
             if cap is None or not cap.isOpened():
                 if cap is not None:
-                    with main_capture_lock:
-                        main_capture = None
                     cap.release()
 
                 # Show and record "no signal" frame during connection attempts
@@ -1097,8 +987,6 @@ def main() -> None:
                 if cap is None or not cap.isOpened():
                     print(f"Failed to open stream on attempt {attempt + 1}")
                     if cap is not None:
-                        with main_capture_lock:
-                            main_capture = None
                         cap.release()
                     cap = None
                     attempt += 1
@@ -1106,9 +994,6 @@ def main() -> None:
                     start_startup(force=True)
                     continue
                 print("Connection established.")
-                # Update main_capture reference
-                with main_capture_lock:
-                    main_capture = cap
                 attempt = 0
 
             try:
@@ -1122,8 +1007,6 @@ def main() -> None:
 
             if not ret or frame is None:
                 print("Frame read failed - signal lost.")
-                with main_capture_lock:
-                    main_capture = None
                 cap.release()
                 cap = None
                 start_startup(force=True)
@@ -1277,8 +1160,6 @@ def main() -> None:
     finally:
         # Cleanup
         print("\nShutting down...")
-        with main_capture_lock:
-            main_capture = None
         if cap is not None:
             cap.release()
         with ffmpeg_lock:
