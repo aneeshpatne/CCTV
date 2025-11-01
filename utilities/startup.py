@@ -53,8 +53,8 @@ def startup():
         time.sleep(5)
         logger.info(f"Resolution Set Successfully to {i}")
         try:
-            logger.info("Setting camera clock to 15")
-            change_clock(15)
+            logger.info("Setting camera clock to 20")
+            change_clock(20)
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
         break

@@ -83,13 +83,17 @@ capture_lock = threading.Lock()
 rssi_value = None
 rssi_lock = threading.Lock()
 rssi_thread = None
-rssi_update_interval = 60  # Update RSSI once per minute
+rssi_update_interval = 10  # Update RSSI every 10 seconds
+rssi_stop_flag = threading.Event()  # Flag to stop RSSI monitor
+rssi_consecutive_failures = 0  # Track consecutive failures
 
 # Memory monitoring state
 memory_percent = None
 memory_lock = threading.Lock()
 memory_thread = None
 memory_update_interval = 10  # Update memory every 10 seconds
+memory_stop_flag = threading.Event()  # Flag to stop memory monitor
+memory_consecutive_failures = 0  # Track consecutive failures
 
 # FPS tracking state
 fps_value = 0.0
@@ -325,6 +329,8 @@ def start_startup(force: bool = False) -> None:
     with startup_lock:
         if force:
             startup_complete.clear()
+            # Stop monitoring threads when forcing a restart
+            stop_monitors()
         if startup_complete.is_set():
             return
         if startup_thread is None or not startup_thread.is_alive():
@@ -336,6 +342,10 @@ def start_startup(force: bool = False) -> None:
                         startup()
                         startup_complete.set()
                         print("Startup completed successfully!")
+                        # Now start monitoring threads after startup succeeds
+                        start_rssi_monitor()
+                        if SHOW_MEMORY_BADGE:
+                            start_memory_monitor()
                     except Exception as exc:
                         print(f"Startup failed with error: {exc}")
                         print("Retrying startup in 5 s...")
@@ -346,24 +356,65 @@ def start_startup(force: bool = False) -> None:
             startup_thread.start()
 
 
+def stop_monitors() -> None:
+    """Stop RSSI and memory monitoring threads."""
+    global rssi_consecutive_failures, memory_consecutive_failures
+    
+    print("Stopping monitoring threads...")
+    rssi_stop_flag.set()
+    memory_stop_flag.set()
+    
+    # Reset failure counters
+    rssi_consecutive_failures = 0
+    memory_consecutive_failures = 0
+    
+    # Wait a bit for threads to notice the flag
+    time.sleep(0.5)
+
+
 def start_rssi_monitor() -> None:
-    """Start background thread to monitor RSSI once per minute."""
-    global rssi_thread
+    """Start background thread to monitor RSSI every 10 seconds."""
+    global rssi_thread, rssi_consecutive_failures
     
     def _rssi_monitor() -> None:
-        global rssi_value
-        while True:
+        global rssi_value, rssi_consecutive_failures
+        while not rssi_stop_flag.is_set():
             try:
                 new_rssi = get_rssi(timeout=2.0)
-                with rssi_lock:
-                    rssi_value = new_rssi
                 if new_rssi is not None:
+                    with rssi_lock:
+                        rssi_value = new_rssi
+                    rssi_consecutive_failures = 0  # Reset on success
                     print(f"RSSI updated: {new_rssi} dBm")
+                else:
+                    # None returned means request failed
+                    rssi_consecutive_failures += 1
+                    print(f"RSSI request returned None (failure {rssi_consecutive_failures})")
+                    print("RSSI: failure detected - triggering startup restart")
+                    rssi_stop_flag.set()  # Stop this monitor
+                    memory_stop_flag.set()  # Stop other monitor too
+                    start_startup(force=True)  # Trigger startup
+                    break
             except Exception as e:
-                print(f"RSSI monitoring error: {e}")
-            time.sleep(rssi_update_interval)
+                rssi_consecutive_failures += 1
+                print(f"RSSI monitoring error: {e} (failure {rssi_consecutive_failures})")
+                print("RSSI: failure detected - triggering startup restart")
+                rssi_stop_flag.set()  # Stop this monitor
+                memory_stop_flag.set()  # Stop other monitor too
+                start_startup(force=True)  # Trigger startup
+                break
+            
+            # Sleep in small intervals to check stop flag more frequently
+            for _ in range(rssi_update_interval):
+                if rssi_stop_flag.is_set():
+                    break
+                time.sleep(1)
+        
+        print("RSSI monitor stopped")
     
     if rssi_thread is None or not rssi_thread.is_alive():
+        rssi_stop_flag.clear()  # Clear stop flag before starting
+        rssi_consecutive_failures = 0  # Reset failure counter
         rssi_thread = threading.Thread(target=_rssi_monitor, daemon=True)
         rssi_thread.start()
         print(f"RSSI monitor started (updates every {rssi_update_interval}s)")
@@ -371,11 +422,11 @@ def start_rssi_monitor() -> None:
 
 def start_memory_monitor() -> None:
     """Start background thread to monitor ESP32 memory every 10 seconds."""
-    global memory_thread
+    global memory_thread, memory_consecutive_failures
     
     def _memory_monitor() -> None:
-        global memory_percent
-        while True:
+        global memory_percent, memory_consecutive_failures
+        while not memory_stop_flag.is_set():
             try:
                 response = requests.get("http://192.168.1.119/syshealth", timeout=3.0)
                 if response.status_code == 200:
@@ -389,17 +440,52 @@ def start_memory_monitor() -> None:
                     with memory_lock:
                         memory_percent = mem_pct
                     
+                    memory_consecutive_failures = 0  # Reset on success
                     print(f"Memory updated: {mem_pct:.1f}% free ({free_heap}/{total_heap} bytes)")
+                else:
+                    memory_consecutive_failures += 1
+                    print(f"Memory monitoring: bad status {response.status_code} (failure {memory_consecutive_failures})")
+                    print("Memory: failure detected - triggering startup restart")
+                    memory_stop_flag.set()  # Stop this monitor
+                    rssi_stop_flag.set()  # Stop other monitor too
+                    start_startup(force=True)  # Trigger startup
+                    break
             except requests.exceptions.Timeout:
-                print("Memory monitoring: request timeout")
+                memory_consecutive_failures += 1
+                print(f"Memory monitoring: request timeout (failure {memory_consecutive_failures})")
+                print("Memory: failure detected - triggering startup restart")
+                memory_stop_flag.set()  # Stop this monitor
+                rssi_stop_flag.set()  # Stop other monitor too
+                start_startup(force=True)  # Trigger startup
+                break
             except requests.exceptions.RequestException as e:
-                print(f"Memory monitoring error: {e}")
+                memory_consecutive_failures += 1
+                print(f"Memory monitoring error: {e} (failure {memory_consecutive_failures})")
+                print("Memory: failure detected - triggering startup restart")
+                memory_stop_flag.set()  # Stop this monitor
+                rssi_stop_flag.set()  # Stop other monitor too
+                start_startup(force=True)  # Trigger startup
+                break
             except Exception as e:
-                print(f"Memory monitoring unexpected error: {e}")
+                memory_consecutive_failures += 1
+                print(f"Memory monitoring unexpected error: {e} (failure {memory_consecutive_failures})")
+                print("Memory: failure detected - triggering startup restart")
+                memory_stop_flag.set()  # Stop this monitor
+                rssi_stop_flag.set()  # Stop other monitor too
+                start_startup(force=True)  # Trigger startup
+                break
             
-            time.sleep(memory_update_interval)
+            # Sleep in small intervals to check stop flag more frequently
+            for _ in range(memory_update_interval):
+                if memory_stop_flag.is_set():
+                    break
+                time.sleep(1)
+        
+        print("Memory monitor stopped")
     
     if memory_thread is None or not memory_thread.is_alive():
+        memory_stop_flag.clear()  # Clear stop flag before starting
+        memory_consecutive_failures = 0  # Reset failure counter
         memory_thread = threading.Thread(target=_memory_monitor, daemon=True)
         memory_thread.start()
         print(f"Memory monitor started (updates every {memory_update_interval}s)")
@@ -471,8 +557,8 @@ def toggle_colorbar_once() -> None:
         else:
             print(f"Failed to turn colorbar ON: status {response.status_code}")
         
-        # Wait 10 seconds
-        time.sleep(10)
+        # Wait 2 seconds
+        time.sleep(2)
         
         # Turn colorbar OFF
         print("Toggling colorbar OFF...")
@@ -945,9 +1031,7 @@ def main() -> None:
         print("Local view disabled - running in headless mode")
         print("Press Ctrl+C to stop")
     start_startup(force=True)
-    start_rssi_monitor()  # Start RSSI monitoring thread
-    if SHOW_MEMORY_BADGE:
-        start_memory_monitor()  # Start memory monitoring thread
+    # Note: RSSI and Memory monitors will start after startup completes
     start_motion_logger()  # Start motion logging thread
     start_colorbar_toggle()  # Start colorbar toggle thread
     show_placeholder("Initializing camera...")
