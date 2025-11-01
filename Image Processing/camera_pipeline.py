@@ -74,10 +74,13 @@ if no_signal_img is None:
 startup_complete = threading.Event()
 startup_thread = None
 startup_lock = threading.Lock()
+startup_in_progress = False  # Flag to prevent multiple simultaneous startup calls
 
 # Capture opening state
 capture_result = {'cap': None, 'done': False}
 capture_lock = threading.Lock()
+main_capture = None  # Reference to main loop's capture for forced cleanup
+main_capture_lock = threading.Lock()
 
 # RSSI monitoring state
 rssi_value = None
@@ -325,16 +328,34 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
 
 
 def start_startup(force: bool = False) -> None:
-    global startup_thread
+    global startup_thread, startup_in_progress
     with startup_lock:
+        # Prevent multiple simultaneous startup calls
+        if startup_in_progress and not force:
+            print("Startup already in progress, skipping duplicate call")
+            return
+        
         if force:
             startup_complete.clear()
+            startup_in_progress = True
+            
+            # Force close the main capture stream immediately
+            with main_capture_lock:
+                if main_capture is not None:
+                    try:
+                        print("Force closing stream for startup...")
+                        main_capture.release()
+                    except Exception as e:
+                        print(f"Error closing stream: {e}")
+            
             # Stop monitoring threads when forcing a restart
             stop_monitors()
+        
         if startup_complete.is_set():
             return
         if startup_thread is None or not startup_thread.is_alive():
             def _runner() -> None:
+                global startup_in_progress
                 attempt = 1
                 while not startup_complete.is_set():
                     try:
@@ -342,6 +363,9 @@ def start_startup(force: bool = False) -> None:
                         startup()
                         startup_complete.set()
                         print("Startup completed successfully!")
+                        # Mark startup as no longer in progress
+                        with startup_lock:
+                            startup_in_progress = False
                         # Now start monitoring threads after startup succeeds
                         start_rssi_monitor()
                         if SHOW_MEMORY_BADGE:
@@ -1002,7 +1026,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, main_capture
     attempt = 0
     cap = None
 
@@ -1049,6 +1073,8 @@ def main() -> None:
 
             if not startup_complete.is_set():
                 if cap is not None:
+                    with main_capture_lock:
+                        main_capture = None
                     cap.release()
                     cap = None
 
@@ -1060,6 +1086,8 @@ def main() -> None:
 
             if cap is None or not cap.isOpened():
                 if cap is not None:
+                    with main_capture_lock:
+                        main_capture = None
                     cap.release()
 
                 # Show and record "no signal" frame during connection attempts
@@ -1069,6 +1097,8 @@ def main() -> None:
                 if cap is None or not cap.isOpened():
                     print(f"Failed to open stream on attempt {attempt + 1}")
                     if cap is not None:
+                        with main_capture_lock:
+                            main_capture = None
                         cap.release()
                     cap = None
                     attempt += 1
@@ -1076,6 +1106,9 @@ def main() -> None:
                     start_startup(force=True)
                     continue
                 print("Connection established.")
+                # Update main_capture reference
+                with main_capture_lock:
+                    main_capture = cap
                 attempt = 0
 
             try:
@@ -1089,6 +1122,8 @@ def main() -> None:
 
             if not ret or frame is None:
                 print("Frame read failed - signal lost.")
+                with main_capture_lock:
+                    main_capture = None
                 cap.release()
                 cap = None
                 start_startup(force=True)
@@ -1242,6 +1277,8 @@ def main() -> None:
     finally:
         # Cleanup
         print("\nShutting down...")
+        with main_capture_lock:
+            main_capture = None
         if cap is not None:
             cap.release()
         with ffmpeg_lock:
