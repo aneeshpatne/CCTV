@@ -72,6 +72,10 @@ startup_complete = threading.Event()
 startup_thread = None
 startup_lock = threading.Lock()
 
+# Camera adjustment state (run after stream starts)
+camera_adjustments_done = False
+camera_adjustments_lock = threading.Lock()
+
 # Capture opening state
 capture_result = {'cap': None, 'done': False}
 capture_lock = threading.Lock()
@@ -312,13 +316,20 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
 
 
 def start_startup(force: bool = False) -> None:
-    global startup_thread
+    global startup_thread, camera_adjustments_done
     with startup_lock:
         if force:
             startup_complete.clear()
+            # Reset camera adjustments flag so they run again after this startup
+            with camera_adjustments_lock:
+                camera_adjustments_done = False
         if startup_complete.is_set():
             return
         if startup_thread is None or not startup_thread.is_alive():
+            # Reset camera adjustments flag for new startup
+            with camera_adjustments_lock:
+                camera_adjustments_done = False
+                
             def _runner() -> None:
                 attempt = 1
                 while not startup_complete.is_set():
@@ -339,6 +350,56 @@ def start_startup(force: bool = False) -> None:
 
             startup_thread = threading.Thread(target=_runner, daemon=True)
             startup_thread.start()
+
+
+def apply_camera_adjustments() -> None:
+    """Apply camera adjustments after stream has started (runs in background thread)."""
+    def _adjust() -> None:
+        try:
+            # Wait 20 seconds after stream starts
+            print("Waiting 20 seconds for stream to stabilize...")
+            time.sleep(20)
+            
+            # Disable auto white balance
+            try:
+                print("Disabling auto white balance (awb=0)")
+                resp = requests.get("http://192.168.1.119/control?var=awb&val=0", timeout=2)
+                if resp.status_code == 200:
+                    print("AWB disabled successfully")
+            except Exception as e:
+                print(f"Setting AWB failed: {e}")
+            
+            time.sleep(2)
+            
+            # Set auto exposure level
+            try:
+                print("Setting auto exposure level (ae_level=2)")
+                resp = requests.get("http://192.168.1.119/control?var=ae_level&val=2", timeout=2)
+                if resp.status_code == 200:
+                    print("AE level set successfully")
+            except Exception as e:
+                print(f"Setting AE level failed: {e}")
+            
+            time.sleep(2)
+            
+            # Disable auto gain control
+            try:
+                print("Disabling auto gain control (agc=0)")
+                resp = requests.get("http://192.168.1.119/control?var=agc&val=0", timeout=2)
+                if resp.status_code == 200:
+                    print("AGC disabled successfully")
+            except Exception as e:
+                print(f"Setting AGC failed: {e}")
+            
+            time.sleep(2)
+            print("Camera adjustments completed")
+            
+        except Exception as e:
+            print(f"Camera adjustments error: {e}")
+    
+    adj_thread = threading.Thread(target=_adjust, daemon=True)
+    adj_thread.start()
+    print("Camera adjustment thread started (will apply settings after stream stabilizes)")
 
 
 def start_rssi_monitor() -> None:
@@ -846,7 +907,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
     attempt = 0
     cap = None
 
@@ -941,6 +1002,12 @@ def main() -> None:
 
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
+
+            # Apply camera adjustments after first successful frame (only once per startup)
+            with camera_adjustments_lock:
+                if not camera_adjustments_done:
+                    camera_adjustments_done = True
+                    apply_camera_adjustments()
 
             # Update FPS calculation
             update_fps()

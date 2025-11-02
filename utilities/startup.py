@@ -61,33 +61,6 @@ def startup():
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
         
-        # Disable auto white balance
-        try:
-            logger.info("Disabling auto white balance (awb=0)")
-            resp = requests.get("http://192.168.1.119/control?var=awb&val=0", timeout=2)
-        except RequestException as err:
-            logger.warning(f"Setting AWB failed: {err}")
-        
-        # Wait 20 seconds for image to stabilize
-        logger.info("Waiting 20 seconds for image to stabilize...")
-        time.sleep(20)
-        
-        # Set auto exposure level
-        try:
-            logger.info("Setting auto exposure level (ae_level=2)")
-            resp = requests.get("http://192.168.1.119/control?var=ae_level&val=2", timeout=2)
-        except RequestException as err:
-            logger.warning(f"Setting AE level failed: {err}")
-        
-        time.sleep(2)
-        
-        # Disable auto gain control
-        try:
-            logger.info("Disabling auto gain control (agc=0)")
-            resp = requests.get("http://192.168.1.119/control?var=agc&val=0", timeout=2)
-        except RequestException as err:
-            logger.warning(f"Setting AGC failed: {err}")
-        
         time.sleep(2)
         logger.info("Camera startup sequence completed")
         break
