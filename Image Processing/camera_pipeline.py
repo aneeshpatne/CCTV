@@ -121,17 +121,17 @@ current_fps: Optional[float] = None  # Dynamically calculated FPS for FFmpeg
 
 
 def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
-    """Start FFmpeg process responsible for local segmented recording."""
+    """Start FFmpeg process for variable frame rate CCTV recording."""
     os.makedirs(BASE_DIR, exist_ok=True)
     out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
 
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
-        # raw frames over stdin
+        # raw frames over stdin - NO FPS declaration
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", f"{fps:.2f}",
-        "-fflags", "+genpts",
+        "-s", f"{width}x{height}",
+        "-use_wallclock_as_timestamps", "1",  # Use system time for timestamps
         "-i", "-",
 
         "-map", "0:v",
@@ -139,7 +139,8 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "20",
-        "-g", str(max(1, int(fps))),
+        "-vsync", "vfr",  # Variable frame rate
+        "-g", "50",  # Keyframe every ~2 seconds at typical CCTV rates
         "-bf", "2",
         "-f", "segment",
         "-segment_time", str(SEGMENT_SECONDS),
@@ -161,7 +162,7 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
             stderr=logf,          # keep stderr for diagnostics
             bufsize=0
         )
-        print(f"FFmpeg recording started at {fps:.2f} FPS: {out_pattern}")
+        print(f"FFmpeg VFR recording started: {out_pattern}")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg: {e}")
@@ -169,13 +170,14 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
 
 
 def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
-    """Start FFmpeg process responsible for RTSP/WebRTC restream."""
+    """Start FFmpeg process for variable frame rate RTSP restream."""
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
+        # raw frames over stdin - NO FPS declaration
         "-f", "rawvideo", "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}", "-r", f"{fps:.2f}",
-        "-fflags", "+genpts",
+        "-s", f"{width}x{height}",
+        "-use_wallclock_as_timestamps", "1",  # Use system time for timestamps
         "-i", "-",
 
         "-map", "0:v",
@@ -188,7 +190,8 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subproces
         "-b:v", "1.5M",
         "-maxrate", "1.5M",
         "-bufsize", "3M",
-        "-g", str(max(1, int(fps))),
+        "-vsync", "vfr",  # Variable frame rate
+        "-g", "50",  # Keyframe every ~2 seconds
         "-bf", "0",
         "-sc_threshold", "0",
         "-rtsp_transport", "tcp",
@@ -206,7 +209,7 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subproces
             stderr=logf,
             bufsize=0
         )
-        print(f"FFmpeg RTSP started at {fps:.2f} FPS: {RTSP_OUT}")
+        print(f"FFmpeg VFR RTSP started: {RTSP_OUT}")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg RTSP: {e}")
