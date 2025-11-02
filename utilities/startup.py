@@ -3,6 +3,7 @@ import os
 import logging
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import time
+import requests
 from requests.exceptions import RequestException
 
 from tools.status import status
@@ -41,7 +42,7 @@ def startup():
                 time.sleep(10)
                 continue
             change_quality(i + 1)
-            time.sleep(2)
+            time.sleep(3)
             stat = status()
             cam_stat = check_mjpeg_stream()[0]
             if cam_stat == False or stat == None or int(stat) != i + 1:
@@ -50,13 +51,45 @@ def startup():
                 time.sleep(5)
                 continue
             i += 1
-        time.sleep(5)
+        time.sleep(6)
         logger.info(f"Resolution Set Successfully to {i}")
+        
+        # Set camera clock
         try:
             logger.info("Setting camera clock to 20")
             change_clock(20)
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
+        
+        # Disable auto white balance
+        try:
+            logger.info("Disabling auto white balance (awb=0)")
+            resp = requests.get("http://192.168.1.119/control?var=awb&val=0", timeout=2)
+        except RequestException as err:
+            logger.warning(f"Setting AWB failed: {err}")
+        
+        # Wait 20 seconds for image to stabilize
+        logger.info("Waiting 20 seconds for image to stabilize...")
+        time.sleep(20)
+        
+        # Set auto exposure level
+        try:
+            logger.info("Setting auto exposure level (ae_level=2)")
+            resp = requests.get("http://192.168.1.119/control?var=ae_level&val=2", timeout=2)
+        except RequestException as err:
+            logger.warning(f"Setting AE level failed: {err}")
+        
+        time.sleep(2)
+        
+        # Disable auto gain control
+        try:
+            logger.info("Disabling auto gain control (agc=0)")
+            resp = requests.get("http://192.168.1.119/control?var=agc&val=0", timeout=2)
+        except RequestException as err:
+            logger.warning(f"Setting AGC failed: {err}")
+        
+        time.sleep(2)
+        logger.info("Camera startup sequence completed")
         break
 
 

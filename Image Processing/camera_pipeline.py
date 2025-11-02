@@ -101,12 +101,6 @@ motion_log_thread = None
 motion_debounce_seconds = 60  # Log motion at most once per minute
 last_motion_log_time = 0.0
 
-# Colorbar toggle state
-colorbar_thread = None
-colorbar_interval = 2 * 60 * 60  # Toggle colorbar every 2 hours
-colorbar_active = False
-colorbar_lock = threading.Lock()
-
 # Recording state
 ffmpeg_record_proc: Optional[subprocess.Popen] = None
 ffmpeg_rtsp_proc: Optional[subprocess.Popen] = None
@@ -453,71 +447,6 @@ def start_motion_logger() -> None:
         motion_log_thread = threading.Thread(target=_motion_logger, daemon=True)
         motion_log_thread.start()
         print("Motion logger thread started")
-
-
-def toggle_colorbar_once() -> None:
-    """Toggle colorbar on then off with 10 second delay."""
-    global colorbar_active
-    
-    try:
-        # Set flag to show "cleanup ongoing" message
-        with colorbar_lock:
-            colorbar_active = True
-        
-        # Turn colorbar ON
-        print("Toggling colorbar ON...")
-        response = requests.get("http://192.168.1.119/control?var=colorbar&val=1", timeout=5.0)
-        if response.status_code == 200:
-            print("Colorbar turned ON successfully")
-        else:
-            print(f"Failed to turn colorbar ON: status {response.status_code}")
-        
-        # Wait 2 seconds
-        time.sleep(2)
-        
-        # Turn colorbar OFF
-        print("Toggling colorbar OFF...")
-        response = requests.get("http://192.168.1.119/control?var=colorbar&val=0", timeout=5.0)
-        if response.status_code == 200:
-            print("Colorbar turned OFF successfully")
-        else:
-            print(f"Failed to turn colorbar OFF: status {response.status_code}")
-        
-    except requests.exceptions.Timeout:
-        print("Colorbar toggle: request timeout")
-    except requests.exceptions.RequestException as e:
-        print(f"Colorbar toggle error: {e}")
-    except Exception as e:
-        print(f"Colorbar toggle unexpected error: {e}")
-    finally:
-        # Clear flag after toggle complete
-        with colorbar_lock:
-            colorbar_active = False
-
-
-def start_colorbar_toggle() -> None:
-    """Start background thread to toggle colorbar every 2 hours."""
-    global colorbar_thread
-    
-    def _colorbar_toggle() -> None:
-        # Wait for startup to complete before first toggle
-        print("Colorbar toggle thread: waiting for startup to complete...")
-        startup_complete.wait()
-        
-        # Perform initial toggle after startup
-        print("Startup complete - performing initial colorbar toggle...")
-        toggle_colorbar_once()
-        
-        # Continue toggling every 2 hours
-        while True:
-            time.sleep(colorbar_interval)
-            print(f"Performing periodic colorbar toggle (every {colorbar_interval/3600:.1f} hours)...")
-            toggle_colorbar_once()
-    
-    if colorbar_thread is None or not colorbar_thread.is_alive():
-        colorbar_thread = threading.Thread(target=_colorbar_toggle, daemon=True)
-        colorbar_thread.start()
-        print(f"Colorbar toggle thread started (runs every {colorbar_interval/3600:.1f} hours)")
 
 
 def queue_motion_log(timestamp: datetime) -> None:
@@ -948,7 +877,6 @@ def main() -> None:
     start_startup(force=True)
     # Note: RSSI and Memory monitors will start after startup completes
     start_motion_logger()  # Start motion logging thread
-    start_colorbar_toggle()  # Start colorbar toggle thread
     show_placeholder("Initializing camera...")
     cv2.waitKey(1)
 
@@ -1083,17 +1011,6 @@ def main() -> None:
             # Draw timestamp text
             cv2.putText(disp, ts, (time_x + 15, time_y + 23),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
-            
-            # Draw camera cleanup message if colorbar toggle is active
-            with colorbar_lock:
-                is_cleanup_active = colorbar_active
-            
-            if is_cleanup_active:
-                cleanup_x = 10
-                cleanup_y = 55
-                cleanup_text = "Camera Frame Cleanup Ongoing..."
-                cv2.putText(disp, cleanup_text, (cleanup_x, cleanup_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
             
             # Draw subtle motion detection badge if motion detected (beside timestamp)
             if motion_detected:
