@@ -41,8 +41,21 @@ def startup():
                 logger.warning("Camera not ready")
                 time.sleep(10)
                 continue
-            change_quality(i + 1)
-            time.sleep(3)
+            
+            # Wrap change_quality in try-except to handle connection timeouts
+            try:
+                change_quality(i + 1)
+                time.sleep(3)
+            except RequestException as err:
+                logger.warning(f"Failed to change quality (connection error): {err}")
+                # Camera likely crashed - restart from beginning
+                time.sleep(5)
+                break
+            except Exception as err:
+                logger.warning(f"Unexpected error changing quality: {err}")
+                time.sleep(5)
+                break
+            
             stat = status()
             cam_stat = check_mjpeg_stream()[0]
             if cam_stat == False or stat == None or int(stat) != i + 1:
@@ -51,8 +64,14 @@ def startup():
                 time.sleep(5)
                 continue
             i += 1
-        time.sleep(6)
-        logger.info(f"Resolution Set Successfully to {i}")
+        
+        # Only log success if we actually completed the loop
+        if i >= 12:
+            time.sleep(6)
+            logger.info(f"Resolution Set Successfully to {i}")
+        else:
+            logger.warning("Resolution setting incomplete - will retry")
+            continue
         
         # Set camera clock
         try:

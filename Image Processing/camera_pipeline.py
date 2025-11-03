@@ -333,6 +333,11 @@ def start_startup(force: bool = False) -> None:
             # Reset camera adjustments flag so they run again after this startup
             with camera_adjustments_lock:
                 camera_adjustments_done = False
+            
+            # Note: We don't stop monitoring threads here because they should continue
+            # running and showing connection status even during restarts.
+            # The key is that startup_complete controls the main loop behavior.
+            
         if startup_complete.is_set():
             return
         if startup_thread is None or not startup_thread.is_alive():
@@ -348,10 +353,7 @@ def start_startup(force: bool = False) -> None:
                         startup()
                         startup_complete.set()
                         print("Startup completed successfully!")
-                        # Now start monitoring threads after startup succeeds
-                        start_rssi_monitor()
-                        if SHOW_MEMORY_BADGE:
-                            start_memory_monitor()
+                        # Monitoring threads are already started in main()
                     except Exception as exc:
                         print(f"Startup failed with error: {exc}")
                         print("Retrying startup in 5 s...")
@@ -946,9 +948,12 @@ def main() -> None:
         print("Local view disabled - running in headless mode")
         print("Press Ctrl+C to stop")
     start_startup(force=True)
-    # Note: RSSI and Memory monitors will start after startup completes
+    # Start monitoring threads early so they show status during startup
+    start_rssi_monitor()
+    if SHOW_MEMORY_BADGE:
+        start_memory_monitor()
     start_motion_logger()  # Start motion logging thread
-    show_placeholder("Initializing camera...")
+    show_placeholder("STARTUP: Initializing camera...")
     cv2.waitKey(1)
 
     try:
@@ -967,7 +972,8 @@ def main() -> None:
                     cap = None
 
                 # Show and record "no signal" frame during initialization
-                record_no_signal_frame("Initializing camera...")
+                # RSSI/Memory monitors are running, showing actual camera health
+                record_no_signal_frame("STARTUP: Configuring camera...")
 
                 time.sleep(0.05)
                 continue
@@ -977,7 +983,8 @@ def main() -> None:
                     cap.release()
 
                 # Show and record "no signal" frame during connection attempts
-                record_no_signal_frame(f"Connecting (attempt {attempt + 1})...")
+                # Startup is complete, but video stream not connected yet
+                record_no_signal_frame(f"STREAM: Connecting (attempt {attempt + 1})...")
 
                 cap = open_capture_with_timeout()
                 if cap is None or not cap.isOpened():
@@ -1008,7 +1015,8 @@ def main() -> None:
                 start_startup(force=True)
 
                 # Show and record "no signal" frame
-                record_no_signal_frame("Signal lost - restarting...")
+                # Camera crashed during operation - restarting everything
+                record_no_signal_frame("CRASH: Restarting camera...")
 
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
