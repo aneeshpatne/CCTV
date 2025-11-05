@@ -50,6 +50,9 @@ async def root():
             "list_videos": "/video/list",
             "last_videos": "/video/last?minutes=15|30|60",
             "by_timestamp": "/video/by-timestamp?timestamp=YYYY-MM-DDTHH:MM:SS",
+            "by_duration": "/video/by-duration?timestamp=YYYY-MM-DDTHH:MM:SS&minutes=X",
+            "by_hour": "/video/by-hour?timestamp=YYYY-MM-DDTHH:MM:SS",
+            "by_day": "/video/by-day?timestamp=YYYY-MM-DDTHH:MM:SS",
             "stream_file": "/video/stream/{filename}",
             "motion_logs": "/motion/logs?hours=1|12|24",
             "motion_by_day": "/motion/day?date=YYYY-MM-DD",
@@ -143,6 +146,110 @@ def find_video_by_timestamp(timestamp: datetime) -> Path:
         raise HTTPException(status_code=404, detail=f"Video not found for timestamp: {timestamp}")
     
     return filepath
+
+
+@app.get("/video/by-duration")
+async def get_video_by_duration(timestamp: str, minutes: int, background_tasks: BackgroundTasks):
+    """
+    Get merged video for a custom duration starting from a timestamp.
+    Includes extra videos at the start and end to ensure complete coverage.
+    
+    Args:
+        timestamp: ISO format datetime (e.g., "2025-11-05T19:40:00")
+                  Starting point for the video duration
+        minutes: Duration in minutes (e.g., 30, 60, 90, 120)
+                Will include 1 video before start and 1 video after end
+    
+    Example:
+        /video/by-duration?timestamp=2025-11-05T19:40:00&minutes=60
+        /video/by-duration?timestamp=2025-11-05T19:40:00&minutes=30
+    """
+    try:
+        # Parse timestamp
+        try:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        except:
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        
+        # Calculate time range
+        start_time = dt
+        end_time = dt + timedelta(minutes=minutes)
+        
+        # Find videos in this range
+        videos = find_videos_in_range(start_time, end_time)
+        
+        if not videos:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No videos found for period: {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')}"
+            )
+        
+        # Get all videos to include extras before and after
+        folder = Path(CCTV_FOLDER)
+        all_videos = []
+        
+        for file in folder.glob("recording_*.mp4"):
+            try:
+                timestamp_str = file.stem.replace("recording_", "")
+                file_dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                all_videos.append((file_dt, file))
+            except ValueError:
+                continue
+        
+        all_videos.sort(key=lambda x: x[0])
+        
+        # Find indices of first and last video in our range
+        first_idx = None
+        last_idx = None
+        
+        for i, (file_dt, file) in enumerate(all_videos):
+            if file in videos:
+                if first_idx is None:
+                    first_idx = i
+                last_idx = i
+        
+        # Include 1 video before and after
+        if first_idx is not None and last_idx is not None:
+            start_idx = max(0, first_idx - 1)
+            end_idx = min(len(all_videos), last_idx + 2)
+            
+            videos_to_merge = [all_videos[i][1] for i in range(start_idx, end_idx)]
+        else:
+            videos_to_merge = videos
+        
+        # If only one video, return it directly
+        if len(videos_to_merge) == 1:
+            return FileResponse(
+                path=str(videos_to_merge[0]),
+                media_type="video/mp4",
+                filename=videos_to_merge[0].name
+            )
+        
+        # Generate unique filename for merged video
+        timestamp_str = dt.strftime("%Y%m%d_%H%M%S")
+        merged_filename = f"merged_duration_{minutes}min_{timestamp_str}.mp4"
+        merged_path = Path(TEMP_FOLDER) / merged_filename
+        
+        # Check if merged video already exists
+        if not merged_path.exists():
+            # Merge videos
+            if not merge_videos(videos_to_merge, merged_path):
+                raise HTTPException(status_code=500, detail="Failed to merge videos")
+        
+        # Schedule cleanup of old merged videos
+        background_tasks.add_task(cleanup_old_merged_videos)
+        
+        return FileResponse(
+            path=str(merged_path),
+            media_type="video/mp4",
+            filename=merged_filename
+        )
+        
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid timestamp format. Use ISO format (2025-11-05T19:40:00)"
+        )
 
 
 @app.get("/video/by-hour")
@@ -362,8 +469,8 @@ async def get_last_videos(minutes: int, background_tasks: BackgroundTasks):
 @app.get("/video/by-timestamp")
 async def get_video_by_timestamp(timestamp: str, background_tasks: BackgroundTasks):
     """
-    Get video by timestamp, including 1 video before and 1 video after.
-    This ensures you get complete coverage around the requested time.
+    Get video that contains the requested timestamp, including 1 video before and 1 video after.
+    Finds the video whose recording period would contain the given timestamp.
     
     Args:
         timestamp: ISO format datetime string (e.g., "2025-10-29T10:53:42")
@@ -381,7 +488,7 @@ async def get_video_by_timestamp(timestamp: str, background_tasks: BackgroundTas
             # Try parsing custom format
             dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
         
-        # Get all videos and find the one matching timestamp
+        # Get all videos
         folder = Path(CCTV_FOLDER)
         all_videos = []
         
@@ -393,21 +500,29 @@ async def get_video_by_timestamp(timestamp: str, background_tasks: BackgroundTas
             except ValueError:
                 continue
         
+        if not all_videos:
+            raise HTTPException(
+                status_code=404,
+                detail="No videos found in the recordings folder"
+            )
+        
         # Sort by timestamp
         all_videos.sort(key=lambda x: x[0])
         
-        # Find the target video and its neighbors
+        # Find the video that would contain this timestamp
+        # This is the video that starts at or before the requested time
+        # and the next video starts after the requested time (or it's the last video)
         target_index = None
+        
         for i, (file_dt, file) in enumerate(all_videos):
-            if file_dt == dt:
-                target_index = i
+            # If this video starts after our timestamp, the previous one contains it
+            if file_dt > dt:
+                target_index = max(0, i - 1)
                 break
         
+        # If we didn't find a video starting after, the last video contains it
         if target_index is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Video not found for timestamp: {dt}"
-            )
+            target_index = len(all_videos) - 1
         
         # Get videos: 1 before, target, 1 after
         videos_to_merge = []
