@@ -1,12 +1,18 @@
 #!/bin/bash
-# Absolute path to your project
+# Activate the virtual environment
+source /home/aneesh/Desktop/Code/CCTV/venv/bin/activate
+
+# Move into the motion directory
 cd /home/aneesh/Desktop/Code/CCTV/motion || exit
 
-# Activate virtual environment
-source venv/bin/activate
+# Log start time
+echo "---- $(date) : Starting motion.py ----" >> /home/aneesh/Desktop/Code/CCTV/motion/motion.log
 
-# Run your Python script
-python motion.py
+# Run the Python script
+python motion.py >> /home/aneesh/Desktop/Code/CCTV/motion/motion.log 2>&1
 
-# (optional) deactivate venv after run
+# Log end time
+echo "---- $(date) : Finished motion.py ----" >> /home/aneesh/Desktop/Code/CCTV/motion/motion.log
+
+# Deactivate venv
 deactivate
