@@ -12,16 +12,19 @@ ist = pytz.timezone('Asia/Kolkata')
 logging.info("Program started")
 directory = Path("data/") 
 
+# Create directory if it doesn't exist
+directory.mkdir(exist_ok=True)
+
 logging.info("Cleaning Paths")
 
 # Deleting Paths
 
-
 if directory.exists() and directory.is_dir():
     for file in directory.iterdir():
+        print("[DELETE] Files Detected")
         if (file.is_file()):
             try:
-                logging.info(f"[DELETE] Program started {file}")
+                logging.info(f"[DELETE] Deleting {file}")
                 file.unlink()
             except Exception as e:
                 logging.error(f"[DELETE] Failed to delete {file}: {e}")
@@ -57,7 +60,7 @@ while i < len(timestamps):
         else:
             break
     
-    # Add the merged event
+
     motion_events.append({
         'timestamp': start_time,
         'duration': duration
@@ -65,18 +68,19 @@ while i < len(timestamps):
     
     logging.info(f"Motion event: {start_time.time()} - Duration: {duration:.2f} minutes")
     
-    # Move to the next unprocessed timestamp
     i = j if j < len(timestamps) else len(timestamps)
 
 logging.info(f"Total merged motion events: {len(motion_events)}")
 
 for item in motion_events:
     start_time = item.get("timestamp") - timedelta(minutes=1)
-    logging.info(f"Fetching video for motion starting at {start_time} and duration{item.get("duration")}")
+    logging.info(f"Fetching video for motion starting at {start_time} and duration: {item.get("duration")}")
     res = requests.get(f"http://192.168.1.100:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(item.get('duration'))}")
     if res.ok:
-        with open(f"{item.get("timestamp")}.mp4", "wb") as f:
+        output_path = directory / f"{item.get('timestamp')}.mp4"
+        with open(output_path, "wb") as f:
             f.write(res.content)
-        print("Video saved as output.mp4")
+        print(f"Video saved as {output_path}")
     else:
         print("Failed to fetch video:", res.status_code)
+
