@@ -57,6 +57,7 @@ async def root():
             "motion_logs": "/motion/logs?hours=1|12|24",
             "motion_by_day": "/motion/day?date=YYYY-MM-DD",
             "motion_by_range": "/motion/range?start=ISO&end=ISO",
+            "motion_stats": "/motion/stats",
             "docs": "/docs"
         }
     }
