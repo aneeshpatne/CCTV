@@ -48,7 +48,7 @@ async def root():
         "local_ip": local_ip,
         "endpoints": {
             "list_videos": "/video/list",
-            "last_videos": "/video/last?minutes=15|30|60",
+            "last_videos": "/video/last?minutes=5|15|30|60",
             "by_timestamp": "/video/by-timestamp?timestamp=YYYY-MM-DDTHH:MM:SS",
             "by_duration": "/video/by-duration?timestamp=YYYY-MM-DDTHH:MM:SS&minutes=X",
             "by_hour": "/video/by-hour?timestamp=YYYY-MM-DDTHH:MM:SS",
@@ -392,17 +392,18 @@ async def get_last_videos(minutes: int, background_tasks: BackgroundTasks):
     Get merged video for the last N minutes from now.
     
     Args:
-        minutes: Number of minutes to look back (15, 30, or 60)
+        minutes: Number of minutes to look back (5, 15, 30, or 60)
     
     Example:
+        /video/last?minutes=5
         /video/last?minutes=15
         /video/last?minutes=30
         /video/last?minutes=60
     """
-    if minutes not in [15, 30, 60]:
+    if minutes not in [5, 15, 30, 60]:
         raise HTTPException(
             status_code=400,
-            detail="Minutes must be 15, 30, or 60"
+            detail="Minutes must be 5, 15, 30, or 60"
         )
     
     try:
