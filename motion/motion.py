@@ -3,6 +3,7 @@ import logging
 import requests
 from datetime import datetime, timedelta
 import pytz
+from collections import defaultdict
 
 logging.basicConfig(level=logging.INFO)
 
@@ -41,7 +42,31 @@ for d in data.json().get("events"):
 
 logging.info("Merging Time")
 
+motion_events = []
 
-for i in range(len(timestamps) - 1):
-    diff = timestamps[i+1] - timestamps[i]        # timedelta
-    print(diff, diff.total_seconds(), "seconds")
+i = 0
+while i < len(timestamps):
+    start_time = timestamps[i]
+    duration = 2  
+    j = i + 1
+    while j < len(timestamps):
+        diff = timestamps[j] - timestamps[j-1]
+        if diff < timedelta(minutes=2):
+            duration += diff.total_seconds() / 60  
+            j += 1
+        else:
+            break
+    
+    # Add the merged event
+    motion_events.append({
+        'timestamp': start_time,
+        'duration': duration
+    })
+    
+    logging.info(f"Motion event: {start_time.time()} - Duration: {duration:.2f} minutes")
+    
+    # Move to the next unprocessed timestamp
+    i = j if j < len(timestamps) else len(timestamps)
+
+logging.info(f"Total merged motion events: {len(motion_events)}")
+
