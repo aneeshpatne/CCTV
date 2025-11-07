@@ -33,6 +33,7 @@ app.add_middleware(
 # Configure your CCTV footage directory
 CCTV_FOLDER = "/media/aneesh/SSD/recordings/esp_cam1"
 TEMP_FOLDER = "/tmp/cctv_merged"  # Temporary folder for merged videos
+NIGHT_EVENTS_FOLDER = str(Path(__file__).resolve().parent.parent / "motion" / "data")  # Night motion events
 
 # Create temp folder if it doesn't exist
 Path(TEMP_FOLDER).mkdir(parents=True, exist_ok=True)
@@ -58,6 +59,8 @@ async def root():
             "motion_by_day": "/motion/day?date=YYYY-MM-DD",
             "motion_by_range": "/motion/range?start=ISO&end=ISO",
             "motion_stats": "/motion/stats",
+            "night_events_list": "/nightevents",
+            "night_event_by_index": "/nightevents/{index}",
             "docs": "/docs"
         }
     }
@@ -749,6 +752,126 @@ async def get_motion_stats():
             "last_12_hours": last_12_hours,
             "last_24_hours": last_24_hours
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# NIGHT EVENTS API ENDPOINTS
+# ============================================================================
+
+@app.get("/nightevents")
+async def get_night_events():
+    """
+    Get all night event videos sorted by timestamp.
+    Returns list of videos from the motion/data folder.
+    
+    Example:
+        /nightevents
+    """
+    try:
+        folder = Path(NIGHT_EVENTS_FOLDER)
+        
+        if not folder.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Night events folder not found"
+            )
+        
+        videos = []
+        
+        for file in folder.glob("*.mp4"):
+            try:
+                # Parse the timestamp from filename: "2025-11-07 05:50:48.009861.mp4"
+                timestamp_str = file.stem  # Remove .mp4 extension
+                dt = datetime.fromisoformat(timestamp_str)
+                
+                videos.append({
+                    "index": 0,  # Will be set after sorting
+                    "filename": file.name,
+                    "timestamp": dt.isoformat(),
+                    "size_mb": round(file.stat().st_size / (1024 * 1024), 2),
+                    "path": str(file)
+                })
+            except (ValueError, OSError) as e:
+                # Skip files that don't match expected format
+                continue
+        
+        # Sort by timestamp (oldest first)
+        videos.sort(key=lambda x: x['timestamp'])
+        
+        # Add 1-based indices
+        for idx, video in enumerate(videos, 1):
+            video['index'] = idx
+        
+        return {
+            "count": len(videos),
+            "videos": videos
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/nightevents/{index}")
+async def get_night_event_by_index(index: int):
+    """
+    Get a specific night event video by its index (1-based).
+    Videos are sorted by timestamp (oldest first).
+    
+    Args:
+        index: 1-based index of the video
+    
+    Example:
+        /nightevents/1  # Get the first (oldest) night event video
+        /nightevents/5  # Get the fifth night event video
+    """
+    try:
+        folder = Path(NIGHT_EVENTS_FOLDER)
+        
+        if not folder.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Night events folder not found"
+            )
+        
+        videos = []
+        
+        for file in folder.glob("*.mp4"):
+            try:
+                timestamp_str = file.stem
+                dt = datetime.fromisoformat(timestamp_str)
+                videos.append((dt, file))
+            except (ValueError, OSError):
+                continue
+        
+        if not videos:
+            raise HTTPException(
+                status_code=404,
+                detail="No night event videos found"
+            )
+        
+        # Sort by timestamp (oldest first)
+        videos.sort(key=lambda x: x[0])
+        
+        # Check if index is valid (1-based)
+        if index < 1 or index > len(videos):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Invalid index. Valid range: 1-{len(videos)}"
+            )
+        
+        # Get the video at the specified index (convert to 0-based)
+        selected_video = videos[index - 1][1]
+        
+        return FileResponse(
+            path=str(selected_video),
+            media_type="video/mp4",
+            filename=selected_video.name
+        )
+        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
