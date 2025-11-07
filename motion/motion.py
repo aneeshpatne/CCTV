@@ -47,7 +47,7 @@ motion_events = []
 i = 0
 while i < len(timestamps):
     start_time = timestamps[i]
-    duration = 2  
+    duration = 1
     j = i + 1
     while j < len(timestamps):
         diff = timestamps[j] - timestamps[j-1]
@@ -70,3 +70,13 @@ while i < len(timestamps):
 
 logging.info(f"Total merged motion events: {len(motion_events)}")
 
+for item in motion_events:
+    start_time = item.get("timestamp") - timedelta(minutes=1)
+    logging.info(f"Fetching video for motion starting at {start_time} and duration{item.get("duration")}")
+    res = requests.get(f"http://192.168.1.100:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(item.get('duration'))}")
+    if res.ok:
+        with open(f"{item.get("timestamp")}.mp4", "wb") as f:
+            f.write(res.content)
+        print("Video saved as output.mp4")
+    else:
+        print("Failed to fetch video:", res.status_code)
