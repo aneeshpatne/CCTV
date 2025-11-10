@@ -5,6 +5,28 @@ from datetime import datetime, timedelta
 import pytz
 from collections import defaultdict
 import sys
+import os
+import json
+import asyncio
+from dotenv import load_dotenv
+from telegram import Bot
+from telegram.request import HTTPXRequest
+
+
+load_dotenv()
+
+# Telegram bot token
+TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+WHITELIST_FILE = "whitelist.json"
+
+def load_whitelist():
+    if os.path.exists(WHITELIST_FILE):
+        with open(WHITELIST_FILE, "r") as f:
+            return set(json.load(f))
+    return set()
+
+whitelist = load_whitelist()
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,4 +200,24 @@ for idx, item in enumerate(motion_events, 1):
 logging.info("="*50)
 logging.info(f"[SUMMARY] Download complete: {successful_downloads} successful, {failed_downloads} failed")
 logging.info("="*50)
+
+logging.info(f"[TELEGRAM] Commencing motion messages")
+
+events_str = "\n".join(
+    f"{e.get("timestamp")} - duration: {e.get("duration")} s"
+    for e in motion_events
+)
+
+message = f"Tonight {now_ist} total Events detected were {len(motion_events)}" + events_str;
+
+async def send_telegram_notification(message: str):
+    """Send notification to all whitelisted users"""
+    request = HTTPXRequest(connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30)
+    bot = Bot(token=TOKEN, request=request)
     
+    for user_id in whitelist:
+        try:
+            await bot.send_message(chat_id=user_id, text=message)  # type: ignore
+            logging.info(f"[TELEGRAM] ✓ Sent to user {user_id}")
+        except Exception as e:
+            logging.error(f"[TELEGRAM] ✗ Failed to send to user {user_id}: {e}")
