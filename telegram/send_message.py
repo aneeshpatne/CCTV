@@ -58,6 +58,8 @@ async def send_message_to_all(message: str, video_path: str | None = None):
     
     print(f"\n📊 Summary: {success_count} successful, {fail_count} failed")
 
+
+
 def main():
     # Your message here
     message = """
