@@ -178,3 +178,4 @@ for idx, item in enumerate(motion_events, 1):
 logging.info("="*50)
 logging.info(f"[SUMMARY] Download complete: {successful_downloads} successful, {failed_downloads} failed")
 logging.info("="*50)
+    

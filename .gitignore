@@ -1,5 +1,2 @@
-venv
-.vscode
+.env
 __pycache__
-live.py
-/motion/data
