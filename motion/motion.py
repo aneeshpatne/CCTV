@@ -215,7 +215,7 @@ events_str = "\n".join(
 )
 
 message = (
-    f"<b>todays events</b>\n"
+    f"<b>Tonights events</b>\n"
     f"📅 Date: {now_ist}\n"
     f"⏱️ Time window: 00:00–07:00\n"
     f"🎯 Total events: {len(motion_events)}\n"
@@ -338,7 +338,10 @@ async def send_telegram_video(directory):
     request = HTTPXRequest(connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30)
     bot = Bot(token=TOKEN, request=request)
     
-    for file in directory.iterdir():
+    # Sort files by name for consistent ordering
+    sorted_files = sorted(directory.iterdir(), key=lambda x: x.name)
+    
+    for i, file in enumerate(sorted_files, start=1):
         if not file.is_file() or file.suffix.lower() != ".mp4":
             continue
             
@@ -360,7 +363,9 @@ async def send_telegram_video(directory):
             for user_id in whitelist:
                 try:
                     with open(video_to_send, 'rb') as f:
-                        await bot.send_video(chat_id=user_id, video=f)  # type: ignore
+                        start_time = motion_events[i-1].get("timestamp")
+                        caption = f"Event Occured at {start_time.strftime('%H:%M:%S')} \n 192.168.1.100:8005/nightevents/{i}"
+                        await bot.send_video(chat_id=user_id, video=f, caption= caption)  # type: ignore
                     logging.info(f"[TELEGRAM] ✓ Sent {file.name} to user {user_id}")
                 except Exception as e:
                     logging.error(f"[TELEGRAM] ✗ Failed to send {file.name} to user {user_id}: {e}")
