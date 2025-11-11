@@ -242,8 +242,11 @@ TARGET_SIZE = 45 * 1024 * 1024
 MAX_TELEGRAM_SIZE = 50 * 1024 * 1024  # 50 MB Telegram limit
 
 # COMPRESSION OPTIONS:
-# Option 1: Use H.265 (HEVC) - Better compression but MUCH SLOWER (not recommended)
-USE_H265 = False  # Set to True for better compression (but 5-10x slower!)
+# Force GPU encoding with NVENC (h264_nvenc for older hardware)
+USE_GPU = True  # Force NVIDIA NVENC hardware encoding
+
+# Force compression for all videos
+FORCE_COMPRESS = True  # Compress all videos regardless of size
 
 # Option 2: Use CRF mode instead of bitrate (better quality control)
 USE_CRF_MODE = True  # CRF mode for better quality at similar file sizes
@@ -253,17 +256,16 @@ SCALE_RESOLUTION = True  # Scale down to 80% size for faster compression
 
 def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Path:
     """
-    Compress video using ffmpeg to fit under target size.
-    Uses ultrafast preset for minimal CPU usage.
-    Supports H.265 (HEVC) for better compression than H.264.
+    Compress video using ffmpeg with NVIDIA NVENC hardware encoding.
+    Uses h264_nvenc for GPU acceleration (compatible with older NVIDIA GPUs).
     Returns path to compressed video (in temp directory).
     """
     input_size = input_path.stat().st_size
     input_size_mb = input_size / (1024 * 1024)
     target_size_mb = target_size_bytes / (1024 * 1024)
     
-    codec_name = "H.265 (HEVC)" if USE_H265 else "H.264"
-    logging.info(f"[COMPRESS] Starting compression of {input_path.name} ({input_size_mb:.2f} MB -> target: {target_size_mb:.2f} MB) using {codec_name}")
+    codec_name = "H.264 NVENC (GPU)"
+    logging.info(f"[COMPRESS] Starting GPU compression of {input_path.name} ({input_size_mb:.2f} MB -> target: {target_size_mb:.2f} MB) using {codec_name}")
     
     # Create a temporary file for compressed output
     temp_dir = Path(tempfile.gettempdir())
@@ -286,56 +288,39 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         logging.info(f"[COMPRESS] Video duration: {duration:.2f}s, target bitrate: {target_bitrate} kbps")
         
         if USE_CRF_MODE:
-            # CRF mode: better quality control (23-28 for H.264, 28-32 for H.265)
-            crf_value = 32 if USE_H265 else 28
-            codec = 'libx265' if USE_H265 else 'libx264'
+            # CRF mode with NVENC: use -cq (constant quality) instead of -crf
+            # CQ range: 0-51, lower = better quality (28-32 is good for NVENC)
+            cq_value = 28
             
             ffmpeg_cmd = [
-                'ffmpeg', '-i', str(input_path),
-                '-c:v', codec,
-                '-preset', 'ultrafast',
-                '-crf', str(crf_value)
-            ]
-            
-            # Add x265-params for H.265 (must come before output options)
-            if USE_H265:
-                ffmpeg_cmd.extend(['-x265-params', 'log-level=error'])
-            
-            # Add common output options
-            ffmpeg_cmd.extend([
+                'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
+                '-cq', str(cq_value),
                 '-an',  # No audio
                 '-movflags', '+faststart',
                 '-y',
                 str(output_path)
-            ])
+            ]
             
-            logging.info(f"[COMPRESS] Running CRF compression (CRF={crf_value}, ultrafast preset, no audio)...")
+            logging.info(f"[COMPRESS] Running GPU CQ compression (CQ={cq_value}, preset=p1/fastest, no audio)...")
         else:
-            # Bitrate mode: direct size control
-            codec = 'libx265' if USE_H265 else 'libx264'
+            # Bitrate mode with NVENC: direct size control
             
             ffmpeg_cmd = [
-                'ffmpeg', '-i', str(input_path),
-                '-c:v', codec,
-                '-preset', 'ultrafast',
+                'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
                 '-b:v', f'{target_bitrate}k',
                 '-maxrate', f'{target_bitrate}k',
-                '-bufsize', f'{target_bitrate * 2}k'
-            ]
-            
-            # Add x265-params for H.265 (must come before output options)
-            if USE_H265:
-                ffmpeg_cmd.extend(['-x265-params', 'log-level=error'])
-            
-            # Add common output options
-            ffmpeg_cmd.extend([
+                '-bufsize', f'{target_bitrate * 2}k',
                 '-an',  # No audio
                 '-movflags', '+faststart',
                 '-y',
                 str(output_path)
-            ])
+            ]
             
-            logging.info(f"[COMPRESS] Running bitrate compression (ultrafast preset, no audio, codec={codec})...")
+            logging.info(f"[COMPRESS] Running GPU bitrate compression (preset=p1/fastest, no audio)...")
         
         subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=180)
         
@@ -343,42 +328,33 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         output_size_mb = output_size / (1024 * 1024)
         compression_ratio = (1 - output_size / input_size) * 100
         
-        logging.info(f"[COMPRESS] ✓ Compressed to {output_size_mb:.2f} MB (saved {compression_ratio:.1f}%)")
+        logging.info(f"[COMPRESS] ✓ GPU compressed to {output_size_mb:.2f} MB (saved {compression_ratio:.1f}%)")
         
         # If still too large, reduce resolution
         if output_size > target_size_bytes:
-            logging.warning(f"[COMPRESS] Still too large, reducing resolution...")
+            logging.warning(f"[COMPRESS] Still too large, reducing resolution with GPU...")
             
-            codec = 'libx265' if USE_H265 else 'libx264'
             reduced_bitrate = int(target_bitrate * 0.7)
             
             ffmpeg_cmd_scaled = [
-                'ffmpeg', '-i', str(input_path),
-                '-c:v', codec,
-                '-preset', 'ultrafast',
+                'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p1',
                 '-vf', 'scale=-2:min(720\\,ih*0.75)',  # Scale to max 720p or 75% of original
                 '-b:v', f'{reduced_bitrate}k',
                 '-maxrate', f'{reduced_bitrate}k',
-                '-bufsize', f'{reduced_bitrate * 2}k'
-            ]
-            
-            # Add x265-params for H.265 (must come before output options)
-            if USE_H265:
-                ffmpeg_cmd_scaled.extend(['-x265-params', 'log-level=error'])
-            
-            # Add common output options
-            ffmpeg_cmd_scaled.extend([
+                '-bufsize', f'{reduced_bitrate * 2}k',
                 '-an',  # No audio
                 '-movflags', '+faststart',
                 '-y',
                 str(output_path)
-            ])
+            ]
             
             subprocess.run(ffmpeg_cmd_scaled, capture_output=True, check=True, timeout=180)
             
             output_size = output_path.stat().st_size
             output_size_mb = output_size / (1024 * 1024)
-            logging.info(f"[COMPRESS] ✓ Scaled compression complete: {output_size_mb:.2f} MB")
+            logging.info(f"[COMPRESS] ✓ GPU scaled compression complete: {output_size_mb:.2f} MB")
         
         return output_path
         
@@ -393,7 +369,7 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         raise
 
 async def send_telegram_video(directory):
-    """Send URL-only notifications to Telegram users (no video upload/compression)."""
+    """Send compressed videos to Telegram users with GPU acceleration."""
     request = HTTPXRequest(connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30)
     bot = Bot(token=TOKEN, request=request)
     
@@ -408,27 +384,71 @@ async def send_telegram_video(directory):
         file_size_mb = file_size / (1024 * 1024)
         
         try:
-            logging.info(f"[TELEGRAM] Sending notification for {file.name} ({file_size_mb:.2f} MB)")
+            logging.info(f"[TELEGRAM] Processing {file.name} ({file_size_mb:.2f} MB)")
             
-            # Send URL-only message to all users (no compression, no upload)
+            # Force compression for all videos using GPU
+            video_to_send = file
+            compressed_path = None
+            
+            if FORCE_COMPRESS or file_size > MAX_TELEGRAM_VIDEO_SIZE:
+                try:
+                    logging.info(f"[TELEGRAM] Compressing video with GPU (force={'ON' if FORCE_COMPRESS else 'size>50MB'})...")
+                    compressed_path = compress_video(file, TARGET_SIZE)
+                    video_to_send = compressed_path
+                    compressed_size = compressed_path.stat().st_size
+                    compressed_size_mb = compressed_size / (1024 * 1024)
+                    logging.info(f"[TELEGRAM] Using GPU compressed version ({compressed_size_mb:.2f} MB)")
+                except Exception as e:
+                    logging.error(f"[TELEGRAM] Compression failed, will send URL instead: {e}")
+                    # Fall back to URL-only if compression fails
+                    for user_id in whitelist:
+                        try:
+                            start_time = motion_events[i-1].get("timestamp")
+                            caption = (
+                                f"🎥 *Motion Event Detected*\n\n"
+                                f"⏰ Time: {start_time.strftime('%H:%M:%S')}\n"
+                                f"📊 Size: {file_size_mb:.1f} MB\n"
+                                f"⚠️ GPU compression failed\n\n"
+                                f"🔗 Watch online:\n"
+                                f"http://192.168.1.100:8005/nightevents/{i}"
+                            )
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=caption,
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        except Exception as send_err:
+                            logging.error(f"[TELEGRAM] ✗ Failed to send fallback to user {user_id}: {send_err}")
+                    continue
+            
+            # Send video to all whitelisted users
             for user_id in whitelist:
                 try:
                     start_time = motion_events[i-1].get("timestamp")
                     caption = (
-                        f"🎥 *Motion Event Detected*\n\n"
-                        f"⏰ Time: {start_time.strftime('%H:%M:%S')}\n"
-                        f"📊 Size: {file_size_mb:.1f} MB\n\n"
-                        f"🔗 Watch online:\n"
-                        f"http://192.168.1.100:8005/nightevents/{i}"
+                        f"🎥 Motion Event\n"
+                        f"⏰ {start_time.strftime('%H:%M:%S')}\n"
+                        f"📊 {file_size_mb:.1f} MB → {video_to_send.stat().st_size / (1024 * 1024):.1f} MB (GPU)"
                     )
-                    await bot.send_message(
-                        chat_id=user_id,
-                        text=caption,
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    logging.info(f"[TELEGRAM] ✓ Sent notification for {file.name} to user {user_id}")
+                    
+                    with open(video_to_send, 'rb') as video_file:
+                        await bot.send_video(
+                            chat_id=user_id,
+                            video=video_file,
+                            caption=caption,
+                            supports_streaming=True
+                        )
+                    logging.info(f"[TELEGRAM] ✓ Sent GPU compressed video to user {user_id}")
                 except Exception as e:
-                    logging.error(f"[TELEGRAM] ✗ Failed to send notification to user {user_id}: {e}")
+                    logging.error(f"[TELEGRAM] ✗ Failed to send to user {user_id}: {e}")
+            
+            # Clean up compressed temp file
+            if compressed_path and compressed_path.exists():
+                try:
+                    compressed_path.unlink()
+                    logging.info(f"[TELEGRAM] Cleaned up temp file: {compressed_path.name}")
+                except Exception as e:
+                    logging.error(f"[TELEGRAM] Failed to delete temp file: {e}")
                     
         except Exception as e:
             logging.error(f"[TELEGRAM] ✗ Error processing {file.name}: {e}")
