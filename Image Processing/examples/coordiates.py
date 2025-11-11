@@ -2,7 +2,7 @@ import cv2
 from datetime import datetime
 import pytz
 
-URL = "http://192.168.1.119:81/stream"  
+URL = "http://192.168.1.13:81/stream"  
 cap = cv2.VideoCapture(URL)
 
 if not cap.isOpened():

@@ -1,6 +1,6 @@
 import requests
 
-url = "http://192.168.1.119:81/stream"
+url = "http://192.168.1.13:81/stream"
 def check_mjpeg_stream(url=url, timeout=2):
     try:
         res = requests.get(url, stream=True, timeout=timeout)

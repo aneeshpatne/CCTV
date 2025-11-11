@@ -78,7 +78,7 @@ now_ist = datetime.now(ist).date()
 logging.info(f"[FETCH] Fetching motion events between 12:00 AM to 7:00 AM on {now_ist}")
 
 try:
-    api_url = f"http://192.168.1.100:8005/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
+    api_url = f"http://192.168.1.13:8005/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
     logging.info(f"[FETCH] API URL: {api_url}")
     
     data = requests.get(api_url, timeout=30)
@@ -164,7 +164,7 @@ for idx, item in enumerate(motion_events, 1):
         
         logging.info(f"[DOWNLOAD] ({idx}/{len(motion_events)}) Fetching video for motion at {start_time.time()} (Duration: {duration:.2f} min)")
         
-        video_url = f"http://192.168.1.100:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
+        video_url = f"http://192.168.1.13:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
         
         res = requests.get(video_url, timeout=120)
         res.raise_for_status()
@@ -243,6 +243,7 @@ TARGET_SIZE = 45 * 1024 * 1024
 def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Path:
     """
     Compress video using ffmpeg to fit under target size.
+    Uses ultrafast preset for minimal CPU usage.
     Returns path to compressed video (in temp directory).
     """
     input_size = input_path.stat().st_size
@@ -256,7 +257,7 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
     output_path = temp_dir / f"compressed_{input_path.name}"
     
     try:
-
+        # Get video duration
         duration_cmd = [
             'ffprobe', '-v', 'error',
             '-show_entries', 'format=duration',
@@ -266,28 +267,28 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=30)
         duration = float(result.stdout.strip())
         
-
-        target_bitrate = int((target_size_bytes * 8 * 0.90) / duration / 1000)
+        # Calculate target bitrate (use 85% of target to leave room for overhead)
+        target_bitrate = int((target_size_bytes * 8 * 0.85) / duration / 1000)
         
         logging.info(f"[COMPRESS] Video duration: {duration:.2f}s, target bitrate: {target_bitrate} kbps")
         
-
+        # Use ultrafast preset and simple bitrate limiting for minimal CPU usage
+        # No audio track - this makes encoding much faster
         ffmpeg_cmd = [
             'ffmpeg', '-i', str(input_path),
             '-c:v', 'libx264',
-            '-preset', 'medium',
-            '-crf', '28',  # Quality factor (higher = more compression, 23 is default)
+            '-preset', 'ultrafast',  # Fastest encoding, minimal CPU
+            '-b:v', f'{target_bitrate}k',  # Target video bitrate
             '-maxrate', f'{target_bitrate}k',
             '-bufsize', f'{target_bitrate * 2}k',
-            '-c:a', 'aac',
-            '-b:a', '96k',  # Lower audio bitrate
+            '-an',  # No audio
             '-movflags', '+faststart',
             '-y',  # Overwrite output file
             str(output_path)
         ]
         
-        logging.info(f"[COMPRESS] Running ffmpeg compression...")
-        subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=300)
+        logging.info(f"[COMPRESS] Running fast compression (ultrafast preset, no audio)...")
+        subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=180)
         
         output_size = output_path.stat().st_size
         output_size_mb = output_size / (1024 * 1024)
@@ -295,32 +296,31 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         
         logging.info(f"[COMPRESS] ✓ Compressed to {output_size_mb:.2f} MB (saved {compression_ratio:.1f}%)")
         
-        # Safety check: if still too large, try more aggressive compression
+        # If still too large, reduce resolution (much faster than re-encoding)
         if output_size > target_size_bytes:
-            logging.warning(f"[COMPRESS] First pass still too large, applying aggressive compression...")
+            logging.warning(f"[COMPRESS] Still too large, reducing resolution...")
             
-            # More aggressive settings
-            aggressive_bitrate = int(target_bitrate * 0.7)
-            ffmpeg_cmd_aggressive = [
+            # Scale down to 720p or 80% of original, whichever is smaller
+            reduced_bitrate = int(target_bitrate * 0.75)
+            ffmpeg_cmd_scaled = [
                 'ffmpeg', '-i', str(input_path),
                 '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '32',  # Higher CRF for more compression
-                '-maxrate', f'{aggressive_bitrate}k',
-                '-bufsize', f'{aggressive_bitrate * 2}k',
-                '-vf', 'scale=iw*0.8:ih*0.8',  # Reduce resolution by 20%
-                '-c:a', 'aac',
-                '-b:a', '64k',
+                '-preset', 'ultrafast',
+                '-vf', 'scale=-2:min(720\\,ih*0.8)',  # Scale to max 720p height
+                '-b:v', f'{reduced_bitrate}k',
+                '-maxrate', f'{reduced_bitrate}k',
+                '-bufsize', f'{reduced_bitrate * 2}k',
+                '-an',  # No audio
                 '-movflags', '+faststart',
                 '-y',
                 str(output_path)
             ]
             
-            subprocess.run(ffmpeg_cmd_aggressive, capture_output=True, check=True, timeout=300)
+            subprocess.run(ffmpeg_cmd_scaled, capture_output=True, check=True, timeout=180)
             
             output_size = output_path.stat().st_size
             output_size_mb = output_size / (1024 * 1024)
-            logging.info(f"[COMPRESS] ✓ Aggressive compression complete: {output_size_mb:.2f} MB")
+            logging.info(f"[COMPRESS] ✓ Scaled compression complete: {output_size_mb:.2f} MB")
         
         return output_path
         
@@ -364,7 +364,7 @@ async def send_telegram_video(directory):
                 try:
                     with open(video_to_send, 'rb') as f:
                         start_time = motion_events[i-1].get("timestamp")
-                        caption = f"Event Occured at {start_time.strftime('%H:%M:%S')} \n 192.168.1.100:8005/nightevents/{i}"
+                        caption = f"Event Occured at {start_time.strftime('%H:%M:%S')} \n 192.168.1.13:8005/nightevents/{i}"
                         await bot.send_video(chat_id=user_id, video=f, caption= caption)  # type: ignore
                     logging.info(f"[TELEGRAM] ✓ Sent {file.name} to user {user_id}")
                 except Exception as e:

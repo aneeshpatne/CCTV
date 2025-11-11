@@ -29,7 +29,7 @@ from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
 from utilities.motion_db import log_motion_event
 
-URL = "http://192.168.1.119:81/stream"
+URL = "http://192.168.1.13:81/stream"
 IST = pytz.timezone('Asia/Kolkata')
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'examples', 'no_signal.png')
 FRAME_RETRY_DELAY = 0.5
@@ -375,7 +375,7 @@ def apply_camera_adjustments() -> None:
             # Disable auto white balance
             try:
                 print("Disabling auto white balance (awb=0)")
-                resp = requests.get("http://192.168.1.119/control?var=awb&val=0", timeout=2)
+                resp = requests.get("http://192.168.1.13/control?var=awb&val=0", timeout=2)
                 if resp.status_code == 200:
                     print("AWB disabled successfully")
             except Exception as e:
@@ -386,7 +386,7 @@ def apply_camera_adjustments() -> None:
             # Set auto exposure level
             try:
                 print("Setting auto exposure level (ae_level=2)")
-                resp = requests.get("http://192.168.1.119/control?var=ae_level&val=2", timeout=2)
+                resp = requests.get("http://192.168.1.13/control?var=ae_level&val=2", timeout=2)
                 if resp.status_code == 200:
                     print("AE level set successfully")
             except Exception as e:
@@ -397,7 +397,7 @@ def apply_camera_adjustments() -> None:
             # Disable auto gain control
             try:
                 print("Disabling auto gain control (agc=0)")
-                resp = requests.get("http://192.168.1.119/control?var=agc&val=0", timeout=2)
+                resp = requests.get("http://192.168.1.13/control?var=agc&val=0", timeout=2)
                 if resp.status_code == 200:
                     print("AGC disabled successfully")
             except Exception as e:
@@ -445,7 +445,7 @@ def start_memory_monitor() -> None:
         global memory_percent
         while True:
             try:
-                response = requests.get("http://192.168.1.119/syshealth", timeout=3.0)
+                response = requests.get("http://192.168.1.13/syshealth", timeout=3.0)
                 if response.status_code == 200:
                     data = response.json()
                     free_heap = data.get('freeHeap', 0)
