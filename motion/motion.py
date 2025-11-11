@@ -78,7 +78,7 @@ now_ist = datetime.now(ist).date()
 logging.info(f"[FETCH] Fetching motion events between 12:00 AM to 7:00 AM on {now_ist}")
 
 try:
-    api_url = f"http://192.168.1.13:8005/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
+    api_url = f"http://192.168.1.100:8005/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
     logging.info(f"[FETCH] API URL: {api_url}")
     
     data = requests.get(api_url, timeout=30)
@@ -164,7 +164,7 @@ for idx, item in enumerate(motion_events, 1):
         
         logging.info(f"[DOWNLOAD] ({idx}/{len(motion_events)}) Fetching video for motion at {start_time.time()} (Duration: {duration:.2f} min)")
         
-        video_url = f"http://192.168.1.13:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
+        video_url = f"http://192.168.1.100:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
         
         res = requests.get(video_url, timeout=120)
         res.raise_for_status()
@@ -239,18 +239,31 @@ async def send_telegram_notification(message: str):
 
 MAX_TELEGRAM_VIDEO_SIZE = 50 * 1024 * 1024 
 TARGET_SIZE = 45 * 1024 * 1024  
+MAX_TELEGRAM_SIZE = 50 * 1024 * 1024  # 50 MB Telegram limit
+
+# COMPRESSION OPTIONS:
+# Option 1: Use H.265 (HEVC) - Better compression but MUCH SLOWER (not recommended)
+USE_H265 = False  # Set to True for better compression (but 5-10x slower!)
+
+# Option 2: Use CRF mode instead of bitrate (better quality control)
+USE_CRF_MODE = True  # CRF mode for better quality at similar file sizes
+
+# Option 3: Reduce resolution to get smaller files faster
+SCALE_RESOLUTION = True  # Scale down to 80% size for faster compression
 
 def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Path:
     """
     Compress video using ffmpeg to fit under target size.
     Uses ultrafast preset for minimal CPU usage.
+    Supports H.265 (HEVC) for better compression than H.264.
     Returns path to compressed video (in temp directory).
     """
     input_size = input_path.stat().st_size
     input_size_mb = input_size / (1024 * 1024)
     target_size_mb = target_size_bytes / (1024 * 1024)
     
-    logging.info(f"[COMPRESS] Starting compression of {input_path.name} ({input_size_mb:.2f} MB -> target: {target_size_mb:.2f} MB)")
+    codec_name = "H.265 (HEVC)" if USE_H265 else "H.264"
+    logging.info(f"[COMPRESS] Starting compression of {input_path.name} ({input_size_mb:.2f} MB -> target: {target_size_mb:.2f} MB) using {codec_name}")
     
     # Create a temporary file for compressed output
     temp_dir = Path(tempfile.gettempdir())
@@ -272,22 +285,58 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         
         logging.info(f"[COMPRESS] Video duration: {duration:.2f}s, target bitrate: {target_bitrate} kbps")
         
-        # Use ultrafast preset and simple bitrate limiting for minimal CPU usage
-        # No audio track - this makes encoding much faster
-        ffmpeg_cmd = [
-            'ffmpeg', '-i', str(input_path),
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',  # Fastest encoding, minimal CPU
-            '-b:v', f'{target_bitrate}k',  # Target video bitrate
-            '-maxrate', f'{target_bitrate}k',
-            '-bufsize', f'{target_bitrate * 2}k',
-            '-an',  # No audio
-            '-movflags', '+faststart',
-            '-y',  # Overwrite output file
-            str(output_path)
-        ]
+        if USE_CRF_MODE:
+            # CRF mode: better quality control (23-28 for H.264, 28-32 for H.265)
+            crf_value = 32 if USE_H265 else 28
+            codec = 'libx265' if USE_H265 else 'libx264'
+            
+            ffmpeg_cmd = [
+                'ffmpeg', '-i', str(input_path),
+                '-c:v', codec,
+                '-preset', 'ultrafast',
+                '-crf', str(crf_value)
+            ]
+            
+            # Add x265-params for H.265 (must come before output options)
+            if USE_H265:
+                ffmpeg_cmd.extend(['-x265-params', 'log-level=error'])
+            
+            # Add common output options
+            ffmpeg_cmd.extend([
+                '-an',  # No audio
+                '-movflags', '+faststart',
+                '-y',
+                str(output_path)
+            ])
+            
+            logging.info(f"[COMPRESS] Running CRF compression (CRF={crf_value}, ultrafast preset, no audio)...")
+        else:
+            # Bitrate mode: direct size control
+            codec = 'libx265' if USE_H265 else 'libx264'
+            
+            ffmpeg_cmd = [
+                'ffmpeg', '-i', str(input_path),
+                '-c:v', codec,
+                '-preset', 'ultrafast',
+                '-b:v', f'{target_bitrate}k',
+                '-maxrate', f'{target_bitrate}k',
+                '-bufsize', f'{target_bitrate * 2}k'
+            ]
+            
+            # Add x265-params for H.265 (must come before output options)
+            if USE_H265:
+                ffmpeg_cmd.extend(['-x265-params', 'log-level=error'])
+            
+            # Add common output options
+            ffmpeg_cmd.extend([
+                '-an',  # No audio
+                '-movflags', '+faststart',
+                '-y',
+                str(output_path)
+            ])
+            
+            logging.info(f"[COMPRESS] Running bitrate compression (ultrafast preset, no audio, codec={codec})...")
         
-        logging.info(f"[COMPRESS] Running fast compression (ultrafast preset, no audio)...")
         subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=180)
         
         output_size = output_path.stat().st_size
@@ -296,25 +345,34 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         
         logging.info(f"[COMPRESS] ✓ Compressed to {output_size_mb:.2f} MB (saved {compression_ratio:.1f}%)")
         
-        # If still too large, reduce resolution (much faster than re-encoding)
+        # If still too large, reduce resolution
         if output_size > target_size_bytes:
             logging.warning(f"[COMPRESS] Still too large, reducing resolution...")
             
-            # Scale down to 720p or 80% of original, whichever is smaller
-            reduced_bitrate = int(target_bitrate * 0.75)
+            codec = 'libx265' if USE_H265 else 'libx264'
+            reduced_bitrate = int(target_bitrate * 0.7)
+            
             ffmpeg_cmd_scaled = [
                 'ffmpeg', '-i', str(input_path),
-                '-c:v', 'libx264',
+                '-c:v', codec,
                 '-preset', 'ultrafast',
-                '-vf', 'scale=-2:min(720\\,ih*0.8)',  # Scale to max 720p height
+                '-vf', 'scale=-2:min(720\\,ih*0.75)',  # Scale to max 720p or 75% of original
                 '-b:v', f'{reduced_bitrate}k',
                 '-maxrate', f'{reduced_bitrate}k',
-                '-bufsize', f'{reduced_bitrate * 2}k',
+                '-bufsize', f'{reduced_bitrate * 2}k'
+            ]
+            
+            # Add x265-params for H.265 (must come before output options)
+            if USE_H265:
+                ffmpeg_cmd_scaled.extend(['-x265-params', 'log-level=error'])
+            
+            # Add common output options
+            ffmpeg_cmd_scaled.extend([
                 '-an',  # No audio
                 '-movflags', '+faststart',
                 '-y',
                 str(output_path)
-            ]
+            ])
             
             subprocess.run(ffmpeg_cmd_scaled, capture_output=True, check=True, timeout=180)
             
@@ -335,6 +393,7 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         raise
 
 async def send_telegram_video(directory):
+    """Send URL-only notifications to Telegram users (no video upload/compression)."""
     request = HTTPXRequest(connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30)
     bot = Bot(token=TOKEN, request=request)
     
@@ -348,37 +407,31 @@ async def send_telegram_video(directory):
         file_size = file.stat().st_size
         file_size_mb = file_size / (1024 * 1024)
         
-        video_to_send = file
-        temp_compressed = None
-        
         try:
-            logging.info(f"[TELEGRAM] Compressing {file.name} ({file_size_mb:.2f} MB)...")
-            temp_compressed = compress_video(file, TARGET_SIZE)
-            video_to_send = temp_compressed
+            logging.info(f"[TELEGRAM] Sending notification for {file.name} ({file_size_mb:.2f} MB)")
             
-            compressed_size_mb = temp_compressed.stat().st_size / (1024 * 1024)
-            savings = ((file_size - temp_compressed.stat().st_size) / file_size) * 100
-            logging.info(f"[TELEGRAM] Compressed {file.name}: {file_size_mb:.2f} MB → {compressed_size_mb:.2f} MB (saved {savings:.1f}%)")
-            
+            # Send URL-only message to all users (no compression, no upload)
             for user_id in whitelist:
                 try:
-                    with open(video_to_send, 'rb') as f:
-                        start_time = motion_events[i-1].get("timestamp")
-                        caption = f"Event Occured at {start_time.strftime('%H:%M:%S')} \n 192.168.1.13:8005/nightevents/{i}"
-                        await bot.send_video(chat_id=user_id, video=f, caption= caption)  # type: ignore
-                    logging.info(f"[TELEGRAM] ✓ Sent {file.name} to user {user_id}")
+                    start_time = motion_events[i-1].get("timestamp")
+                    caption = (
+                        f"🎥 *Motion Event Detected*\n\n"
+                        f"⏰ Time: {start_time.strftime('%H:%M:%S')}\n"
+                        f"📊 Size: {file_size_mb:.1f} MB\n\n"
+                        f"🔗 Watch online:\n"
+                        f"http://192.168.1.100:8005/nightevents/{i}"
+                    )
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=caption,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    logging.info(f"[TELEGRAM] ✓ Sent notification for {file.name} to user {user_id}")
                 except Exception as e:
-                    logging.error(f"[TELEGRAM] ✗ Failed to send {file.name} to user {user_id}: {e}")
+                    logging.error(f"[TELEGRAM] ✗ Failed to send notification to user {user_id}: {e}")
                     
         except Exception as e:
             logging.error(f"[TELEGRAM] ✗ Error processing {file.name}: {e}")
-        finally:
-            if temp_compressed and temp_compressed.exists():
-                try:
-                    temp_compressed.unlink()
-                    logging.info(f"[CLEANUP] Deleted temporary compressed file: {temp_compressed.name}")
-                except Exception as e:
-                    logging.error(f"[CLEANUP] Failed to delete temp file {temp_compressed}: {e}")
             
 
 
