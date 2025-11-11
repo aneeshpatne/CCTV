@@ -258,6 +258,7 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
     """
     Compress video using ffmpeg with NVIDIA NVENC hardware encoding.
     Uses h264_nvenc for GPU acceleration (compatible with older NVIDIA GPUs).
+    No -hwaccel flag needed - NVENC works directly without CUDA runtime.
     Returns path to compressed video (in temp directory).
     """
     input_size = input_path.stat().st_size
@@ -292,8 +293,9 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
             # CQ range: 0-51, lower = better quality (28-32 is good for NVENC)
             cq_value = 28
             
+            # IMPORTANT: No -hwaccel cuda flag! NVENC encoder works directly
             ffmpeg_cmd = [
-                'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+                'ffmpeg', '-i', str(input_path),
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
                 '-cq', str(cq_value),
@@ -308,7 +310,7 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
             # Bitrate mode with NVENC: direct size control
             
             ffmpeg_cmd = [
-                'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+                'ffmpeg', '-i', str(input_path),
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
                 '-b:v', f'{target_bitrate}k',
@@ -337,7 +339,7 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
             reduced_bitrate = int(target_bitrate * 0.7)
             
             ffmpeg_cmd_scaled = [
-                'ffmpeg', '-hwaccel', 'cuda', '-i', str(input_path),
+                'ffmpeg', '-i', str(input_path),
                 '-c:v', 'h264_nvenc',
                 '-preset', 'p1',
                 '-vf', 'scale=-2:min(720\\,ih*0.75)',  # Scale to max 720p or 75% of original
