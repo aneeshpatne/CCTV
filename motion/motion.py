@@ -257,16 +257,12 @@ SCALE_RESOLUTION = True  # Scale down to 80% size for faster compression
 def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Path:
     """
     Compress video using ffmpeg with NVIDIA NVENC hardware encoding.
-    Uses h264_nvenc for GPU acceleration (compatible with older NVIDIA GPUs).
-    No -hwaccel flag needed - NVENC works directly without CUDA runtime.
+    Falls back to CPU (libx264) if GPU is not available.
     Returns path to compressed video (in temp directory).
     """
     input_size = input_path.stat().st_size
     input_size_mb = input_size / (1024 * 1024)
     target_size_mb = target_size_bytes / (1024 * 1024)
-    
-    codec_name = "H.264 NVENC (GPU)"
-    logging.info(f"[COMPRESS] Starting GPU compression of {input_path.name} ({input_size_mb:.2f} MB -> target: {target_size_mb:.2f} MB) using {codec_name}")
     
     # Create a temporary file for compressed output
     temp_dir = Path(tempfile.gettempdir())
@@ -286,62 +282,139 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
         # Calculate target bitrate (use 85% of target to leave room for overhead)
         target_bitrate = int((target_size_bytes * 8 * 0.85) / duration / 1000)
         
+        logging.info(f"[COMPRESS] Compressing {input_path.name} ({input_size_mb:.2f} MB -> target: {target_size_mb:.2f} MB)")
         logging.info(f"[COMPRESS] Video duration: {duration:.2f}s, target bitrate: {target_bitrate} kbps")
         
-        if USE_CRF_MODE:
-            # CRF mode with NVENC: use -cq (constant quality) instead of -crf
-            # CQ range: 0-51, lower = better quality (28-32 is good for NVENC)
-            cq_value = 28
-            
-            # IMPORTANT: No -hwaccel cuda flag! NVENC encoder works directly
-            ffmpeg_cmd = [
-                'ffmpeg', '-i', str(input_path),
-                '-c:v', 'h264_nvenc',
-                '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
-                '-cq', str(cq_value),
-                '-an',  # No audio
-                '-movflags', '+faststart',
-                '-y',
-                str(output_path)
-            ]
-            
-            logging.info(f"[COMPRESS] Running GPU CQ compression (CQ={cq_value}, preset=p1/fastest, no audio)...")
-        else:
-            # Bitrate mode with NVENC: direct size control
-            
-            ffmpeg_cmd = [
-                'ffmpeg', '-i', str(input_path),
-                '-c:v', 'h264_nvenc',
-                '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
-                '-b:v', f'{target_bitrate}k',
-                '-maxrate', f'{target_bitrate}k',
-                '-bufsize', f'{target_bitrate * 2}k',
-                '-an',  # No audio
-                '-movflags', '+faststart',
-                '-y',
-                str(output_path)
-            ]
-            
-            logging.info(f"[COMPRESS] Running GPU bitrate compression (preset=p1/fastest, no audio)...")
+        # Try GPU encoding first
+        use_gpu = USE_GPU
+        codec = 'h264_nvenc' if use_gpu else 'libx264'
         
-        subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=180)
+        if USE_CRF_MODE:
+            # CRF/CQ mode for better quality control
+            if use_gpu:
+                # NVENC uses -cq (constant quality)
+                quality_value = 28
+                ffmpeg_cmd = [
+                    'ffmpeg', '-i', str(input_path),
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
+                    '-cq', str(quality_value),
+                    '-an',  # No audio
+                    '-movflags', '+faststart',
+                    '-y',
+                    str(output_path)
+                ]
+                logging.info(f"[COMPRESS] Trying GPU encoding (h264_nvenc, CQ={quality_value}, preset=p1)...")
+            else:
+                # libx264 uses -crf (constant rate factor)
+                quality_value = 23
+                ffmpeg_cmd = [
+                    'ffmpeg', '-i', str(input_path),
+                    '-c:v', 'libx264',
+                    '-preset', 'veryfast',
+                    '-crf', str(quality_value),
+                    '-an',  # No audio
+                    '-movflags', '+faststart',
+                    '-y',
+                    str(output_path)
+                ]
+                logging.info(f"[COMPRESS] Using CPU encoding (libx264, CRF={quality_value}, preset=veryfast)...")
+        else:
+            # Bitrate mode: direct size control
+            if use_gpu:
+                ffmpeg_cmd = [
+                    'ffmpeg', '-i', str(input_path),
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'p1',
+                    '-b:v', f'{target_bitrate}k',
+                    '-maxrate', f'{target_bitrate}k',
+                    '-bufsize', f'{target_bitrate * 2}k',
+                    '-an',  # No audio
+                    '-movflags', '+faststart',
+                    '-y',
+                    str(output_path)
+                ]
+                logging.info(f"[COMPRESS] Trying GPU bitrate encoding (h264_nvenc, preset=p1)...")
+            else:
+                ffmpeg_cmd = [
+                    'ffmpeg', '-i', str(input_path),
+                    '-c:v', 'libx264',
+                    '-preset', 'veryfast',
+                    '-b:v', f'{target_bitrate}k',
+                    '-maxrate', f'{target_bitrate}k',
+                    '-bufsize', f'{target_bitrate * 2}k',
+                    '-an',  # No audio
+                    '-movflags', '+faststart',
+                    '-y',
+                    str(output_path)
+                ]
+                logging.info(f"[COMPRESS] Using CPU bitrate encoding (libx264, preset=veryfast)...")
+        
+        # Try to run ffmpeg
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=180)
+        
+        # If GPU encoding failed and we were trying GPU, fallback to CPU
+        if result.returncode != 0 and use_gpu:
+            stderr = result.stderr.decode() if result.stderr else ""
+            if "libcuda" in stderr or "nvenc" in stderr.lower():
+                logging.warning(f"[COMPRESS] GPU encoding failed (driver issue), falling back to CPU...")
+                use_gpu = False
+                
+                # Retry with CPU encoding
+                if USE_CRF_MODE:
+                    quality_value = 23
+                    ffmpeg_cmd = [
+                        'ffmpeg', '-i', str(input_path),
+                        '-c:v', 'libx264',
+                        '-preset', 'veryfast',
+                        '-crf', str(quality_value),
+                        '-an',
+                        '-movflags', '+faststart',
+                        '-y',
+                        str(output_path)
+                    ]
+                else:
+                    ffmpeg_cmd = [
+                        'ffmpeg', '-i', str(input_path),
+                        '-c:v', 'libx264',
+                        '-preset', 'veryfast',
+                        '-b:v', f'{target_bitrate}k',
+                        '-maxrate', f'{target_bitrate}k',
+                        '-bufsize', f'{target_bitrate * 2}k',
+                        '-an',
+                        '-movflags', '+faststart',
+                        '-y',
+                        str(output_path)
+                    ]
+                
+                logging.info(f"[COMPRESS] Retrying with CPU encoding (libx264)...")
+                result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=180)
+            else:
+                # Different error, raise it
+                result.check_returncode()
+        elif result.returncode != 0:
+            # CPU encoding failed, raise the error
+            result.check_returncode()
         
         output_size = output_path.stat().st_size
         output_size_mb = output_size / (1024 * 1024)
         compression_ratio = (1 - output_size / input_size) * 100
         
-        logging.info(f"[COMPRESS] ✓ GPU compressed to {output_size_mb:.2f} MB (saved {compression_ratio:.1f}%)")
+        encoder_used = "GPU (h264_nvenc)" if use_gpu else "CPU (libx264)"
+        logging.info(f"[COMPRESS] ✓ Compressed to {output_size_mb:.2f} MB using {encoder_used} (saved {compression_ratio:.1f}%)")
         
         # If still too large, reduce resolution
         if output_size > target_size_bytes:
-            logging.warning(f"[COMPRESS] Still too large, reducing resolution with GPU...")
+            logging.warning(f"[COMPRESS] Still too large, reducing resolution...")
             
             reduced_bitrate = int(target_bitrate * 0.7)
+            codec = 'h264_nvenc' if use_gpu else 'libx264'
+            preset = 'p1' if use_gpu else 'veryfast'
             
             ffmpeg_cmd_scaled = [
                 'ffmpeg', '-i', str(input_path),
-                '-c:v', 'h264_nvenc',
-                '-preset', 'p1',
+                '-c:v', codec,
+                '-preset', preset,
                 '-vf', 'scale=-2:min(720\\,ih*0.75)',  # Scale to max 720p or 75% of original
                 '-b:v', f'{reduced_bitrate}k',
                 '-maxrate', f'{reduced_bitrate}k',
@@ -356,7 +429,7 @@ def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Pa
             
             output_size = output_path.stat().st_size
             output_size_mb = output_size / (1024 * 1024)
-            logging.info(f"[COMPRESS] ✓ GPU scaled compression complete: {output_size_mb:.2f} MB")
+            logging.info(f"[COMPRESS] ✓ Scaled compression complete: {output_size_mb:.2f} MB")
         
         return output_path
         
@@ -415,6 +488,7 @@ async def send_telegram_video(directory):
                                 f"http://192.168.1.100:8005/nightevents/{i}"
                             )
                             await bot.send_message(
+
                                 chat_id=user_id,
                                 text=caption,
                                 parse_mode=ParseMode.MARKDOWN

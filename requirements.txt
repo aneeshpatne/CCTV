@@ -1,0 +1,12 @@
+ffmpeg-python
+fastapi
+httpx
+numpy
+opencv-python
+python-dotenv
+python-multipart
+python-telegram-bot[http2]
+pytz
+requests
+SQLAlchemy
+uvicorn[standard]
