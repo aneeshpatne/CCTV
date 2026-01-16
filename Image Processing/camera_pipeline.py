@@ -723,6 +723,10 @@ def show_placeholder(message: str) -> None:
 
 def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     """Create and optionally display a no-signal frame. Always returns the frame for recording."""
+    # Initialize frame from no_signal_img
+    frame = no_signal_img.copy()
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+
     # Draw timestamp with minimal elegant style
     time_x = 10
     time_y = 10
