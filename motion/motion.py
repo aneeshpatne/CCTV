@@ -178,7 +178,8 @@ total_duration = sum(e.get("duration", 0) for e in motion_events)
 
 events_str = "\n".join(
     f"• {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n \n"
-    for e in motion_events
+    f"https://192.168.1.100:8005/nightevents/{idx}"
+    for idx, e in enumerate(motion_events)
 )
 
 message = (
