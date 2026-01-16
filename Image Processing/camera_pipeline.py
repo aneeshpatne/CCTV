@@ -38,7 +38,13 @@ CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
 
 # Recording configuration
 ENABLE_RECORDING = True
-BASE_DIR = "/media/aneesh/SSD/recordings/esp_cam1"
+try:
+    BASE_DIR = "/media/aneesh/SSD/recordings/esp_cam1"
+    os.makedirs(BASE_DIR, exist_ok=True)
+except (PermissionError, OSError):
+    BASE_DIR = os.path.join(os.path.dirname(__file__), '..', 'recordings')
+    print(f"Warning: Primary recording path unavailable, using: {BASE_DIR}")
+
 SEGMENT_SECONDS = 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
@@ -539,158 +545,111 @@ def queue_motion_log(timestamp: datetime) -> None:
         last_motion_log_time = current_time
 
 
-def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
-    """Draw FPS badge in minimal elegant style.
+def draw_sleek_badge(frame, text, x, y, align='left', color=(255, 255, 255), status_color=None):
+    """Draws a sleek rounded badge with optional status dot."""
+    font = cv2.FONT_HERSHEY_DUPLEX
+    scale = 0.55
+    thickness = 1
+    pad_x = 16
+    pad_y = 10
     
-    Args:
-        frame: Frame to draw on (modified in-place)
-        fps: Current frames per second
-    """
-    # Position to the left of WiFi badge
-    badge_w = 85
-    badge_h = 35
-    wifi_badge_x = frame.shape[1] - 160 - 10  # WiFi badge position
-    badge_x = wifi_badge_x - badge_w - 5  # 5px gap
-    badge_y = 10
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
     
-    # Draw solid dark background (high opacity for "solid" look)
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                 (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-    
-    # Determine color based on FPS
-    if fps >= 7:
-        color = (100, 255, 100)  # Pastel Green
-    elif fps >= 5:
-        color = (0, 255, 255)  # Yellow
-    else:
-        color = (50, 50, 255)  # Red
-    
-    # Draw status dot instead of border
-    cv2.circle(frame, (badge_x + 12, badge_y + badge_h // 2), 4, color, -1)
-    
-    # Draw FPS text (Clean white)
-    fps_text = f"FPS {int(fps)}"
-    cv2.putText(frame, fps_text, (badge_x + 25, badge_y + 24), 
-                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-
-
-def draw_memory_badge(frame: np.ndarray, mem_percent: float | None) -> None:
-    """Draw Memory badge with RAM symbol in minimal elegant style.
-    
-    Args:
-        frame: Frame to draw on (modified in-place)
-        mem_percent: Percentage of free memory (0-100) or None
-    """
-    # Position to the left of FPS badge
-    badge_w = 50
-    badge_h = 35
-    fps_badge_x = frame.shape[1] - 160 - 10 - 85 - 5  # FPS badge position
-    badge_x = fps_badge_x - badge_w - 5  # 5px gap
-    badge_y = 10
-    
-    # Draw solid dark background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                 (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-    
-    # Determine color based on memory percentage
-    if mem_percent is None:
-        color = (128, 128, 128)  # Gray for no data
-    elif mem_percent > 30:
-        color = (100, 255, 100)  # Pastel Green
-    elif mem_percent > 15:
-        color = (0, 255, 255)  # Yellow
-    else:
-        color = (50, 50, 255)  # Red
-    
-    # Draw RAM chip symbol (cleaner)
-    icon_x = badge_x + badge_w // 2 - 10
-    icon_y = badge_y + badge_h // 2 - 6
-    
-    # Main chip body (Outline)
-    cv2.rectangle(frame, (icon_x, icon_y), (icon_x + 20, icon_y + 12), (200, 200, 200), 1)
-    # Fill slightly
-    # cv2.rectangle(frame, (icon_x+1, icon_y+1), (icon_x + 19, icon_y + 11), color, -1) 
-    # Actually just a solid colored small rect looks cleaner
-    cv2.rectangle(frame, (icon_x + 3, icon_y + 3), (icon_x + 17, icon_y + 9), color, -1)
-
-    # Pins (Subtle)
-    for i in range(3):
-        pin_y = icon_y + 2 + i * 4
-        cv2.line(frame, (icon_x - 2, pin_y), (icon_x, pin_y), (150, 150, 150), 1)
-        cv2.line(frame, (icon_x + 20, pin_y), (icon_x + 22, pin_y), (150, 150, 150), 1)
-
-
-def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
-    """Draw WiFi signal strength indicator in minimal elegant style.
-    
-    Args:
-        frame: Frame to draw on (modified in-place)
-        rssi: Signal strength in dBm (e.g., -50) or None
-    """
-    # Position in top-right corner
-    badge_w = 160
-    badge_h = 35
-    badge_x = frame.shape[1] - badge_w - 10
-    badge_y = 10
-    
-    # Draw solid dark background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                 (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-    
-    # Determine signal strength and color
-    if rssi is None:
-        bars_filled = 0
-        color = (50, 50, 255)  # Red
-        text = "N/A"
-    elif rssi >= -50:
-        bars_filled = 4
-        color = (100, 255, 100)  # Pastel Green
-        text = f"{rssi} dBm"
-    elif rssi >= -60:
-        bars_filled = 3
-        color = (100, 255, 100)
-        text = f"{rssi} dBm"
-    elif rssi >= -70:
-        bars_filled = 2
-        color = (0, 255, 255)
-        text = f"{rssi} dBm"
-    elif rssi >= -80:
-        bars_filled = 1
-        color = (0, 165, 255)
-        text = f"{rssi} dBm"
-    else:
-        bars_filled = 0
-        color = (50, 50, 255)
-        text = f"{rssi} dBm"
-    
-    # Draw 4 bars inside badge
-    bar_width = 4
-    bar_spacing = 4
-    bar_height_base = 6
-    x_base = badge_x + 15
-    y_base = badge_y + badge_h - 10
-    
-    for i in range(4):
-        x = x_base + i * (bar_width + bar_spacing)
-        bar_height = bar_height_base + (i + 1) * 3
-        y_top = y_base - bar_height
+    # Calculate width including status dot if present
+    dot_radius = 4
+    dot_spacing = 10
+    content_w = text_w
+    if status_color is not None:
+        content_w += (dot_radius * 2) + dot_spacing
         
-        if i < bars_filled:
-            # Filled bar
-            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), color, -1)
-        else:
-            # Empty bar (dark grey)
-            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (60, 60, 60), -1)
+    w = content_w + (pad_x * 2)
+    h = int(text_h + (pad_y * 2))
     
-    # Draw RSSI value text
-    cv2.putText(frame, text, (badge_x + 52, badge_y + 24), 
-                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    # Calculate Top-Left based on alignment
+    if align == 'right':
+        x = x - w
+    elif align == 'center':
+        x = x - (w // 2)
+    
+    # Background (Rounded Rectangle)
+    overlay = frame.copy()
+    r = h // 2
+    
+    # Main body
+    cv2.rectangle(overlay, (x + r, y), (x + w - r, y + h), (20, 20, 20), -1)
+    cv2.circle(overlay, (x + r, y + r), r, (20, 20, 20), -1)
+    cv2.circle(overlay, (x + w - r, y + r), r, (20, 20, 20), -1)
+    
+    # Apply transparency
+    alpha = 0.7
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    
+    # Draw Content
+    content_start_x = x + pad_x
+    center_y = y + (h // 2)
+    
+    if status_color is not None:
+        cv2.circle(frame, (content_start_x + dot_radius, center_y), dot_radius, status_color, -1)
+        text_x = content_start_x + (dot_radius * 2) + dot_spacing
+    else:
+        text_x = content_start_x
+        
+    # Center text vertically
+    text_y = center_y + (text_h // 2) - 1
+    
+    cv2.putText(frame, text, (text_x, text_y), font, scale, color, thickness, cv2.LINE_AA)
+    
+    return w, h
+
+
+def get_status_color(value, thresholds, colors):
+    """Returns color based on value and thresholds (descending quality)."""
+    if value is None:
+        return (128, 128, 128)
+    for limit, color in zip(thresholds, colors):
+        if value >= limit:
+            return color
+    return colors[-1]
+
+
+def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | None, motion_detected: bool = False):
+    """Draws the Head-Up Display with all status badges."""
+    h, w = frame.shape[:2]
+    margin = 25
+    spacing = 15
+    
+    # 1. Timestamp (Top Left)
+    ts = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p")
+    draw_sleek_badge(frame, ts, margin, margin, align='left')
+    
+    # 2. Status Badges (Top Right)
+    cursor_x = w - margin
+    
+    # WiFi Badge
+    wifi_color = get_status_color(rssi, [-60, -70, -80], 
+                                 [(100, 255, 100), (0, 255, 255), (0, 165, 255), (50, 50, 255)])
+    wifi_text = f"WiFi {rssi}dBm" if rssi is not None else "WiFi N/A"
+    bw, bh = draw_sleek_badge(frame, wifi_text, cursor_x, margin, align='right', status_color=wifi_color)
+    cursor_x -= (bw + spacing)
+    
+    # Memory Badge (if enabled)
+    if SHOW_MEMORY_BADGE:
+        mem_color = get_status_color(mem_pct, [30, 15], 
+                                    [(100, 255, 100), (0, 255, 255), (50, 50, 255)])
+        mem_text = f"RAM {int(mem_pct)}%" if mem_pct is not None else "RAM --%"
+        bw, bh = draw_sleek_badge(frame, mem_text, cursor_x, margin, align='right', status_color=mem_color)
+        cursor_x -= (bw + spacing)
+        
+    # FPS Badge
+    fps_color = get_status_color(fps, [15, 10], 
+                                [(100, 255, 100), (0, 255, 255), (50, 50, 255)])
+    fps_text = f"FPS {int(fps)}"
+    draw_sleek_badge(frame, fps_text, cursor_x, margin, align='right', status_color=fps_color)
+    
+    # 3. Motion Warning (Top Center)
+    if motion_detected:
+        draw_sleek_badge(frame, "MOTION DETECTED", w // 2, margin, align='center', 
+                        status_color=(50, 50, 255))
 
 
 def backoff(attempt: int) -> float:
@@ -702,66 +661,37 @@ def show_placeholder(message: str) -> None:
         return  # Don't show placeholder if local view is disabled
     base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
     frame = base.copy()
-    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     
-    # Draw timestamp with minimal elegant style
-    time_x = 10
-    time_y = 10
-    time_w = 305
-    time_h = 35
+    # Draw Timestamp using sleek badge
+    ts = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p")
+    draw_sleek_badge(frame, ts, 25, 25, align='left')
     
-    # Draw solid dark background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                 (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    # Message
+    cv2.putText(frame, message, (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (200, 200, 200), 1, cv2.LINE_AA)
     
-    # Draw timestamp text (Clean white)
-    cv2.putText(frame, ts, (time_x + 15, time_y + 24),
-                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    cv2.imshow("frame", frame)
 
 
 def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     """Create and optionally display a no-signal frame. Always returns the frame for recording."""
     # Initialize frame from no_signal_img
     frame = no_signal_img.copy()
-    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
 
-    # Draw timestamp with minimal elegant style
-    time_x = 10
-    time_y = 10
-    time_w = 305
-    time_h = 35
-    
-    # Draw solid dark background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                 (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-    
-    # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 24),
-                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-    
-    # Draw message below
-    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.65, (180, 220, 255), 1, cv2.LINE_AA)
+    # Draw message below HUD area
+    cv2.putText(frame, message, (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (200, 200, 200), 1, cv2.LINE_AA)
 
-    # Draw WiFi signal strength indicator
+    # Get current status values
     with rssi_lock:
         current_rssi = rssi_value
-    draw_wifi_signal(frame, current_rssi)
-    
-    # Draw FPS badge (to the left of WiFi)
     with fps_lock:
         current_fps = fps_value
-    draw_fps_badge(frame, current_fps)
-    
-    # Draw Memory badge (to the left of FPS) if enabled
-    if SHOW_MEMORY_BADGE:
-        with memory_lock:
-            current_memory = memory_percent
-        draw_memory_badge(frame, current_memory)
+    with memory_lock:
+        current_memory = memory_percent
+
+    # Draw HUD
+    draw_hud(frame, current_fps, current_rssi, current_memory)
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -781,43 +711,21 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
                     1.4, (0, 0, 255), 3, cv2.LINE_AA)
 
     frame = base.copy()
-    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     
-    # Draw timestamp with minimal elegant style
-    time_x = 10
-    time_y = 10
-    time_w = 305
-    time_h = 35
-    
-    # Draw solid dark background
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                 (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-    
-    # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 24),
-                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-    
-    # Draw message below
-    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.65, (180, 220, 255), 1, cv2.LINE_AA)
+    # Draw message
+    cv2.putText(frame, message, (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                0.7, (200, 200, 200), 1, cv2.LINE_AA)
 
-    # Draw WiFi signal strength indicator
+    # Get current status values
     with rssi_lock:
         current_rssi = rssi_value
-    draw_wifi_signal(frame, current_rssi)
-    
-    # Draw FPS badge (to the left of WiFi)
     with fps_lock:
         current_fps = fps_value
-    draw_fps_badge(frame, current_fps)
-    
-    # Draw Memory badge (to the left of FPS) if enabled
-    if SHOW_MEMORY_BADGE:
-        with memory_lock:
-            current_memory = memory_percent
-        draw_memory_badge(frame, current_memory)
+    with memory_lock:
+        current_memory = memory_percent
+
+    # Draw HUD
+    draw_hud(frame, current_fps, current_rssi, current_memory)
 
     return frame
 
@@ -1042,65 +950,15 @@ def main() -> None:
                 print(f"Warning: Blinker update failed (camera may be crashed): {e}")
                 start_startup(force=True)
 
-            # Timestamp and motion label
-            ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-            
-            # Draw timestamp with minimal elegant style
-            time_x = 10
-            time_y = 10
-            time_w = 305
-            time_h = 35
-            
-            # Draw solid dark background
-            overlay = disp.copy()
-            cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                         (20, 20, 20), -1)
-            cv2.addWeighted(overlay, 0.85, disp, 0.15, 0, disp)
-            
-            # Draw timestamp text
-            cv2.putText(disp, ts, (time_x + 15, time_y + 24),
-                       cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-            
-            # Draw minimal motion detection badge if motion detected
-            if motion_detected:
-                # Calculate position next to timestamp
-                badge_x = 325  # Position to the right of timestamp
-                badge_y = 10
-                badge_w = 190
-                badge_h = 35
-                
-                # Draw solid dark background
-                overlay = disp.copy()
-                cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                             (20, 20, 20), -1)
-                cv2.addWeighted(overlay, 0.85, disp, 0.15, 0, disp)
-                
-                # Draw warning dot (Red)
-                dot_x = badge_x + 15
-                dot_y = badge_y + badge_h // 2
-                cv2.circle(disp, (dot_x, dot_y), 5, (50, 50, 255), -1)
-                
-                # Draw "MOTION DETECTED" text
-                cv2.putText(disp, "MOTION DETECTED", (badge_x + 30, badge_y + 24),
-                           cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-
-            # Draw WiFi signal strength indicator
+            # Draw HUD (Timestamp, Status Badges, Motion Warning)
             with rssi_lock:
                 current_rssi = rssi_value
-            
-            # Draw FPS badge (to the left of WiFi)
             with fps_lock:
                 current_fps = fps_value
-            draw_fps_badge(disp, current_fps)
-            
-            # Draw Memory badge (to the left of FPS) if enabled
-            if SHOW_MEMORY_BADGE:
-                with memory_lock:
-                    current_memory = memory_percent
-                draw_memory_badge(disp, current_memory)
-            
-            # Draw WiFi signal (stays in same position)
-            draw_wifi_signal(disp, current_rssi)
+            with memory_lock:
+                current_memory = memory_percent
+
+            draw_hud(disp, current_fps, current_rssi, current_memory, motion_detected)
 
             # Draw ROI polygon on display only if flag is enabled
             if SHOW_MOTION_BOXES:

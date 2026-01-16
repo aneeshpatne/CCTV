@@ -12,11 +12,16 @@ from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 
 # Database path
-DB_DIR = Path("/media/aneesh/SSD/recordings/esp_cam1")
-DB_PATH = DB_DIR / "motion_logs.db"
+try:
+    DB_DIR = Path("/media/aneesh/SSD/recordings/esp_cam1")
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+except (PermissionError, FileNotFoundError, OSError):
+    # Fallback to local data directory
+    DB_DIR = Path(__file__).parent.parent / "motion" / "data"
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Warning: primary DB path unavailable, using: {DB_DIR}")
 
-# Ensure directory exists
-DB_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DB_DIR / "motion_logs.db"
 
 # Create engine
 engine = create_engine(f'sqlite:///{DB_PATH}', echo=False)
