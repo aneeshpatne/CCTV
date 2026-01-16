@@ -763,52 +763,40 @@ async def get_motion_stats():
 @app.get("/nightevents")
 async def get_night_events():
     """
-    Get all night event videos sorted by timestamp.
+    Get all night event videos.
     Returns list of videos from the motion/data folder.
-    
+    Files are named by index (1.mp4, 2.mp4, etc.)
+
     Example:
         /nightevents
     """
     try:
         folder = Path(NIGHT_EVENTS_FOLDER)
-        
+
         if not folder.exists():
             raise HTTPException(
                 status_code=404,
                 detail="Night events folder not found"
             )
-        
+
         videos = []
-        
+
         for file in folder.glob("*.mp4"):
             try:
-                # Parse the timestamp from filename: "2025-11-07 05:50:48.009861.mp4"
-                timestamp_str = file.stem  # Remove .mp4 extension
-                dt = datetime.fromisoformat(timestamp_str)
-                
+                idx = int(file.stem)
                 videos.append({
-                    "index": 0,  # Will be set after sorting
+                    "index": idx,
                     "filename": file.name,
-                    "timestamp": dt.isoformat(),
                     "size_mb": round(file.stat().st_size / (1024 * 1024), 2),
-                    "path": str(file)
                 })
-            except (ValueError, OSError) as e:
-                # Skip files that don't match expected format
+            except (ValueError, OSError):
                 continue
-        
-        # Sort by timestamp (oldest first)
-        videos.sort(key=lambda x: x['timestamp'])
-        
-        # Add 1-based indices
-        for idx, video in enumerate(videos, 1):
-            video['index'] = idx
-        
+
         return {
             "count": len(videos),
             "videos": videos
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -817,59 +805,37 @@ async def get_night_events():
 async def get_night_event_by_index(index: int):
     """
     Get a specific night event video by its index (1-based).
-    Videos are sorted by timestamp (oldest first).
-    
+
     Args:
         index: 1-based index of the video
-    
+
     Example:
-        /nightevents/1  # Get the first (oldest) night event video
-        /nightevents/5  # Get the fifth night event video
+        /nightevents/1
+        /nightevents/5
     """
     try:
         folder = Path(NIGHT_EVENTS_FOLDER)
-        
+
         if not folder.exists():
             raise HTTPException(
                 status_code=404,
                 detail="Night events folder not found"
             )
-        
-        videos = []
-        
-        for file in folder.glob("*.mp4"):
-            try:
-                timestamp_str = file.stem
-                dt = datetime.fromisoformat(timestamp_str)
-                videos.append((dt, file))
-            except (ValueError, OSError):
-                continue
-        
-        if not videos:
+
+        video_file = folder / f"{index}.mp4"
+
+        if not video_file.exists():
             raise HTTPException(
                 status_code=404,
-                detail="No night event videos found"
+                detail=f"Video {index} not found"
             )
-        
-        # Sort by timestamp (oldest first)
-        videos.sort(key=lambda x: x[0])
-        
-        # Check if index is valid (1-based)
-        if index < 1 or index > len(videos):
-            raise HTTPException(
-                status_code=404,
-                detail=f"Invalid index. Valid range: 1-{len(videos)}"
-            )
-        
-        # Get the video at the specified index (convert to 0-based)
-        selected_video = videos[index - 1][1]
-        
+
         return FileResponse(
-            path=str(selected_video),
+            path=str(video_file),
             media_type="video/mp4",
-            filename=selected_video.name
+            filename=video_file.name
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:

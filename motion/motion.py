@@ -3,13 +3,10 @@ import logging
 import requests
 from datetime import datetime, timedelta
 import pytz
-from collections import defaultdict
 import sys
 import os
 import json
 import asyncio
-import subprocess
-import tempfile
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.request import HTTPXRequest
@@ -18,9 +15,9 @@ from telegram.constants import ParseMode
 
 load_dotenv()
 
-# Telegram bot token
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 WHITELIST_FILE = "whitelist.json"
+
 
 def load_whitelist():
     if os.path.exists(WHITELIST_FILE):
@@ -28,50 +25,44 @@ def load_whitelist():
             return set(json.load(f))
     return set()
 
+
 whitelist = load_whitelist()
 
-
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-ist = pytz.timezone('Asia/Kolkata')
+ist = pytz.timezone("Asia/Kolkata")
 
-logging.info("="*50)
+logging.info("=" * 50)
 logging.info("Motion Detection Video Processor Started")
-logging.info("="*50)
+logging.info("=" * 50)
 
-directory = Path("data/") 
+directory = Path("data/")
 
 # Create directory if it doesn't exist
 try:
     directory.mkdir(exist_ok=True)
     logging.info(f"[SETUP] Data directory ready: {directory.absolute()}")
 except Exception as e:
-    logging.error(f"[SETUP] Failed to create directory {directory}: {e}")
+    logging.error(f"[SETUP] Failed to create directory: {e}")
     sys.exit(1)
 
 logging.info("[CLEANUP] Starting cleanup of old files")
 
 # Deleting old files
 deleted_count = 0
-try:
-    if directory.exists() and directory.is_dir():
-        for file in directory.iterdir():
-            if file.is_file():
-                try:
-                    file_size = file.stat().st_size / (1024 * 1024)  # Size in MB
-                    logging.info(f"[CLEANUP] Deleting {file.name} ({file_size:.2f} MB)")
-                    file.unlink()
-                    deleted_count += 1
-                except Exception as e:
-                    logging.error(f"[CLEANUP] Failed to delete {file}: {e}")
-        logging.info(f"[CLEANUP] Deleted {deleted_count} old file(s)")
-    else:
-        logging.warning("[CLEANUP] Directory does not exist")
-except Exception as e:
-    logging.error(f"[CLEANUP] Error during cleanup: {e}")
+if directory.exists() and directory.is_dir():
+    for file in directory.iterdir():
+        if file.is_file():
+            try:
+                file_size = file.stat().st_size / (1024 * 1024)
+                logging.info(f"[CLEANUP] Deleting {file.name} ({file_size:.2f} MB)")
+                file.unlink()
+                deleted_count += 1
+            except Exception as e:
+                logging.error(f"[CLEANUP] Failed to delete {file}: {e}")
+    logging.info(f"[CLEANUP] Deleted {deleted_count} old file(s)")
 
 now_ist = datetime.now(ist).date()
 
@@ -79,72 +70,59 @@ logging.info(f"[FETCH] Fetching motion events between 12:00 AM to 7:00 AM on {no
 
 try:
     api_url = f"http://192.168.1.100:8005/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
-    logging.info(f"[FETCH] API URL: {api_url}")
-    
     data = requests.get(api_url, timeout=30)
     data.raise_for_status()
-    
-    response_json = data.json()
-    events = response_json.get("events", [])
-    
+
+    events = data.json().get("events", [])
+
     if not events:
-        logging.warning("[FETCH] No motion events found for the specified time range")
+        logging.warning("[FETCH] No motion events found")
         sys.exit(0)
-    
+
     logging.info(f"[FETCH] Retrieved {len(events)} motion event(s)")
-    
+
     timestamps = []
     for d in events:
         try:
-            dt = datetime.fromisoformat(d.get('timestamp'))
+            dt = datetime.fromisoformat(d.get("timestamp"))
             timestamps.append(dt)
             logging.info(f"[FETCH] Motion detected at {dt.time()}")
-        except Exception as e:
-            logging.error(f"[FETCH] Failed to parse timestamp {d.get('timestamp')}: {e}")
+        except (ValueError, TypeError):
             continue
-    
+
     if not timestamps:
         logging.warning("[FETCH] No valid timestamps found")
         sys.exit(0)
-        
-except requests.exceptions.Timeout:
-    logging.error("[FETCH] Request timed out while fetching motion events")
-    sys.exit(1)
-except requests.exceptions.ConnectionError:
-    logging.error("[FETCH] Failed to connect to the API server")
-    sys.exit(1)
-except requests.exceptions.HTTPError as e:
-    logging.error(f"[FETCH] HTTP error occurred: {e}")
+
+except requests.RequestException as e:
+    logging.error(f"[FETCH] Request failed: {e}")
     sys.exit(1)
 except Exception as e:
-    logging.error(f"[FETCH] Unexpected error while fetching motion events: {e}")
+    logging.error(f"[FETCH] Unexpected error: {e}")
     sys.exit(1)
 
 
 logging.info("[MERGE] Starting to merge nearby motion events")
 
 motion_events = []
-
 i = 0
 while i < len(timestamps):
     start_time = timestamps[i]
     duration = 1
     j = i + 1
     while j < len(timestamps):
-        diff = timestamps[j] - timestamps[j-1]
+        diff = timestamps[j] - timestamps[j - 1]
         if diff < timedelta(minutes=2):
-            duration += diff.total_seconds() / 60  
+            duration += diff.total_seconds() / 60
             j += 1
         else:
             break
-    
-    motion_events.append({
-        'timestamp': start_time,
-        'duration': duration
-    })
-    
-    logging.info(f"[MERGE] Motion event: {start_time.time()} - Duration: {duration:.2f} minutes")
-    
+
+    motion_events.append({"timestamp": start_time, "duration": duration})
+
+    logging.info(
+        f"[MERGE] Motion event: {start_time.time()} - Duration: {duration:.2f} minutes"
+    )
     i = j if j < len(timestamps) else len(timestamps)
 
 logging.info(f"[MERGE] Total merged motion events: {len(motion_events)}")
@@ -154,63 +132,52 @@ successful_downloads = 0
 failed_downloads = 0
 
 for idx, item in enumerate(motion_events, 1):
-    start_time = None
-    output_path = None
-    res = None
-    
     try:
         start_time = item.get("timestamp") - timedelta(minutes=1)
         duration = item.get("duration")
-        
-        logging.info(f"[DOWNLOAD] ({idx}/{len(motion_events)}) Fetching video for motion at {start_time.time()} (Duration: {duration:.2f} min)")
-        
+
+        logging.info(
+            f"[DOWNLOAD] ({idx}/{len(motion_events)}) Fetching video for motion at {start_time.time()}"
+        )
+
         video_url = f"http://192.168.1.100:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
-        
         res = requests.get(video_url, timeout=120)
         res.raise_for_status()
-        
-        output_path = directory / f"{item.get('timestamp')}.mp4"
-        
+
+        output_path = directory / f"{idx}.mp4"
+
         with open(output_path, "wb") as f:
             f.write(res.content)
-        
-        file_size = len(res.content) / (1024 * 1024)  # Size in MB
-        logging.info(f"[DOWNLOAD] ✓ Video saved: {output_path.name} ({file_size:.2f} MB)")
+
+        file_size = len(res.content) / (1024 * 1024)
+        logging.info(
+            f"[DOWNLOAD] ✓ Video saved: {output_path.name} ({file_size:.2f} MB)"
+        )
         successful_downloads += 1
-        
-    except requests.exceptions.Timeout:
-        time_str = start_time.time() if start_time else "unknown"
-        logging.error(f"[DOWNLOAD] ✗ Timeout while fetching video for {time_str}")
-        failed_downloads += 1
-    except requests.exceptions.ConnectionError:
-        time_str = start_time.time() if start_time else "unknown"
-        logging.error(f"[DOWNLOAD] ✗ Connection error while fetching video for {time_str}")
-        failed_downloads += 1
-    except requests.exceptions.HTTPError as e:
-        time_str = start_time.time() if start_time else "unknown"
-        status_code = res.status_code if res else "unknown"
-        logging.error(f"[DOWNLOAD] ✗ HTTP error {status_code} for video at {time_str}")
+
+    except requests.RequestException as e:
+        logging.error(f"[DOWNLOAD] ✗ Failed to fetch video: {e}")
         failed_downloads += 1
     except IOError as e:
-        file_str = output_path if output_path else "unknown file"
-        logging.error(f"[DOWNLOAD] ✗ Failed to write file {file_str}: {e}")
+        logging.error(f"[DOWNLOAD] ✗ Failed to write file: {e}")
         failed_downloads += 1
     except Exception as e:
-        time_str = start_time.time() if start_time else "unknown"
-        logging.error(f"[DOWNLOAD] ✗ Unexpected error for video at {time_str}: {e}")
+        logging.error(f"[DOWNLOAD] ✗ Unexpected error: {e}")
         failed_downloads += 1
 
-logging.info("="*50)
-logging.info(f"[SUMMARY] Download complete: {successful_downloads} successful, {failed_downloads} failed")
-logging.info("="*50)
+logging.info("=" * 50)
+logging.info(
+    f"[SUMMARY] Download complete: {successful_downloads} successful, {failed_downloads} failed"
+)
+logging.info("=" * 50)
 
-logging.info(f"[TELEGRAM] Commencing motion messages")
+logging.info("[TELEGRAM] Sending motion summary")
 
-# Build a clean, readable message for Telegram
-total_duration = sum((e.get('duration') or 0) for e in motion_events)
+# Build Telegram message
+total_duration = sum(e.get("duration", 0) for e in motion_events)
 
 events_str = "\n".join(
-    f"• {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min"
+    f"• {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n \n"
     for e in motion_events
 )
 
@@ -226,310 +193,20 @@ message = (
 
 async def send_telegram_notification(message: str):
     """Send notification to all whitelisted users"""
-    request = HTTPXRequest(connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30)
+    request = HTTPXRequest(
+        connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30
+    )
     bot = Bot(token=TOKEN, request=request)
-    
+
     for user_id in whitelist:
         try:
-            await bot.send_message(chat_id=user_id, text=message, parse_mode=ParseMode.HTML)  # type: ignore
+            await bot.send_message(
+                chat_id=user_id, text=message, parse_mode=ParseMode.HTML
+            )
             logging.info(f"[TELEGRAM] ✓ Sent to user {user_id}")
         except Exception as e:
             logging.error(f"[TELEGRAM] ✗ Failed to send to user {user_id}: {e}")
 
 
-MAX_TELEGRAM_VIDEO_SIZE = 50 * 1024 * 1024 
-TARGET_SIZE = 45 * 1024 * 1024  
-MAX_TELEGRAM_SIZE = 50 * 1024 * 1024  # 50 MB Telegram limit
-
-# COMPRESSION OPTIONS:
-# Force GPU encoding with NVENC (h264_nvenc for older hardware)
-USE_GPU = True  # Force NVIDIA NVENC hardware encoding
-
-# Force compression for all videos
-FORCE_COMPRESS = True  # Compress all videos regardless of size
-
-# Option 2: Use CRF mode instead of bitrate (better quality control)
-USE_CRF_MODE = True  # CRF mode for better quality at similar file sizes
-
-# Option 3: Reduce resolution to get smaller files faster
-SCALE_RESOLUTION = True  # Scale down to 80% size for faster compression
-
-def compress_video(input_path: Path, target_size_bytes: int = TARGET_SIZE) -> Path:
-    """
-    Compress video using ffmpeg with NVIDIA NVENC hardware encoding.
-    Falls back to CPU (libx264) if GPU is not available.
-    Returns path to compressed video (in temp directory).
-    """
-    input_size = input_path.stat().st_size
-    input_size_mb = input_size / (1024 * 1024)
-    target_size_mb = target_size_bytes / (1024 * 1024)
-    
-    # Create a temporary file for compressed output
-    temp_dir = Path(tempfile.gettempdir())
-    output_path = temp_dir / f"compressed_{input_path.name}"
-    
-    try:
-        # Get video duration
-        duration_cmd = [
-            'ffprobe', '-v', 'error',
-            '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            str(input_path)
-        ]
-        result = subprocess.run(duration_cmd, capture_output=True, text=True, timeout=30)
-        duration = float(result.stdout.strip())
-        
-        # Calculate target bitrate (use 85% of target to leave room for overhead)
-        target_bitrate = int((target_size_bytes * 8 * 0.85) / duration / 1000)
-        
-        logging.info(f"[COMPRESS] Compressing {input_path.name} ({input_size_mb:.2f} MB -> target: {target_size_mb:.2f} MB)")
-        logging.info(f"[COMPRESS] Video duration: {duration:.2f}s, target bitrate: {target_bitrate} kbps")
-        
-        # Try GPU encoding first
-        use_gpu = USE_GPU
-        codec = 'h264_nvenc' if use_gpu else 'libx264'
-        
-        if USE_CRF_MODE:
-            # CRF/CQ mode for better quality control
-            if use_gpu:
-                # NVENC uses -cq (constant quality)
-                quality_value = 28
-                ffmpeg_cmd = [
-                    'ffmpeg', '-i', str(input_path),
-                    '-c:v', 'h264_nvenc',
-                    '-preset', 'p1',  # NVENC preset: p1 (fastest) to p7 (slowest)
-                    '-cq', str(quality_value),
-                    '-an',  # No audio
-                    '-movflags', '+faststart',
-                    '-y',
-                    str(output_path)
-                ]
-                logging.info(f"[COMPRESS] Trying GPU encoding (h264_nvenc, CQ={quality_value}, preset=p1)...")
-            else:
-                # libx264 uses -crf (constant rate factor)
-                quality_value = 23
-                ffmpeg_cmd = [
-                    'ffmpeg', '-i', str(input_path),
-                    '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    '-crf', str(quality_value),
-                    '-an',  # No audio
-                    '-movflags', '+faststart',
-                    '-y',
-                    str(output_path)
-                ]
-                logging.info(f"[COMPRESS] Using CPU encoding (libx264, CRF={quality_value}, preset=veryfast)...")
-        else:
-            # Bitrate mode: direct size control
-            if use_gpu:
-                ffmpeg_cmd = [
-                    'ffmpeg', '-i', str(input_path),
-                    '-c:v', 'h264_nvenc',
-                    '-preset', 'p1',
-                    '-b:v', f'{target_bitrate}k',
-                    '-maxrate', f'{target_bitrate}k',
-                    '-bufsize', f'{target_bitrate * 2}k',
-                    '-an',  # No audio
-                    '-movflags', '+faststart',
-                    '-y',
-                    str(output_path)
-                ]
-                logging.info(f"[COMPRESS] Trying GPU bitrate encoding (h264_nvenc, preset=p1)...")
-            else:
-                ffmpeg_cmd = [
-                    'ffmpeg', '-i', str(input_path),
-                    '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    '-b:v', f'{target_bitrate}k',
-                    '-maxrate', f'{target_bitrate}k',
-                    '-bufsize', f'{target_bitrate * 2}k',
-                    '-an',  # No audio
-                    '-movflags', '+faststart',
-                    '-y',
-                    str(output_path)
-                ]
-                logging.info(f"[COMPRESS] Using CPU bitrate encoding (libx264, preset=veryfast)...")
-        
-        # Try to run ffmpeg
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=180)
-        
-        # If GPU encoding failed and we were trying GPU, fallback to CPU
-        if result.returncode != 0 and use_gpu:
-            stderr = result.stderr.decode() if result.stderr else ""
-            if "libcuda" in stderr or "nvenc" in stderr.lower():
-                logging.warning(f"[COMPRESS] GPU encoding failed (driver issue), falling back to CPU...")
-                use_gpu = False
-                
-                # Retry with CPU encoding
-                if USE_CRF_MODE:
-                    quality_value = 23
-                    ffmpeg_cmd = [
-                        'ffmpeg', '-i', str(input_path),
-                        '-c:v', 'libx264',
-                        '-preset', 'veryfast',
-                        '-crf', str(quality_value),
-                        '-an',
-                        '-movflags', '+faststart',
-                        '-y',
-                        str(output_path)
-                    ]
-                else:
-                    ffmpeg_cmd = [
-                        'ffmpeg', '-i', str(input_path),
-                        '-c:v', 'libx264',
-                        '-preset', 'veryfast',
-                        '-b:v', f'{target_bitrate}k',
-                        '-maxrate', f'{target_bitrate}k',
-                        '-bufsize', f'{target_bitrate * 2}k',
-                        '-an',
-                        '-movflags', '+faststart',
-                        '-y',
-                        str(output_path)
-                    ]
-                
-                logging.info(f"[COMPRESS] Retrying with CPU encoding (libx264)...")
-                result = subprocess.run(ffmpeg_cmd, capture_output=True, check=True, timeout=180)
-            else:
-                # Different error, raise it
-                result.check_returncode()
-        elif result.returncode != 0:
-            # CPU encoding failed, raise the error
-            result.check_returncode()
-        
-        output_size = output_path.stat().st_size
-        output_size_mb = output_size / (1024 * 1024)
-        compression_ratio = (1 - output_size / input_size) * 100
-        
-        encoder_used = "GPU (h264_nvenc)" if use_gpu else "CPU (libx264)"
-        logging.info(f"[COMPRESS] ✓ Compressed to {output_size_mb:.2f} MB using {encoder_used} (saved {compression_ratio:.1f}%)")
-        
-        # If still too large, reduce resolution
-        if output_size > target_size_bytes:
-            logging.warning(f"[COMPRESS] Still too large, reducing resolution...")
-            
-            reduced_bitrate = int(target_bitrate * 0.7)
-            codec = 'h264_nvenc' if use_gpu else 'libx264'
-            preset = 'p1' if use_gpu else 'veryfast'
-            
-            ffmpeg_cmd_scaled = [
-                'ffmpeg', '-i', str(input_path),
-                '-c:v', codec,
-                '-preset', preset,
-                '-vf', 'scale=-2:min(720\\,ih*0.75)',  # Scale to max 720p or 75% of original
-                '-b:v', f'{reduced_bitrate}k',
-                '-maxrate', f'{reduced_bitrate}k',
-                '-bufsize', f'{reduced_bitrate * 2}k',
-                '-an',  # No audio
-                '-movflags', '+faststart',
-                '-y',
-                str(output_path)
-            ]
-            
-            subprocess.run(ffmpeg_cmd_scaled, capture_output=True, check=True, timeout=180)
-            
-            output_size = output_path.stat().st_size
-            output_size_mb = output_size / (1024 * 1024)
-            logging.info(f"[COMPRESS] ✓ Scaled compression complete: {output_size_mb:.2f} MB")
-        
-        return output_path
-        
-    except subprocess.TimeoutExpired:
-        logging.error(f"[COMPRESS] ✗ Compression timed out for {input_path.name}")
-        raise
-    except subprocess.CalledProcessError as e:
-        logging.error(f"[COMPRESS] ✗ ffmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
-        raise
-    except Exception as e:
-        logging.error(f"[COMPRESS] ✗ Compression failed: {e}")
-        raise
-
-async def send_telegram_video(directory):
-    """Send compressed videos to Telegram users with GPU acceleration."""
-    request = HTTPXRequest(connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30)
-    bot = Bot(token=TOKEN, request=request)
-    
-    # Sort files by name for consistent ordering
-    sorted_files = sorted(directory.iterdir(), key=lambda x: x.name)
-    
-    for i, file in enumerate(sorted_files, start=1):
-        if not file.is_file() or file.suffix.lower() != ".mp4":
-            continue
-            
-        file_size = file.stat().st_size
-        file_size_mb = file_size / (1024 * 1024)
-        
-        try:
-            logging.info(f"[TELEGRAM] Processing {file.name} ({file_size_mb:.2f} MB)")
-            
-            # Force compression for all videos using GPU
-            video_to_send = file
-            compressed_path = None
-            
-            if FORCE_COMPRESS or file_size > MAX_TELEGRAM_VIDEO_SIZE:
-                try:
-                    logging.info(f"[TELEGRAM] Compressing video with GPU (force={'ON' if FORCE_COMPRESS else 'size>50MB'})...")
-                    compressed_path = compress_video(file, TARGET_SIZE)
-                    video_to_send = compressed_path
-                    compressed_size = compressed_path.stat().st_size
-                    compressed_size_mb = compressed_size / (1024 * 1024)
-                    logging.info(f"[TELEGRAM] Using GPU compressed version ({compressed_size_mb:.2f} MB)")
-                except Exception as e:
-                    logging.error(f"[TELEGRAM] Compression failed, will send URL instead: {e}")
-                    # Fall back to URL-only if compression fails
-                    for user_id in whitelist:
-                        try:
-                            start_time = motion_events[i-1].get("timestamp")
-                            caption = (
-                                f"🎥 *Motion Event Detected*\n\n"
-                                f"⏰ Time: {start_time.strftime('%H:%M:%S')}\n"
-                                f"📊 Size: {file_size_mb:.1f} MB\n"
-                                f"⚠️ GPU compression failed\n\n"
-                                f"🔗 Watch online:\n"
-                                f"http://192.168.1.100:8005/nightevents/{i}"
-                            )
-                            await bot.send_message(
-
-                                chat_id=user_id,
-                                text=caption,
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                        except Exception as send_err:
-                            logging.error(f"[TELEGRAM] ✗ Failed to send fallback to user {user_id}: {send_err}")
-                    continue
-            
-            # Send video to all whitelisted users
-            for user_id in whitelist:
-                try:
-                    start_time = motion_events[i-1].get("timestamp")
-                    caption = (
-                        f"🎥 Motion Event\n"
-                        f"⏰ {start_time.strftime('%H:%M:%S')}\n"
-                        f"📊 {file_size_mb:.1f} MB → {video_to_send.stat().st_size / (1024 * 1024):.1f} MB (GPU)"
-                    )
-                    
-                    with open(video_to_send, 'rb') as video_file:
-                        await bot.send_video(
-                            chat_id=user_id,
-                            video=video_file,
-                            caption=caption,
-                            supports_streaming=True
-                        )
-                    logging.info(f"[TELEGRAM] ✓ Sent GPU compressed video to user {user_id}")
-                except Exception as e:
-                    logging.error(f"[TELEGRAM] ✗ Failed to send to user {user_id}: {e}")
-            
-            # Clean up compressed temp file
-            if compressed_path and compressed_path.exists():
-                try:
-                    compressed_path.unlink()
-                    logging.info(f"[TELEGRAM] Cleaned up temp file: {compressed_path.name}")
-                except Exception as e:
-                    logging.error(f"[TELEGRAM] Failed to delete temp file: {e}")
-                    
-        except Exception as e:
-            logging.error(f"[TELEGRAM] ✗ Error processing {file.name}: {e}")
-            
-
-
 asyncio.run(send_telegram_notification(message))
-asyncio.run(send_telegram_video(directory=directory))
+logging.info("Motion Detection Video Processor Complete")
