@@ -545,10 +545,16 @@ def queue_motion_log(timestamp: datetime) -> None:
         last_motion_log_time = current_time
 
 
+def draw_box(frame, x, y, w, h, bg_color=(10, 10, 10), alpha=0.85):
+    """Draws a semi-transparent background box."""
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), bg_color, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
 def draw_wifi_icon(frame, x, y, size, rssi, color):
     """Draws a WiFi signal icon using arcs."""
     # center is bottom-middle of the icon area
-    cx, cy = x + size // 2, y + size - 2
+    cx, cy = x + size // 2, y + size - 4
     radius_step = size // 3
     thickness = 2
     
@@ -586,91 +592,115 @@ def get_status_color(value, thresholds, colors):
 
 
 def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | None, motion_detected: bool = False):
-    """Draws the Head-Up Display with all status badges in an industrial top-bar style."""
+    """Draws the Head-Up Display with separated floating boxes."""
     h, w = frame.shape[:2]
-    bar_h = 32
     
-    # Background Bar (Full width, Top)
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, bar_h), (10, 10, 10), -1)
-    cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
+    # Configuration
+    top_margin = 15
+    box_h = 36
+    pad_x = 12
+    gap = 10
     
-    # Font Settings - Clean & Sharp
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.45
-    font_color = (220, 220, 220)
+    font_scale = 0.55  # Increased slightly
+    font_color = (230, 230, 230)
     thickness = 1
     
-    # 1. Timestamp (Left)
+    # --- 1. Timestamp (Top Left) ---
     ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-    cv2.putText(frame, ts, (12, 21), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    (tw, th), baseline = cv2.getTextSize(ts, font, font_scale, thickness)
     
-    # 2. Right Side Widgets (Flow from Right to Left)
-    cursor_x = w - 12
+    ts_box_w = tw + (pad_x * 2)
+    draw_box(frame, gap, top_margin, ts_box_w, box_h)
     
-    # -- WiFi --
-    # Text
+    text_y = top_margin + (box_h + th) // 2 - 2
+    cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    
+    # --- 2. Status Widgets (Top Right - Flowing Left) ---
+    cursor_x = w - gap
+    
+    # -- WiFi Box --
     wifi_text = f"{rssi}dBm" if rssi is not None else "--dBm"
     (tw, th), _ = cv2.getTextSize(wifi_text, font, font_scale, thickness)
     
-    cursor_x -= tw
+    icon_size = 20
+    icon_pad = 8
+    wifi_box_w = tw + icon_size + icon_pad + (pad_x * 2)
+    
+    cursor_x -= wifi_box_w
+    draw_box(frame, cursor_x, top_margin, wifi_box_w, box_h)
+    
+    # Draw content
     wifi_color = get_status_color(rssi, [-60, -70, -80], [(100, 255, 100), (0, 255, 255), (0, 165, 255), (50, 50, 255)])
-    cv2.putText(frame, wifi_text, (cursor_x, 21), font, font_scale, font_color, thickness, cv2.LINE_AA)
     
     # Icon
-    icon_size = 18
-    cursor_x -= (icon_size + 6)
-    draw_wifi_icon(frame, cursor_x, 6, icon_size, rssi, wifi_color)
+    icon_x = cursor_x + pad_x
+    draw_wifi_icon(frame, icon_x, top_margin + 6, icon_size, rssi, wifi_color)
     
-    # Divider
-    cursor_x -= 12
-    cv2.line(frame, (cursor_x, 6), (cursor_x, 26), (60, 60, 60), 1)
-    cursor_x -= 12
+    # Text
+    cv2.putText(frame, wifi_text, (icon_x + icon_size + icon_pad, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
     
-    # -- FPS --
-    # Compact "30 fps"
+    cursor_x -= gap
+    
+    # -- FPS Box --
     fps_val = int(fps)
     fps_str = f"{fps_val} fps"
     (tw, th), _ = cv2.getTextSize(fps_str, font, font_scale, thickness)
-    cursor_x -= tw
-    fps_color = get_status_color(fps, [15, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)])
-    cv2.putText(frame, fps_str, (cursor_x, 21), font, font_scale, fps_color, thickness, cv2.LINE_AA)
-
-    # Divider
-    cursor_x -= 12
-    cv2.line(frame, (cursor_x, 6), (cursor_x, 26), (60, 60, 60), 1)
-    cursor_x -= 12
-
-    # -- Memory --
+    
+    fps_box_w = tw + (pad_x * 2) + 6 # +6 for dot space
+    cursor_x -= fps_box_w
+    draw_box(frame, cursor_x, top_margin, fps_box_w, box_h)
+    
+    # Color logic: >= 7 Green, >= 5 Yellow, else Red
+    fps_color = get_status_color(fps, [7, 5], [(100, 255, 100), (0, 255, 255), (50, 50, 255)])
+    
+    # Dot
+    dot_x = cursor_x + pad_x
+    dot_y = top_margin + box_h // 2
+    cv2.circle(frame, (dot_x + 2, dot_y), 3, fps_color, -1)
+    
+    # Text
+    cv2.putText(frame, fps_str, (dot_x + 10, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    
+    cursor_x -= gap
+    
+    # -- Memory Box (if enabled) --
     if SHOW_MEMORY_BADGE:
-        # Just "45%"
         mem_val = f"{int(mem_pct)}%" if mem_pct is not None else "--%"
         (tw, th), _ = cv2.getTextSize(mem_val, font, font_scale, thickness)
-        cursor_x -= tw
+        
+        icon_w = 12
+        icon_pad = 6
+        mem_box_w = tw + icon_w + icon_pad + (pad_x * 2)
+        
+        cursor_x -= mem_box_w
+        draw_box(frame, cursor_x, top_margin, mem_box_w, box_h)
+        
         mem_color = get_status_color(mem_pct, [20, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)])
-        cv2.putText(frame, mem_val, (cursor_x, 21), font, font_scale, mem_color, thickness, cv2.LINE_AA)
         
-        # Simple Square Icon
-        icon_w = 10
-        cursor_x -= (icon_w + 6)
-        cv2.rectangle(frame, (cursor_x, 10), (cursor_x + 10, 22), mem_color, 1)
-        # Pins details
-        cv2.line(frame, (cursor_x+2, 13), (cursor_x+8, 13), mem_color, 1)
-        cv2.line(frame, (cursor_x+2, 19), (cursor_x+8, 19), mem_color, 1)
+        # Icon (Simple Chip)
+        ic_x = cursor_x + pad_x
+        ic_y = top_margin + 10
+        cv2.rectangle(frame, (ic_x, ic_y), (ic_x + icon_w, ic_y + 14), mem_color, 1)
+        # Pins
+        cv2.line(frame, (ic_x+2, ic_y+3), (ic_x+icon_w-2, ic_y+3), mem_color, 1)
+        cv2.line(frame, (ic_x+2, ic_y+10), (ic_x+icon_w-2, ic_y+10), mem_color, 1)
         
-        # Divider (if needed for further items, but this is the last one)
-        # cursor_x -= 12
-        # cv2.line(frame, (cursor_x, 6), (cursor_x, 26), (60, 60, 60), 1)
+        # Text
+        cv2.putText(frame, mem_val, (ic_x + icon_w + icon_pad, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        
+        cursor_x -= gap
 
-    # 3. Motion Warning (Center)
+    # --- 3. Motion Warning (Center) ---
     if motion_detected:
         warn_text = "MOTION DETECTED"
         (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
-        cx = w // 2 - tw // 2
+        warn_box_w = tw + (pad_x * 2)
+        cx = (w - warn_box_w) // 2
         
-        # Red background block for warning
-        cv2.rectangle(frame, (cx - 10, 0), (cx + tw + 10, bar_h), (180, 40, 40), -1)
-        cv2.putText(frame, warn_text, (cx, 21), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        # Red background box
+        draw_box(frame, cx, top_margin, warn_box_w, box_h, bg_color=(180, 40, 40), alpha=0.9)
+        cv2.putText(frame, warn_text, (cx + pad_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
 def backoff(attempt: int) -> float:
