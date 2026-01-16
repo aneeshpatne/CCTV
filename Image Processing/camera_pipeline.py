@@ -540,7 +540,7 @@ def queue_motion_log(timestamp: datetime) -> None:
 
 
 def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
-    """Draw FPS badge in CCTV style.
+    """Draw FPS badge in minimal elegant style.
     
     Args:
         frame: Frame to draw on (modified in-place)
@@ -553,32 +553,31 @@ def draw_fps_badge(frame: np.ndarray, fps: float) -> None:
     badge_x = wifi_badge_x - badge_w - 5  # 5px gap
     badge_y = 10
     
-    # Draw semi-transparent dark background
+    # Draw solid dark background (high opacity for "solid" look)
     overlay = frame.copy()
     cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
                  (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
     
     # Determine color based on FPS
     if fps >= 7:
-        color = (0, 255, 0)  # Green for good (target FPS)
+        color = (100, 255, 100)  # Pastel Green
     elif fps >= 5:
-        color = (0, 255, 255)  # Yellow for fair
+        color = (0, 255, 255)  # Yellow
     else:
-        color = (0, 0, 255)  # Red for poor
+        color = (50, 50, 255)  # Red
     
-    # Draw border with color based on FPS
-    cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                 color, 1)
+    # Draw status dot instead of border
+    cv2.circle(frame, (badge_x + 12, badge_y + badge_h // 2), 4, color, -1)
     
-    # Draw FPS text (no decimal)
-    fps_text = f"FPS: {int(fps)}"
-    cv2.putText(frame, fps_text, (badge_x + 10, badge_y + 23), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
+    # Draw FPS text (Clean white)
+    fps_text = f"FPS {int(fps)}"
+    cv2.putText(frame, fps_text, (badge_x + 25, badge_y + 24), 
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
 
 
 def draw_memory_badge(frame: np.ndarray, mem_percent: float | None) -> None:
-    """Draw Memory badge with RAM symbol in CCTV style.
+    """Draw Memory badge with RAM symbol in minimal elegant style.
     
     Args:
         frame: Frame to draw on (modified in-place)
@@ -591,46 +590,42 @@ def draw_memory_badge(frame: np.ndarray, mem_percent: float | None) -> None:
     badge_x = fps_badge_x - badge_w - 5  # 5px gap
     badge_y = 10
     
-    # Draw semi-transparent dark background
+    # Draw solid dark background
     overlay = frame.copy()
     cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
                  (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
     
     # Determine color based on memory percentage
     if mem_percent is None:
         color = (128, 128, 128)  # Gray for no data
     elif mem_percent > 30:
-        color = (0, 255, 0)  # Green for healthy
+        color = (100, 255, 100)  # Pastel Green
     elif mem_percent > 15:
-        color = (0, 255, 255)  # Yellow for warning
+        color = (0, 255, 255)  # Yellow
     else:
-        color = (0, 0, 255)  # Red for critical
+        color = (50, 50, 255)  # Red
     
-    # Draw border with color based on memory
-    cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                 color, 1)
-    
-    # Draw RAM chip symbol (simplified rectangle with lines)
+    # Draw RAM chip symbol (cleaner)
     icon_x = badge_x + badge_w // 2 - 10
     icon_y = badge_y + badge_h // 2 - 6
     
-    # Main chip body
-    cv2.rectangle(frame, (icon_x, icon_y), (icon_x + 20, icon_y + 12), color, 1)
-    
-    # Pins on left side
+    # Main chip body (Outline)
+    cv2.rectangle(frame, (icon_x, icon_y), (icon_x + 20, icon_y + 12), (200, 200, 200), 1)
+    # Fill slightly
+    # cv2.rectangle(frame, (icon_x+1, icon_y+1), (icon_x + 19, icon_y + 11), color, -1) 
+    # Actually just a solid colored small rect looks cleaner
+    cv2.rectangle(frame, (icon_x + 3, icon_y + 3), (icon_x + 17, icon_y + 9), color, -1)
+
+    # Pins (Subtle)
     for i in range(3):
         pin_y = icon_y + 2 + i * 4
-        cv2.line(frame, (icon_x - 2, pin_y), (icon_x, pin_y), color, 1)
-    
-    # Pins on right side
-    for i in range(3):
-        pin_y = icon_y + 2 + i * 4
-        cv2.line(frame, (icon_x + 20, pin_y), (icon_x + 22, pin_y), color, 1)
+        cv2.line(frame, (icon_x - 2, pin_y), (icon_x, pin_y), (150, 150, 150), 1)
+        cv2.line(frame, (icon_x + 20, pin_y), (icon_x + 22, pin_y), (150, 150, 150), 1)
 
 
 def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
-    """Draw WiFi signal strength indicator with CCTV-style background.
+    """Draw WiFi signal strength indicator in minimal elegant style.
     
     Args:
         frame: Frame to draw on (modified in-place)
@@ -642,54 +637,44 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
     badge_x = frame.shape[1] - badge_w - 10
     badge_y = 10
     
-    # Draw semi-transparent dark background
+    # Draw solid dark background
     overlay = frame.copy()
     cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
                  (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
     
     # Determine signal strength and color
     if rssi is None:
         bars_filled = 0
-        color = (0, 0, 255)  # Red for no signal
+        color = (50, 50, 255)  # Red
         text = "N/A"
-        border_color = (0, 0, 255)
     elif rssi >= -50:
         bars_filled = 4
-        color = (0, 255, 0)  # Green for excellent
+        color = (100, 255, 100)  # Pastel Green
         text = f"{rssi} dBm"
-        border_color = (0, 255, 0)
     elif rssi >= -60:
         bars_filled = 3
-        color = (0, 255, 0)  # Green for good
+        color = (100, 255, 100)
         text = f"{rssi} dBm"
-        border_color = (0, 255, 0)
     elif rssi >= -70:
         bars_filled = 2
-        color = (0, 255, 255)  # Yellow for fair
+        color = (0, 255, 255)
         text = f"{rssi} dBm"
-        border_color = (0, 255, 255)
     elif rssi >= -80:
         bars_filled = 1
-        color = (0, 165, 255)  # Orange for weak
+        color = (0, 165, 255)
         text = f"{rssi} dBm"
-        border_color = (0, 165, 255)
     else:
         bars_filled = 0
-        color = (0, 0, 255)  # Red for very weak
+        color = (50, 50, 255)
         text = f"{rssi} dBm"
-        border_color = (0, 0, 255)
-    
-    # Draw border with color based on signal strength
-    cv2.rectangle(frame, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                 border_color, 1)
     
     # Draw 4 bars inside badge
-    bar_width = 6
-    bar_spacing = 3
-    bar_height_base = 5
-    x_base = badge_x + 12
-    y_base = badge_y + badge_h - 8
+    bar_width = 4
+    bar_spacing = 4
+    bar_height_base = 6
+    x_base = badge_x + 15
+    y_base = badge_y + badge_h - 10
     
     for i in range(4):
         x = x_base + i * (bar_width + bar_spacing)
@@ -700,12 +685,12 @@ def draw_wifi_signal(frame: np.ndarray, rssi: int | None) -> None:
             # Filled bar
             cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), color, -1)
         else:
-            # Empty bar (outline only)
-            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (80, 80, 80), 1)
+            # Empty bar (dark grey)
+            cv2.rectangle(frame, (x, y_top), (x + bar_width, y_base), (60, 60, 60), -1)
     
     # Draw RSSI value text
-    cv2.putText(frame, text, (badge_x + 52, badge_y + 23), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, text, (badge_x + 52, badge_y + 24), 
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
 
 
 def backoff(attempt: int) -> float:
@@ -719,57 +704,40 @@ def show_placeholder(message: str) -> None:
     frame = base.copy()
     ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     
-    # Draw timestamp with CCTV-style background (matching normal frames)
+    # Draw timestamp with minimal elegant style
     time_x = 10
     time_y = 10
     time_w = 305
     time_h = 35
     
-    # Draw semi-transparent dark background for timestamp
+    # Draw solid dark background
     overlay = frame.copy()
     cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
                  (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
     
-    # Draw subtle border
-    cv2.rectangle(frame, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                 (0, 255, 0), 1)
-    
-    # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 23),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
-    
-    # Draw message below
-    cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
-                0.65, (180, 220, 255), 1, cv2.LINE_AA)
-    cv2.imshow("frame", frame)
+    # Draw timestamp text (Clean white)
+    cv2.putText(frame, ts, (time_x + 15, time_y + 24),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
 
 
 def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     """Create and optionally display a no-signal frame. Always returns the frame for recording."""
-    base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
-    frame = base.copy()
-    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-    
-    # Draw timestamp with CCTV-style background (matching normal frames)
+    # Draw timestamp with minimal elegant style
     time_x = 10
     time_y = 10
     time_w = 305
     time_h = 35
     
-    # Draw semi-transparent dark background for timestamp
+    # Draw solid dark background
     overlay = frame.copy()
     cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
                  (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    
-    # Draw subtle border
-    cv2.rectangle(frame, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                 (0, 255, 0), 1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
     
     # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 23),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, ts, (time_x + 15, time_y + 24),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
     
     # Draw message below
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
@@ -811,25 +779,21 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
     frame = base.copy()
     ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     
-    # Draw timestamp with CCTV-style background (matching normal frames)
+    # Draw timestamp with minimal elegant style
     time_x = 10
     time_y = 10
     time_w = 305
     time_h = 35
     
-    # Draw semi-transparent dark background for timestamp
+    # Draw solid dark background
     overlay = frame.copy()
     cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
                  (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    
-    # Draw subtle border
-    cv2.rectangle(frame, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                 (0, 255, 0), 1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
     
     # Draw timestamp text
-    cv2.putText(frame, ts, (time_x + 15, time_y + 23),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
+    cv2.putText(frame, ts, (time_x + 15, time_y + 24),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
     
     # Draw message below
     cv2.putText(frame, message, (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
@@ -1077,27 +1041,23 @@ def main() -> None:
             # Timestamp and motion label
             ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
             
-            # Draw timestamp with CCTV-style background
+            # Draw timestamp with minimal elegant style
             time_x = 10
             time_y = 10
             time_w = 305
             time_h = 35
             
-            # Draw semi-transparent dark background for timestamp
+            # Draw solid dark background
             overlay = disp.copy()
             cv2.rectangle(overlay, (time_x, time_y), (time_x + time_w, time_y + time_h),
                          (20, 20, 20), -1)
-            cv2.addWeighted(overlay, 0.6, disp, 0.4, 0, disp)
-            
-            # Draw subtle border
-            cv2.rectangle(disp, (time_x, time_y), (time_x + time_w, time_y + time_h),
-                         (0, 255, 0), 1)
+            cv2.addWeighted(overlay, 0.85, disp, 0.15, 0, disp)
             
             # Draw timestamp text
-            cv2.putText(disp, ts, (time_x + 15, time_y + 23),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 255, 200), 1, cv2.LINE_AA)
+            cv2.putText(disp, ts, (time_x + 15, time_y + 24),
+                       cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
             
-            # Draw subtle motion detection badge if motion detected (beside timestamp)
+            # Draw minimal motion detection badge if motion detected
             if motion_detected:
                 # Calculate position next to timestamp
                 badge_x = 325  # Position to the right of timestamp
@@ -1105,24 +1065,20 @@ def main() -> None:
                 badge_w = 190
                 badge_h = 35
                 
-                # Draw semi-transparent dark background rectangle
+                # Draw solid dark background
                 overlay = disp.copy()
                 cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                             (40, 40, 40), -1)
-                cv2.addWeighted(overlay, 0.5, disp, 0.5, 0, disp)
+                             (20, 20, 20), -1)
+                cv2.addWeighted(overlay, 0.85, disp, 0.15, 0, disp)
                 
-                # Draw subtle border
-                cv2.rectangle(disp, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h),
-                             (100, 200, 255), 1)
-                
-                # Draw small warning dot
-                dot_x = badge_x + 12
+                # Draw warning dot (Red)
+                dot_x = badge_x + 15
                 dot_y = badge_y + badge_h // 2
-                cv2.circle(disp, (dot_x, dot_y), 5, (100, 200, 255), -1)
+                cv2.circle(disp, (dot_x, dot_y), 5, (50, 50, 255), -1)
                 
                 # Draw "MOTION DETECTED" text
-                cv2.putText(disp, "MOTION DETECTED", (badge_x + 25, badge_y + 23),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 220, 255), 1, cv2.LINE_AA)
+                cv2.putText(disp, "MOTION DETECTED", (badge_x + 30, badge_y + 24),
+                           cv2.FONT_HERSHEY_DUPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
 
             # Draw WiFi signal strength indicator
             with rssi_lock:
