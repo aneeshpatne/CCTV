@@ -545,61 +545,34 @@ def queue_motion_log(timestamp: datetime) -> None:
         last_motion_log_time = current_time
 
 
-def draw_sleek_badge(frame, text, x, y, align='left', color=(255, 255, 255), status_color=None):
-    """Draws a sleek rounded badge with optional status dot."""
-    font = cv2.FONT_HERSHEY_DUPLEX
-    scale = 0.55
-    thickness = 1
-    pad_x = 16
-    pad_y = 10
+def draw_wifi_icon(frame, x, y, size, rssi, color):
+    """Draws a WiFi signal icon using arcs."""
+    # center is bottom-middle of the icon area
+    cx, cy = x + size // 2, y + size - 2
+    radius_step = size // 3
+    thickness = 2
     
-    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+    # Dot
+    cv2.circle(frame, (cx, cy), 2, color, -1)
     
-    # Calculate width including status dot if present
-    dot_radius = 4
-    dot_spacing = 10
-    content_w = text_w
-    if status_color is not None:
-        content_w += (dot_radius * 2) + dot_spacing
-        
-    w = content_w + (pad_x * 2)
-    h = int(text_h + (pad_y * 2))
+    # Arcs
+    # Logic: > -60: 3 arcs, > -70: 2 arcs, > -80: 1 arc
+    bars = 0
+    if rssi is not None:
+        if rssi >= -60: bars = 3
+        elif rssi >= -70: bars = 2
+        elif rssi >= -80: bars = 1
     
-    # Calculate Top-Left based on alignment
-    if align == 'right':
-        x = x - w
-    elif align == 'center':
-        x = x - (w // 2)
+    # Draw background (dim) arcs
+    grey = (60, 60, 60)
     
-    # Background (Rounded Rectangle)
-    overlay = frame.copy()
-    r = h // 2
+    for i in range(1, 4):
+        r = i * radius_step
+        curr_color = color if i <= bars else grey
+        # StartAngle 225, EndAngle 315 for a top-up wedge look
+        cv2.ellipse(frame, (cx, cy), (r, r), 0, 225, 315, curr_color, thickness, cv2.LINE_AA)
     
-    # Main body
-    cv2.rectangle(overlay, (x + r, y), (x + w - r, y + h), (20, 20, 20), -1)
-    cv2.circle(overlay, (x + r, y + r), r, (20, 20, 20), -1)
-    cv2.circle(overlay, (x + w - r, y + r), r, (20, 20, 20), -1)
-    
-    # Apply transparency
-    alpha = 0.7
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-    
-    # Draw Content
-    content_start_x = x + pad_x
-    center_y = y + (h // 2)
-    
-    if status_color is not None:
-        cv2.circle(frame, (content_start_x + dot_radius, center_y), dot_radius, status_color, -1)
-        text_x = content_start_x + (dot_radius * 2) + dot_spacing
-    else:
-        text_x = content_start_x
-        
-    # Center text vertically
-    text_y = center_y + (text_h // 2) - 1
-    
-    cv2.putText(frame, text, (text_x, text_y), font, scale, color, thickness, cv2.LINE_AA)
-    
-    return w, h
+    return size
 
 
 def get_status_color(value, thresholds, colors):
@@ -613,43 +586,91 @@ def get_status_color(value, thresholds, colors):
 
 
 def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | None, motion_detected: bool = False):
-    """Draws the Head-Up Display with all status badges."""
+    """Draws the Head-Up Display with all status badges in an industrial top-bar style."""
     h, w = frame.shape[:2]
-    margin = 25
-    spacing = 15
+    bar_h = 32
     
-    # 1. Timestamp (Top Left)
-    ts = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p")
-    draw_sleek_badge(frame, ts, margin, margin, align='left')
+    # Background Bar (Full width, Top)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, bar_h), (10, 10, 10), -1)
+    cv2.addWeighted(overlay, 0.9, frame, 0.1, 0, frame)
     
-    # 2. Status Badges (Top Right)
-    cursor_x = w - margin
+    # Font Settings - Clean & Sharp
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    font_color = (220, 220, 220)
+    thickness = 1
     
-    # WiFi Badge
-    wifi_color = get_status_color(rssi, [-60, -70, -80], 
-                                 [(100, 255, 100), (0, 255, 255), (0, 165, 255), (50, 50, 255)])
-    wifi_text = f"WiFi {rssi}dBm" if rssi is not None else "WiFi N/A"
-    bw, bh = draw_sleek_badge(frame, wifi_text, cursor_x, margin, align='right', status_color=wifi_color)
-    cursor_x -= (bw + spacing)
+    # 1. Timestamp (Left)
+    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    cv2.putText(frame, ts, (12, 21), font, font_scale, font_color, thickness, cv2.LINE_AA)
     
-    # Memory Badge (if enabled)
+    # 2. Right Side Widgets (Flow from Right to Left)
+    cursor_x = w - 12
+    
+    # -- WiFi --
+    # Text
+    wifi_text = f"{rssi}dBm" if rssi is not None else "--dBm"
+    (tw, th), _ = cv2.getTextSize(wifi_text, font, font_scale, thickness)
+    
+    cursor_x -= tw
+    wifi_color = get_status_color(rssi, [-60, -70, -80], [(100, 255, 100), (0, 255, 255), (0, 165, 255), (50, 50, 255)])
+    cv2.putText(frame, wifi_text, (cursor_x, 21), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    
+    # Icon
+    icon_size = 18
+    cursor_x -= (icon_size + 6)
+    draw_wifi_icon(frame, cursor_x, 6, icon_size, rssi, wifi_color)
+    
+    # Divider
+    cursor_x -= 12
+    cv2.line(frame, (cursor_x, 6), (cursor_x, 26), (60, 60, 60), 1)
+    cursor_x -= 12
+    
+    # -- FPS --
+    # Compact "30 fps"
+    fps_val = int(fps)
+    fps_str = f"{fps_val} fps"
+    (tw, th), _ = cv2.getTextSize(fps_str, font, font_scale, thickness)
+    cursor_x -= tw
+    fps_color = get_status_color(fps, [15, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)])
+    cv2.putText(frame, fps_str, (cursor_x, 21), font, font_scale, fps_color, thickness, cv2.LINE_AA)
+
+    # Divider
+    cursor_x -= 12
+    cv2.line(frame, (cursor_x, 6), (cursor_x, 26), (60, 60, 60), 1)
+    cursor_x -= 12
+
+    # -- Memory --
     if SHOW_MEMORY_BADGE:
-        mem_color = get_status_color(mem_pct, [30, 15], 
-                                    [(100, 255, 100), (0, 255, 255), (50, 50, 255)])
-        mem_text = f"RAM {int(mem_pct)}%" if mem_pct is not None else "RAM --%"
-        bw, bh = draw_sleek_badge(frame, mem_text, cursor_x, margin, align='right', status_color=mem_color)
-        cursor_x -= (bw + spacing)
+        # Just "45%"
+        mem_val = f"{int(mem_pct)}%" if mem_pct is not None else "--%"
+        (tw, th), _ = cv2.getTextSize(mem_val, font, font_scale, thickness)
+        cursor_x -= tw
+        mem_color = get_status_color(mem_pct, [20, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)])
+        cv2.putText(frame, mem_val, (cursor_x, 21), font, font_scale, mem_color, thickness, cv2.LINE_AA)
         
-    # FPS Badge
-    fps_color = get_status_color(fps, [15, 10], 
-                                [(100, 255, 100), (0, 255, 255), (50, 50, 255)])
-    fps_text = f"FPS {int(fps)}"
-    draw_sleek_badge(frame, fps_text, cursor_x, margin, align='right', status_color=fps_color)
-    
-    # 3. Motion Warning (Top Center)
+        # Simple Square Icon
+        icon_w = 10
+        cursor_x -= (icon_w + 6)
+        cv2.rectangle(frame, (cursor_x, 10), (cursor_x + 10, 22), mem_color, 1)
+        # Pins details
+        cv2.line(frame, (cursor_x+2, 13), (cursor_x+8, 13), mem_color, 1)
+        cv2.line(frame, (cursor_x+2, 19), (cursor_x+8, 19), mem_color, 1)
+        
+        # Divider (if needed for further items, but this is the last one)
+        # cursor_x -= 12
+        # cv2.line(frame, (cursor_x, 6), (cursor_x, 26), (60, 60, 60), 1)
+
+    # 3. Motion Warning (Center)
     if motion_detected:
-        draw_sleek_badge(frame, "MOTION DETECTED", w // 2, margin, align='center', 
-                        status_color=(50, 50, 255))
+        warn_text = "MOTION DETECTED"
+        (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
+        cx = w // 2 - tw // 2
+        
+        # Red background block for warning
+        cv2.rectangle(frame, (cx - 10, 0), (cx + tw + 10, bar_h), (180, 40, 40), -1)
+        cv2.putText(frame, warn_text, (cx, 21), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
 def backoff(attempt: int) -> float:
@@ -662,13 +683,12 @@ def show_placeholder(message: str) -> None:
     base = no_signal_img if no_signal_img is not None else np.zeros((480, 640, 3), dtype=np.uint8)
     frame = base.copy()
     
-    # Draw Timestamp using sleek badge
-    ts = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p")
-    draw_sleek_badge(frame, ts, 25, 25, align='left')
-    
     # Message
     cv2.putText(frame, message, (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
                 0.7, (200, 200, 200), 1, cv2.LINE_AA)
+    
+    # Use draw_hud with placeholders
+    draw_hud(frame, fps=0, rssi=None, mem_pct=None)
     
     cv2.imshow("frame", frame)
 
