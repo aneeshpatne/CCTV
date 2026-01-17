@@ -178,20 +178,11 @@ async def get_video_by_duration(timestamp: str, minutes: int, background_tasks: 
         # Calculate time range
         start_time = dt
         end_time = dt + timedelta(minutes=minutes)
-        
-        # Find videos in this range
-        videos = find_videos_in_range(start_time, end_time)
-        
-        if not videos:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No videos found for period: {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')}"
-            )
-        
-        # Get all videos to include extras before and after
+
+        # Get all videos so we can handle timestamps with seconds
         folder = Path(CCTV_FOLDER)
         all_videos = []
-        
+
         for file in folder.glob("recording_*.mp4"):
             try:
                 timestamp_str = file.stem.replace("recording_", "")
@@ -199,27 +190,41 @@ async def get_video_by_duration(timestamp: str, minutes: int, background_tasks: 
                 all_videos.append((file_dt, file))
             except ValueError:
                 continue
-        
+
+        if not all_videos:
+            raise HTTPException(
+                status_code=404,
+                detail="No videos found in the recordings folder"
+            )
+
         all_videos.sort(key=lambda x: x[0])
-        
-        # Find indices of first and last video in our range
-        first_idx = None
-        last_idx = None
-        
+
+        start_idx = None
+        end_idx = None
+
         for i, (file_dt, file) in enumerate(all_videos):
-            if file in videos:
-                if first_idx is None:
-                    first_idx = i
-                last_idx = i
-        
-        # Include 1 video before and after
-        if first_idx is not None and last_idx is not None:
-            start_idx = max(0, first_idx - 1)
-            end_idx = min(len(all_videos), last_idx + 2)
-            
-            videos_to_merge = [all_videos[i][1] for i in range(start_idx, end_idx)]
-        else:
-            videos_to_merge = videos
+            if start_idx is None and file_dt >= start_time:
+                start_idx = max(0, i - 1)
+            if file_dt > end_time:
+                end_idx = max(0, i - 1)
+                break
+
+        if start_idx is None:
+            start_idx = len(all_videos) - 1
+        if end_idx is None:
+            end_idx = len(all_videos) - 1
+
+        # Include 1 video before and after the range
+        start_idx = max(0, start_idx - 1)
+        end_idx = min(len(all_videos) - 1, end_idx + 1)
+
+        if start_idx > end_idx:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No videos found for period: {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+        videos_to_merge = [all_videos[i][1] for i in range(start_idx, end_idx + 1)]
         
         # If only one video, return it directly
         if len(videos_to_merge) == 1:
