@@ -108,7 +108,7 @@ motion_events = []
 i = 0
 while i < len(timestamps):
     start_time = timestamps[i]
-    duration = 1
+    duration = 0.2
     j = i + 1
     while j < len(timestamps):
         diff = timestamps[j] - timestamps[j - 1]
@@ -133,7 +133,7 @@ failed_downloads = 0
 
 for idx, item in enumerate(motion_events, 1):
     try:
-        start_time = item.get("timestamp") - timedelta(minutes=1)
+        start_time = item.get("timestamp") - timedelta(seconds=20)
         duration = item.get("duration")
 
         logging.info(
