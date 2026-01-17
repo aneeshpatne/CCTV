@@ -108,7 +108,7 @@ motion_events = []
 i = 0
 while i < len(timestamps):
     start_time = timestamps[i]
-    duration = 1
+    duration = 0.5
     j = i + 1
     while j < len(timestamps):
         diff = timestamps[j] - timestamps[j - 1]
@@ -133,7 +133,7 @@ failed_downloads = 0
 
 for idx, item in enumerate(motion_events, 1):
     try:
-        start_time = item.get("timestamp") - timedelta(minutes=1)
+        start_time = item.get("timestamp") - timedelta(seconds=20)
         duration = item.get("duration")
 
         logging.info(
@@ -177,8 +177,8 @@ logging.info("[TELEGRAM] Sending motion summary")
 total_duration = sum(e.get("duration", 0) for e in motion_events)
 
 events_str = "\n".join(
-    f"• {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n \n"
-    f"https://192.168.1.100:8005/nightevents/{idx}"
+    f"• {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n"
+    f"https://192.168.1.100:8005/nightevents/{idx + 1}"
     for idx, e in enumerate(motion_events)
 )
 
