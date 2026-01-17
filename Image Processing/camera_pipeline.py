@@ -607,7 +607,7 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     thickness = 1
     
     # --- 1. Timestamp (Top Left) ---
-    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     (tw, th), baseline = cv2.getTextSize(ts, font, font_scale, thickness)
     
     ts_box_w = tw + (pad_x * 2)
@@ -615,8 +615,17 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     
     text_y = top_margin + (box_h + th) // 2 - 2
     cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+
+    # --- 2. Motion Warning (Next to Timestamp) ---
+    if motion_detected:
+        warn_text = "MOTION DETECTED"
+        (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
+        warn_box_w = tw + (pad_x * 2)
+        warn_x = gap + ts_box_w + gap
+        draw_box(frame, warn_x, top_margin, warn_box_w, box_h, bg_color=(180, 40, 40), alpha=0.9)
+        cv2.putText(frame, warn_text, (warn_x + pad_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
     
-    # --- 2. Status Widgets (Top Right - Flowing Left) ---
+    # --- 3. Status Widgets (Top Right - Flowing Left) ---
     cursor_x = w - gap
     
     # -- WiFi Box --
@@ -691,16 +700,6 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
         
         cursor_x -= gap
 
-    # --- 3. Motion Warning (Center) ---
-    if motion_detected:
-        warn_text = "MOTION DETECTED"
-        (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
-        warn_box_w = tw + (pad_x * 2)
-        cx = (w - warn_box_w) // 2
-        
-        # Red background box
-        draw_box(frame, cx, top_margin, warn_box_w, box_h, bg_color=(180, 40, 40), alpha=0.9)
-        cv2.putText(frame, warn_text, (cx + pad_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
 
 def backoff(attempt: int) -> float:
@@ -726,7 +725,12 @@ def show_placeholder(message: str) -> None:
 def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     """Create and optionally display a no-signal frame. Always returns the frame for recording."""
     # Initialize frame from no_signal_img
-    frame = no_signal_img.copy()
+    if no_signal_img is not None:
+        frame = no_signal_img.copy()
+    else:
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(frame, "NO SIGNAL", (160, 260), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.4, (0, 0, 255), 3, cv2.LINE_AA)
 
     # Draw message below HUD area
     cv2.putText(frame, message, (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
