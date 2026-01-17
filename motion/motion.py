@@ -177,9 +177,9 @@ logging.info("[TELEGRAM] Sending motion summary")
 total_duration = sum(e.get("duration", 0) for e in motion_events)
 
 events_str = "\n".join(
-    f"{idx + 1} - {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n"
-    f"http://192.168.1.100:8005/nightevents/{idx + 1}"
-    for idx, e in enumerate(motion_events)
+    f"{idx} - {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n"
+    f"http://192.168.1.100:8005/nightevents/{idx}"
+    for idx, e in enumerate(motion_events, start=1)
 )
 
 message = (
