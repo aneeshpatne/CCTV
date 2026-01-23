@@ -36,7 +36,7 @@ class NonBlockingBlinker:
         # Toggle LED at intervals
         if current_time - self.last_toggle_time >= self.blink_interval:
             self.led_state = not self.led_state
-            adJustLED(20 if self.led_state else 0)
+            adJustLED(5 if self.led_state else 0)
             self.last_toggle_time = current_time
     
     def stop(self):
