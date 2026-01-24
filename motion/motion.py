@@ -38,7 +38,7 @@ logging.info("=" * 50)
 logging.info("Motion Detection Video Processor Started")
 logging.info("=" * 50)
 
-directory = Path("data/")
+directory = Path("/Volumes/drive/CCTV/motion/data")
 
 # Create directory if it doesn't exist
 try:

@@ -22,7 +22,6 @@ from typing import Optional
 import cv2
 import numpy as np
 import pytz
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
@@ -39,7 +38,7 @@ CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
 # Recording configuration
 ENABLE_RECORDING = True
 try:
-    BASE_DIR = "/media/aneesh/SSD/recordings/esp_cam1"
+    BASE_DIR = "/Volumes/drive/CCTV/recordings/esp_cam1"
     os.makedirs(BASE_DIR, exist_ok=True)
 except (PermissionError, OSError):
     BASE_DIR = os.path.join(os.path.dirname(__file__), '..', 'recordings')

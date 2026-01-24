@@ -31,9 +31,9 @@ app.add_middleware(
 )
 
 # Configure your CCTV footage directory
-CCTV_FOLDER = "/media/aneesh/SSD/recordings/esp_cam1"
+CCTV_FOLDER = "/Volumes/drive/CCTV/recordings/esp_cam1"
 TEMP_FOLDER = "/tmp/cctv_merged"  # Temporary folder for merged videos
-NIGHT_EVENTS_FOLDER = str(Path(__file__).resolve().parent.parent / "motion" / "data")  # Night motion events
+NIGHT_EVENTS_FOLDER = "/Volumes/drive/CCTV/motion/data"  # Night motion events
 
 # Create temp folder if it doesn't exist
 Path(TEMP_FOLDER).mkdir(parents=True, exist_ok=True)

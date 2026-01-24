@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 BASE_DIR = Path(__file__).resolve().parent
 CAMERA_SCRIPT = BASE_DIR / "camera_pipeline.py"
-RECORDINGS_DIR = Path("/media/aneesh/SSD/recordings/esp_cam1")
+RECORDINGS_DIR = Path("/Volumes/drive/CCTV/recordings/esp_cam1")
 DISK_USAGE_THRESHOLD = 90  # percent
 CHECK_INTERVAL_SECONDS = 5 * 60
 STOP_TIMEOUT_SECONDS = 5.0

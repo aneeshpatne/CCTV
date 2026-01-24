@@ -13,7 +13,7 @@ from contextlib import contextmanager
 
 # Database path
 try:
-    DB_DIR = Path("/media/aneesh/SSD/recordings/esp_cam1")
+    DB_DIR = Path("/Volumes/drive/CCTV/recordings/esp_cam1")
     DB_DIR.mkdir(parents=True, exist_ok=True)
 except (PermissionError, FileNotFoundError, OSError):
     # Fallback to local data directory
