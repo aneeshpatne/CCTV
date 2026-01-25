@@ -640,9 +640,9 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     
     
     text_y = top_margin + (box_h + th) // 2 - 2
-    print(gap, gap + ts_box_w)
-    print(x)
-    if ((gap <= y <= gap + ts_box_w and top_margin <= x <= top_margin + box_h) == False):
+    overlap_pad = 4
+
+    if not (gap - overlap_pad <= x <= gap + ts_box_w + overlap_pad and top_margin - overlap_pad <= y <= top_margin + box_h + overlap_pad):
         draw_box(frame, gap, top_margin, ts_box_w, box_h)
         cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
