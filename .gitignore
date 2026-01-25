@@ -4,4 +4,4 @@ __pycache__
 .vscode
 venv
 /motion/data
-/motion/motion.logs
+/motion/*.log
