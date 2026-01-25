@@ -1,3 +1,0 @@
-shell-init: error retrieving current directory: getcwd: cannot access parent directories: Operation not permitted
-/bin/bash: /Users/aneesh/Desktop/coding/CCTV/run_motion.sh: Operation not permitted
-/bin/bash: /Users/aneesh/Desktop/coding/CCTV/run_motion.sh: Operation not permitted
