@@ -620,6 +620,7 @@ def get_status_color(value, thresholds, colors):
 
 def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | None, motion_detected: bool = False, show_time: bool = True, coordinates: list = [0, 0]):
     """Draws the Head-Up Display with separated floating boxes."""
+    x, y = coordinates
     h, w = frame.shape[:2]
     # Configuration
     top_margin = 15
@@ -639,6 +640,7 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     
     
     text_y = top_margin + (box_h + th) // 2 - 2
+
     if (show_time == False):
         draw_box(frame, gap, top_margin, ts_box_w, box_h)
         cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
