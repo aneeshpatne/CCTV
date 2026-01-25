@@ -18,6 +18,7 @@ import subprocess
 import requests
 from datetime import datetime
 from typing import Optional
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -37,11 +38,17 @@ CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
 
 # Recording configuration
 ENABLE_RECORDING = True
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RECORDINGS_DIR = REPO_ROOT / "recordings" / "esp_cam1"
+PRIMARY_RECORDINGS_DIR = Path(
+    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
+).expanduser()
 try:
-    BASE_DIR = "/Volumes/drive/CCTV/recordings/esp_cam1"
-    os.makedirs(BASE_DIR, exist_ok=True)
+    BASE_DIR = PRIMARY_RECORDINGS_DIR
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
 except (PermissionError, OSError):
-    BASE_DIR = os.path.join(os.path.dirname(__file__), '..', 'recordings')
+    BASE_DIR = DEFAULT_RECORDINGS_DIR
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Warning: Primary recording path unavailable, using: {BASE_DIR}")
 
 SEGMENT_SECONDS = 60  # 1 minute per segment
@@ -127,26 +134,38 @@ current_fps: Optional[float] = None  # Dynamically calculated FPS for FFmpeg
 
 def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
     """Start FFmpeg process for variable frame rate CCTV recording."""
-    os.makedirs(BASE_DIR, exist_ok=True)
-    out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
 
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
-        # raw frames over stdin - NO FPS declaration
-        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        # raw frames over stdin
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}",
-        "-use_wallclock_as_timestamps", "1",  # Use system time for timestamps
+        "-r", "15",                              # FIXED FPS (important)
+        "-use_wallclock_as_timestamps", "1",
         "-i", "-",
 
         "-map", "0:v",
-        "-vf", "format=yuv420p",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "20",
-        "-vsync", "vfr",  # Variable frame rate
-        "-g", "50",  # Keyframe every ~2 seconds at typical CCTV rates
-        "-bf", "2",
+
+        # videotoolbox-friendly pixel format
+        "-vf", "format=nv12",
+
+        # hardware encoder (Intel Mac)
+        "-c:v", "h264_videotoolbox",
+
+        # stable quality (avoid blur/clear cycling)
+        "-b:v", "2500k",
+        "-maxrate", "2500k",
+        "-bufsize", "5000k",
+
+        # GOP: 2 seconds @ 15 fps
+        "-g", "30",
+        "-bf", "0",
+
+        # segmenting
         "-f", "segment",
         "-segment_time", str(SEGMENT_SECONDS),
         "-segment_format", "mp4",
@@ -156,9 +175,10 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
         out_pattern,
     ]
 
+
     # ---- Spawn process with logging -------------------------------------------
     try:
-        log_path = os.path.join(BASE_DIR, "ffmpeg_record.log")
+        log_path = BASE_DIR / "ffmpeg_record.log"
         logf = open(log_path, "ab", buffering=0)
         proc = subprocess.Popen(
             cmd,
@@ -179,33 +199,41 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subproces
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
-        # raw frames over stdin - NO FPS declaration
-        "-f", "rawvideo", "-pix_fmt", "bgr24",
+        # Raw frames from Python
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}",
-        "-use_wallclock_as_timestamps", "1",  # Use system time for timestamps
+        "-r", "15",                              # FIXED FPS (important)
+        "-use_wallclock_as_timestamps", "1",
         "-i", "-",
 
         "-map", "0:v",
-        "-vf", "format=yuv420p",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-tune", "zerolatency",
-        "-profile:v", "baseline",
-        "-level", "3.1",
-        "-b:v", "1.5M",
-        "-maxrate", "1.5M",
-        "-bufsize", "3M",
-        "-vsync", "vfr",  # Variable frame rate
-        "-g", "50",  # Keyframe every ~2 seconds
+
+        # Convert to videotoolbox-friendly format
+        "-vf", "format=nv12",
+
+        # Hardware encoder (Intel Quick Sync via VideoToolbox)
+        "-c:v", "h264_videotoolbox",
+
+        # Stable bitrate (no pulsing)
+        "-b:v", "2500k",
+        "-maxrate", "2500k",
+        "-bufsize", "5000k",
+
+        # GOP / latency
+        "-g", "30",                              # 2 seconds @ 15 fps
         "-bf", "0",
-        "-sc_threshold", "0",
+
+        # RTSP output
         "-rtsp_transport", "tcp",
         "-f", "rtsp",
         RTSP_OUT,
     ]
 
+
+
     try:
-        log_path = os.path.join(BASE_DIR, "ffmpeg_rtsp.log")
+        log_path = BASE_DIR / "ffmpeg_rtsp.log"
         logf = open(log_path, "ab", buffering=0)
         proc = subprocess.Popen(
             cmd,

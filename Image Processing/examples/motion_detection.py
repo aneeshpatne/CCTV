@@ -3,7 +3,8 @@ from datetime import datetime
 import pytz
 import numpy as np
 import sys
-sys.path.append('/home/aneesh/code/CCTV')
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 from utilities.warn import NonBlockingBlinker
 
 

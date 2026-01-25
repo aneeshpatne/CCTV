@@ -56,8 +56,9 @@ logging.info("=" * 50)
 logging.info("Motion Detection Video Processor Started")
 logging.info("=" * 50)
 
-data_dir = os.getenv("DATA_DIR") or os.getenv("MOTION_DATA_DIR") or "/Volumes/drive/CCTV/motion/data"
-directory = Path(data_dir)
+BASE_DIR = Path(__file__).resolve().parents[1]
+data_dir = os.getenv("DATA_DIR") or os.getenv("MOTION_DATA_DIR")
+directory = Path(data_dir).expanduser() if data_dir else (BASE_DIR / "motion" / "data")
 
 # Create directory if it doesn't exist
 try:

@@ -31,12 +31,37 @@ app.add_middleware(
 )
 
 # Configure your CCTV footage directory
-CCTV_FOLDER = "/Volumes/drive/CCTV/recordings/esp_cam1"
-TEMP_FOLDER = "/tmp/cctv_merged"  # Temporary folder for merged videos
-NIGHT_EVENTS_FOLDER = "/Volumes/drive/CCTV/motion/data"  # Night motion events
+BASE_DIR = Path(__file__).resolve().parent.parent
+TEMP_FOLDER = Path(os.getenv("CCTV_TEMP_DIR", "/tmp/cctv_merged"))
+
+def resolve_path(env_keys: list[str], fallback_paths: list[Path]) -> Path:
+    for key in env_keys:
+        value = os.getenv(key)
+        if value:
+            return Path(value).expanduser()
+    for path in fallback_paths:
+        if path.exists():
+            return path
+    return fallback_paths[0]
+
+
+CCTV_FOLDER = resolve_path(
+    ["CCTV_RECORDINGS_DIR", "RECORDINGS_DIR"],
+    [
+        Path("/Volumes/drive/CCTV/recordings/esp_cam1"),
+        BASE_DIR / "recordings" / "esp_cam1",
+    ],
+)
+NIGHT_EVENTS_FOLDER = resolve_path(
+    ["MOTION_DATA_DIR", "DATA_DIR"],
+    [
+        Path("/Volumes/drive/CCTV/motion/data"),
+        BASE_DIR / "motion" / "data",
+    ],
+)
 
 # Create temp folder if it doesn't exist
-Path(TEMP_FOLDER).mkdir(parents=True, exist_ok=True)
+TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
 
 @app.get("/")
 async def root():
