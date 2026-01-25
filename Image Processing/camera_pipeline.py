@@ -642,7 +642,13 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     text_y = top_margin + (box_h + th) // 2 - 2
     overlap_pad = 4
 
-    if not (gap - overlap_pad <= x <= gap + ts_box_w + overlap_pad and top_margin - overlap_pad <= y <= top_margin + box_h + overlap_pad):
+    def overlaps_box(box_x: int, box_y: int, box_w: int, box_h: int) -> bool:
+        return (
+            box_x - overlap_pad <= x <= box_x + box_w + overlap_pad
+            and box_y - overlap_pad <= y <= box_y + box_h + overlap_pad
+        )
+
+    if not overlaps_box(gap, top_margin, ts_box_w, box_h):
         draw_box(frame, gap, top_margin, ts_box_w, box_h)
         cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
@@ -652,8 +658,9 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
         (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
         warn_box_w = tw + (pad_x * 2)
         warn_x = gap + ts_box_w + gap
-        draw_box(frame, warn_x, top_margin, warn_box_w, box_h, bg_color=(180, 40, 40), alpha=0.9)
-        cv2.putText(frame, warn_text, (warn_x + pad_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        if not overlaps_box(warn_x, top_margin, warn_box_w, box_h):
+            draw_box(frame, warn_x, top_margin, warn_box_w, box_h, bg_color=(180, 40, 40), alpha=0.9)
+            cv2.putText(frame, warn_text, (warn_x + pad_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
     
     # --- 3. Status Widgets (Top Right - Flowing Left) ---
     cursor_x = w - gap
@@ -667,17 +674,18 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     wifi_box_w = tw + icon_size + icon_pad + (pad_x * 2)
     
     cursor_x -= wifi_box_w
-    draw_box(frame, cursor_x, top_margin, wifi_box_w, box_h)
-    
-    # Draw content
-    wifi_color = get_status_color(rssi, [-60, -70, -80], [(100, 255, 100), (0, 255, 255), (0, 165, 255), (50, 50, 255)])
-    
-    # Icon
-    icon_x = cursor_x + pad_x
-    draw_wifi_icon(frame, icon_x, top_margin + 6, icon_size, rssi, wifi_color)
-    
-    # Text
-    cv2.putText(frame, wifi_text, (icon_x + icon_size + icon_pad, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    if not overlaps_box(cursor_x, top_margin, wifi_box_w, box_h):
+        draw_box(frame, cursor_x, top_margin, wifi_box_w, box_h)
+
+        # Draw content
+        wifi_color = get_status_color(rssi, [-60, -70, -80], [(100, 255, 100), (0, 255, 255), (0, 165, 255), (50, 50, 255)])
+
+        # Icon
+        icon_x = cursor_x + pad_x
+        draw_wifi_icon(frame, icon_x, top_margin + 6, icon_size, rssi, wifi_color)
+
+        # Text
+        cv2.putText(frame, wifi_text, (icon_x + icon_size + icon_pad, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
     
     cursor_x -= gap
     
@@ -688,18 +696,19 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     
     fps_box_w = tw + (pad_x * 2) + 6 # +6 for dot space
     cursor_x -= fps_box_w
-    draw_box(frame, cursor_x, top_margin, fps_box_w, box_h)
-    
-    # Color logic: >= 7 Green, >= 5 Yellow, else Red
-    fps_color = get_status_color(fps, [7, 5], [(100, 255, 100), (0, 255, 255), (50, 50, 255)])
-    
-    # Dot
-    dot_x = cursor_x + pad_x
-    dot_y = top_margin + box_h // 2
-    cv2.circle(frame, (dot_x + 2, dot_y), 3, fps_color, -1)
-    
-    # Text
-    cv2.putText(frame, fps_str, (dot_x + 10, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    if not overlaps_box(cursor_x, top_margin, fps_box_w, box_h):
+        draw_box(frame, cursor_x, top_margin, fps_box_w, box_h)
+
+        # Color logic: >= 7 Green, >= 5 Yellow, else Red
+        fps_color = get_status_color(fps, [7, 5], [(100, 255, 100), (0, 255, 255), (50, 50, 255)])
+
+        # Dot
+        dot_x = cursor_x + pad_x
+        dot_y = top_margin + box_h // 2
+        cv2.circle(frame, (dot_x + 2, dot_y), 3, fps_color, -1)
+
+        # Text
+        cv2.putText(frame, fps_str, (dot_x + 10, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
     
     cursor_x -= gap
     
@@ -713,20 +722,21 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
         mem_box_w = tw + icon_w + icon_pad + (pad_x * 2)
         
         cursor_x -= mem_box_w
-        draw_box(frame, cursor_x, top_margin, mem_box_w, box_h)
-        
-        mem_color = get_status_color(mem_pct, [20, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)])
-        
-        # Icon (Simple Chip)
-        ic_x = cursor_x + pad_x
-        ic_y = top_margin + 10
-        cv2.rectangle(frame, (ic_x, ic_y), (ic_x + icon_w, ic_y + 14), mem_color, 1)
-        # Pins
-        cv2.line(frame, (ic_x+2, ic_y+3), (ic_x+icon_w-2, ic_y+3), mem_color, 1)
-        cv2.line(frame, (ic_x+2, ic_y+10), (ic_x+icon_w-2, ic_y+10), mem_color, 1)
-        
-        # Text
-        cv2.putText(frame, mem_val, (ic_x + icon_w + icon_pad, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        if not overlaps_box(cursor_x, top_margin, mem_box_w, box_h):
+            draw_box(frame, cursor_x, top_margin, mem_box_w, box_h)
+
+            mem_color = get_status_color(mem_pct, [20, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)])
+
+            # Icon (Simple Chip)
+            ic_x = cursor_x + pad_x
+            ic_y = top_margin + 10
+            cv2.rectangle(frame, (ic_x, ic_y), (ic_x + icon_w, ic_y + 14), mem_color, 1)
+            # Pins
+            cv2.line(frame, (ic_x+2, ic_y+3), (ic_x+icon_w-2, ic_y+3), mem_color, 1)
+            cv2.line(frame, (ic_x+2, ic_y+10), (ic_x+icon_w-2, ic_y+10), mem_color, 1)
+
+            # Text
+            cv2.putText(frame, mem_val, (ic_x + icon_w + icon_pad, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
         
         cursor_x -= gap
 
