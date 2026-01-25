@@ -618,10 +618,9 @@ def get_status_color(value, thresholds, colors):
     return colors[-1]
 
 
-def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | None, motion_detected: bool = False):
+def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | None, motion_detected: bool = False, show_time: bool = True, coordinates: list = [0, 0]):
     """Draws the Head-Up Display with separated floating boxes."""
     h, w = frame.shape[:2]
-    
     # Configuration
     top_margin = 15
     box_h = 36
@@ -632,16 +631,17 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     font_scale = 0.55  # Increased slightly
     font_color = (230, 230, 230)
     thickness = 1
-    
     # --- 1. Timestamp (Top Left) ---
     ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     (tw, th), baseline = cv2.getTextSize(ts, font, font_scale, thickness)
-    
     ts_box_w = tw + (pad_x * 2)
-    draw_box(frame, gap, top_margin, ts_box_w, box_h)
+
+    
     
     text_y = top_margin + (box_h + th) // 2 - 2
-    cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
+    if (show_time == False):
+        draw_box(frame, gap, top_margin, ts_box_w, box_h)
+        cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
     # --- 2. Motion Warning (Next to Timestamp) ---
     if motion_detected:
@@ -1002,14 +1002,21 @@ def main() -> None:
             contours, _ = cv2.findContours(filtered_motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             disp = frame.copy()
             motion_detected = False
+            time_overlap = False
+            coordinates = [0, 0]
             for c in contours:
                 area = cv2.contourArea(c)
                 if area < MIN_AREA:
                     continue
                 motion_detected = True
+                x, y, w, h = cv2.boundingRect(c)
+                coordinates = [x, y]
+                if ( 10 <= x <= 46 and 15 <= y <= 276):
+                    time_overlap = True
+                    print("time_overlap")
+
                 # Only draw motion boxes if flag is enabled
                 if SHOW_MOTION_BOXES:
-                    x, y, w, h = cv2.boundingRect(c)
                     cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 255, 255), 2)
                     cx, cy = x + w // 2, y + h // 2
                     cv2.circle(disp, (cx, cy), 3, (0, 255, 255), -1)
@@ -1039,7 +1046,7 @@ def main() -> None:
             with memory_lock:
                 current_memory = memory_percent
 
-            draw_hud(disp, current_fps, current_rssi, current_memory, motion_detected)
+            draw_hud(disp, current_fps, current_rssi, current_memory, motion_detected, time_overlap, coordinates )
 
             # Draw ROI polygon on display only if flag is enabled
             if SHOW_MOTION_BOXES:
