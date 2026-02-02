@@ -35,7 +35,6 @@ NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'examples', 'no_signal.
 FRAME_RETRY_DELAY = 0.5
 FRAME_READ_TIMEOUT = 5.0  # seconds
 CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
-MAX_CONSECUTIVE_FRAME_FAILURES = 5  # tolerate brief MJPEG hiccups before restart
 
 # Recording configuration
 ENABLE_RECORDING = True
@@ -935,7 +934,6 @@ def main() -> None:
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
     attempt = 0
     cap = None
-    consecutive_failures = 0
 
     # Initialize motion detection components
     mog2 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
@@ -1023,17 +1021,7 @@ def main() -> None:
                 signal.setitimer(signal.ITIMER_REAL, 0)
 
             if not ret or frame is None:
-                consecutive_failures += 1
-                if consecutive_failures < MAX_CONSECUTIVE_FRAME_FAILURES:
-                    print(
-                        f"Frame read failed ({consecutive_failures}/{MAX_CONSECUTIVE_FRAME_FAILURES}) "
-                        "- retrying before restart."
-                    )
-                    time.sleep(FRAME_RETRY_DELAY)
-                    continue
-
-                print("Frame read failed repeatedly - signal lost.")
-                consecutive_failures = 0
+                print("Frame read failed - signal lost.")
                 cap.release()
                 cap = None
                 start_startup(force=True)
@@ -1044,8 +1032,6 @@ def main() -> None:
 
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
-
-            consecutive_failures = 0
 
             # Apply camera adjustments after first successful frame (only once per startup)
             with camera_adjustments_lock:
