@@ -1,6 +1,7 @@
 .env
+.venv
 __pycache__
 .vscode
 venv
 /motion/data
-/motion/motion.log
+/motion/*.log

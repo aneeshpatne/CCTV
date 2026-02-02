@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 def reset():
     """Reset the camera. Returns True on success, False on failure."""
     try:
-        res = requests.get("http://192.168.1.13/reset", timeout=2)
+        res = requests.get("http://192.168.0.13/reset", timeout=2)
         res.raise_for_status()
         logger.info("Camera reset successful")
         return True

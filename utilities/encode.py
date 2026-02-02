@@ -1,6 +1,6 @@
 import ffmpeg
 
-ESP_URL = "http://192.168.1.13:81/stream"
+ESP_URL = "http://192.168.0.13:81/stream"
 
 (
     ffmpeg

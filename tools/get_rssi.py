@@ -17,7 +17,7 @@ def get_rssi(timeout: float = 2.0) -> int | None:
         RSSI value in dBm (e.g., -50) or None if request fails
     """
     try:
-        res = requests.get("http://192.168.1.13/rssi", timeout=timeout)
+        res = requests.get("http://192.168.0.13/rssi", timeout=timeout)
         data = res.json().get("rssi")
         return data if isinstance(data, int) else None
     except requests.exceptions.Timeout:

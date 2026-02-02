@@ -1,7 +1,7 @@
 import requests
 from requests.exceptions import RequestException
 
-XCLK_ENDPOINT = "http://192.168.1.13/xclk"
+XCLK_ENDPOINT = "http://192.168.0.13/xclk"
 
 
 def change_clock(xclk: int = 15) -> None:

@@ -5,7 +5,7 @@ from datetime import datetime
 import pytz
 
 # ====== CONFIG ======
-URL = "http://192.168.1.13:81/stream"   
+URL = "http://192.168.0.13:81/stream"   
 IST = pytz.timezone("Asia/Kolkata")
 
 # Output

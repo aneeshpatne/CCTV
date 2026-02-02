@@ -5,6 +5,7 @@ This module manages motion detection events in a SQLite database.
 
 from datetime import datetime
 from pathlib import Path
+import os
 from typing import Generator
 from sqlalchemy import create_engine, Column, Integer, DateTime
 from sqlalchemy.ext.declarative import declarative_base
@@ -12,12 +13,17 @@ from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 
 # Database path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DB_DIR = REPO_ROOT / "motion" / "data"
+PRIMARY_DB_DIR = Path(
+    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
+).expanduser()
 try:
-    DB_DIR = Path("/media/aneesh/SSD/recordings/esp_cam1")
+    DB_DIR = PRIMARY_DB_DIR
     DB_DIR.mkdir(parents=True, exist_ok=True)
 except (PermissionError, FileNotFoundError, OSError):
     # Fallback to local data directory
-    DB_DIR = Path(__file__).parent.parent / "motion" / "data"
+    DB_DIR = DEFAULT_DB_DIR
     DB_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Warning: primary DB path unavailable, using: {DB_DIR}")
 

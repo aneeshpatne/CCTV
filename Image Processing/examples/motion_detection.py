@@ -3,11 +3,12 @@ from datetime import datetime
 import pytz
 import numpy as np
 import sys
-sys.path.append('/home/aneesh/code/CCTV')
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[2]))
 from utilities.warn import NonBlockingBlinker
 
 
-URL = "http://192.168.1.13:81/stream"  
+URL = "http://192.168.0.13:81/stream"  
 cap = cv2.VideoCapture(URL)
 
 if not cap.isOpened():

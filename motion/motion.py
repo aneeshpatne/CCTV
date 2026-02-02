@@ -17,6 +17,7 @@ load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 WHITELIST_FILE = "whitelist.json"
+API_BASE_URL =  "http://127.0.0.1:8005"
 
 
 def load_whitelist():
@@ -28,6 +29,23 @@ def load_whitelist():
 
 whitelist = load_whitelist()
 
+
+async def send_telegram_notification(message: str):
+    """Send notification to all whitelisted users"""
+    request = HTTPXRequest(
+        connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30
+    )
+    bot = Bot(token=TOKEN, request=request)
+
+    for user_id in whitelist:
+        try:
+            await bot.send_message(
+                chat_id=user_id, text=message, parse_mode=ParseMode.HTML
+            )
+            logging.info(f"[TELEGRAM] ✓ Sent to user {user_id}")
+        except Exception as e:
+            logging.error(f"[TELEGRAM] ✗ Failed to send to user {user_id}: {e}")
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -38,7 +56,9 @@ logging.info("=" * 50)
 logging.info("Motion Detection Video Processor Started")
 logging.info("=" * 50)
 
-directory = Path("data/")
+BASE_DIR = Path(__file__).resolve().parents[1]
+data_dir = os.getenv("DATA_DIR") or os.getenv("MOTION_DATA_DIR")
+directory = Path(data_dir).expanduser() if data_dir else (BASE_DIR / "motion" / "data")
 
 # Create directory if it doesn't exist
 try:
@@ -69,7 +89,7 @@ now_ist = datetime.now(ist).date()
 logging.info(f"[FETCH] Fetching motion events between 12:00 AM to 7:00 AM on {now_ist}")
 
 try:
-    api_url = f"http://192.168.1.100:8005/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
+    api_url = f"{API_BASE_URL}/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
     data = requests.get(api_url, timeout=30)
     data.raise_for_status()
 
@@ -77,6 +97,15 @@ try:
 
     if not events:
         logging.warning("[FETCH] No motion events found")
+        message = (
+            "<b>Tonights events</b>\n"
+            f"📅 Date: {now_ist}\n"
+            "⏱️ Time window: 00:00–07:00\n"
+            "🎯 Total events: 0\n"
+            "⏳ Total duration: 0.00 min\n\n"
+            "No motion events detected."
+        )
+        asyncio.run(send_telegram_notification(message))
         sys.exit(0)
 
     logging.info(f"[FETCH] Retrieved {len(events)} motion event(s)")
@@ -92,6 +121,15 @@ try:
 
     if not timestamps:
         logging.warning("[FETCH] No valid timestamps found")
+        message = (
+            "<b>Tonights events</b>\n"
+            f"📅 Date: {now_ist}\n"
+            "⏱️ Time window: 00:00–07:00\n"
+            "🎯 Total events: 0\n"
+            "⏳ Total duration: 0.00 min\n\n"
+            "No motion events detected."
+        )
+        asyncio.run(send_telegram_notification(message))
         sys.exit(0)
 
 except requests.RequestException as e:
@@ -140,7 +178,7 @@ for idx, item in enumerate(motion_events, 1):
             f"[DOWNLOAD] ({idx}/{len(motion_events)}) Fetching video for motion at {start_time.time()}"
         )
 
-        video_url = f"http://192.168.1.100:8005/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
+        video_url = f"{API_BASE_URL}/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
         res = requests.get(video_url, timeout=120)
         res.raise_for_status()
 
@@ -178,7 +216,7 @@ total_duration = sum(e.get("duration", 0) for e in motion_events)
 
 events_str = "\n".join(
     f"{idx} - {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n"
-    f"http://192.168.1.100:8005/nightevents/{idx}"
+    f"http://192.168.0.99:8005/nightevents/{idx}"
     for idx, e in enumerate(motion_events, start=1)
 )
 
@@ -190,23 +228,6 @@ message = (
     f"⏳ Total duration: {total_duration:.2f} min\n\n"
     f"{events_str}"
 )
-
-
-async def send_telegram_notification(message: str):
-    """Send notification to all whitelisted users"""
-    request = HTTPXRequest(
-        connection_pool_size=8, read_timeout=60, write_timeout=60, connect_timeout=30
-    )
-    bot = Bot(token=TOKEN, request=request)
-
-    for user_id in whitelist:
-        try:
-            await bot.send_message(
-                chat_id=user_id, text=message, parse_mode=ParseMode.HTML
-            )
-            logging.info(f"[TELEGRAM] ✓ Sent to user {user_id}")
-        except Exception as e:
-            logging.error(f"[TELEGRAM] ✗ Failed to send to user {user_id}: {e}")
 
 
 asyncio.run(send_telegram_notification(message))
