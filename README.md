@@ -40,7 +40,7 @@ ESP32-CAM MJPEG → camera_pipeline.py → FFmpeg ─┬─ segmented MP4 record
 - Linux with Python 3.10+ (tested on Ubuntu 22.04).
 - FFmpeg CLI with NVENC support if GPU compression is desired.
 - OpenCV build with FFMPEG support.
-- ESP32-CAM or compatible device serving MJPEG/HTTP control endpoints (defaults assume `192.168.1.13`).
+- ESP32-CAM or compatible device serving MJPEG/HTTP control endpoints (defaults assume `192.168.0.13`).
 - SQLite (bundled with Python) and write access to `/media/aneesh/SSD/recordings/esp_cam1` or a custom path.
 
 ### Python Dependencies

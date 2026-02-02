@@ -17,7 +17,7 @@ load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 WHITELIST_FILE = "whitelist.json"
-API_BASE_URL = os.getenv("CCTV_API_BASE_URL", "http://127.0.0.1:8005")
+API_BASE_URL =  "http://127.0.0.1:8005"
 
 
 def load_whitelist():
@@ -216,7 +216,7 @@ total_duration = sum(e.get("duration", 0) for e in motion_events)
 
 events_str = "\n".join(
     f"{idx} - {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n"
-    f"{API_BASE_URL}/nightevents/{idx}"
+    f"http://192.168.0.99:8005/nightevents/{idx}"
     for idx, e in enumerate(motion_events, start=1)
 )
 

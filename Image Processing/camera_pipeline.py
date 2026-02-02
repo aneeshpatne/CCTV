@@ -29,7 +29,7 @@ from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
 from utilities.motion_db import log_motion_event
 
-URL = "http://192.168.1.13:81/stream"
+URL = "http://192.168.0.13:81/stream"
 IST = pytz.timezone('Asia/Kolkata')
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'examples', 'no_signal.png')
 FRAME_RETRY_DELAY = 0.5
@@ -55,6 +55,8 @@ SEGMENT_SECONDS = 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
 USE_DYNAMIC_FPS = True  # Match source FPS dynamically instead of enforcing fixed rate
+VIDEO_BITRATE_KBPS = int(os.getenv("CCTV_VIDEO_BITRATE_KBPS", "1500"))
+VIDEO_BUFSIZE_KBPS = int(os.getenv("CCTV_VIDEO_BUFSIZE_KBPS", str(VIDEO_BITRATE_KBPS * 2)))
 
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
@@ -117,6 +119,34 @@ fps_lock = threading.Lock()
 fps_frame_times = []
 FPS_SAMPLE_WINDOW = 30  # Calculate FPS over last 30 frames
 
+# HUD overlap cooldown configuration
+HUD_HIDE_SECONDS = 5.0
+
+
+class BoxVisibilityCooldown:
+    """Tracks temporary hide windows for HUD boxes after overlap events."""
+
+    def __init__(self) -> None:
+        self._hide_until: dict[str, float] = {}
+
+    def set_hidden(self, key: str, now: float, seconds: float) -> None:
+        hide_until = now + seconds
+        current = self._hide_until.get(key, 0.0)
+        if hide_until > current:
+            self._hide_until[key] = hide_until
+
+    def is_hidden(self, key: str, now: float) -> bool:
+        hide_until = self._hide_until.get(key)
+        if hide_until is None:
+            return False
+        if now >= hide_until:
+            del self._hide_until[key]
+            return False
+        return True
+
+
+HUD_COOLDOWN = BoxVisibilityCooldown()
+
 # Motion detection logging state
 motion_log_queue = []
 motion_log_lock = threading.Lock()
@@ -136,6 +166,8 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
     """Start FFmpeg process for variable frame rate CCTV recording."""
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
+    safe_fps = max(1.0, fps)
+    gop_size = max(1, int(round(safe_fps * 2)))
 
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
@@ -144,7 +176,7 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}",
-        "-r", "15",                              # FIXED FPS (important)
+        "-r", f"{safe_fps:.2f}",                 # Match input cadence to measured FPS
         "-use_wallclock_as_timestamps", "1",
         "-i", "-",
 
@@ -157,12 +189,12 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
         "-c:v", "h264_videotoolbox",
 
         # stable quality (avoid blur/clear cycling)
-        "-b:v", "2500k",
-        "-maxrate", "2500k",
-        "-bufsize", "5000k",
+        "-b:v", f"{VIDEO_BITRATE_KBPS}k",
+        "-maxrate", f"{VIDEO_BITRATE_KBPS}k",
+        "-bufsize", f"{VIDEO_BUFSIZE_KBPS}k",
 
-        # GOP: 2 seconds @ 15 fps
-        "-g", "30",
+        # GOP: ~2 seconds based on current FPS
+        "-g", str(gop_size),
         "-bf", "0",
 
         # segmenting
@@ -196,6 +228,8 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
 
 def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
     """Start FFmpeg process for variable frame rate RTSP restream."""
+    safe_fps = max(1.0, fps)
+    gop_size = max(1, int(round(safe_fps * 2)))
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
@@ -203,7 +237,7 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subproces
         "-f", "rawvideo",
         "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}",
-        "-r", "15",                              # FIXED FPS (important)
+        "-r", f"{safe_fps:.2f}",                 # Match input cadence to measured FPS
         "-use_wallclock_as_timestamps", "1",
         "-i", "-",
 
@@ -216,12 +250,12 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subproces
         "-c:v", "h264_videotoolbox",
 
         # Stable bitrate (no pulsing)
-        "-b:v", "2500k",
-        "-maxrate", "2500k",
-        "-bufsize", "5000k",
+        "-b:v", f"{VIDEO_BITRATE_KBPS}k",
+        "-maxrate", f"{VIDEO_BITRATE_KBPS}k",
+        "-bufsize", f"{VIDEO_BUFSIZE_KBPS}k",
 
         # GOP / latency
-        "-g", "30",                              # 2 seconds @ 15 fps
+        "-g", str(gop_size),                     # ~2 seconds of frames
         "-bf", "0",
 
         # RTSP output
@@ -408,7 +442,7 @@ def apply_camera_adjustments() -> None:
             # Disable auto white balance
             try:
                 print("Disabling auto white balance (awb=0)")
-                resp = requests.get("http://192.168.1.13/control?var=awb&val=0", timeout=2)
+                resp = requests.get("http://192.168.0.13/control?var=awb&val=0", timeout=2)
                 if resp.status_code == 200:
                     print("AWB disabled successfully")
             except Exception as e:
@@ -419,7 +453,7 @@ def apply_camera_adjustments() -> None:
             # Set auto exposure level
             try:
                 print("Setting auto exposure level (ae_level=2)")
-                resp = requests.get("http://192.168.1.13/control?var=ae_level&val=2", timeout=2)
+                resp = requests.get("http://192.168.0.13/control?var=ae_level&val=2", timeout=2)
                 if resp.status_code == 200:
                     print("AE level set successfully")
             except Exception as e:
@@ -430,7 +464,7 @@ def apply_camera_adjustments() -> None:
             # Disable auto gain control
             try:
                 print("Disabling auto gain control (agc=0)")
-                resp = requests.get("http://192.168.1.13/control?var=agc&val=0", timeout=2)
+                resp = requests.get("http://192.168.0.13/control?var=agc&val=0", timeout=2)
                 if resp.status_code == 200:
                     print("AGC disabled successfully")
             except Exception as e:
@@ -478,7 +512,7 @@ def start_memory_monitor() -> None:
         global memory_percent
         while True:
             try:
-                response = requests.get("http://192.168.1.13/syshealth", timeout=3.0)
+                response = requests.get("http://192.168.0.13/syshealth", timeout=3.0)
                 if response.status_code == 200:
                     data = response.json()
                     free_heap = data.get('freeHeap', 0)
@@ -648,7 +682,15 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
             and box_y - overlap_pad <= y <= box_y + box_h + overlap_pad
         )
 
-    if not overlaps_box(gap, top_margin, ts_box_w, box_h):
+    now = time.monotonic()
+
+    def should_draw(key: str, box_x: int, box_y: int, box_w: int, box_h: int) -> bool:
+        if overlaps_box(box_x, box_y, box_w, box_h):
+            HUD_COOLDOWN.set_hidden(key, now, HUD_HIDE_SECONDS)
+            return False
+        return not HUD_COOLDOWN.is_hidden(key, now)
+
+    if should_draw("timestamp", gap, top_margin, ts_box_w, box_h):
         draw_box(frame, gap, top_margin, ts_box_w, box_h)
         cv2.putText(frame, ts, (gap + pad_x, text_y), font, font_scale, font_color, thickness, cv2.LINE_AA)
 
@@ -658,7 +700,7 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
         (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
         warn_box_w = tw + (pad_x * 2)
         warn_x = gap + ts_box_w + gap
-        if not overlaps_box(warn_x, top_margin, warn_box_w, box_h):
+        if should_draw("motion_warn", warn_x, top_margin, warn_box_w, box_h):
             draw_box(frame, warn_x, top_margin, warn_box_w, box_h, bg_color=(180, 40, 40), alpha=0.9)
             cv2.putText(frame, warn_text, (warn_x + pad_x, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
     
@@ -674,7 +716,7 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     wifi_box_w = tw + icon_size + icon_pad + (pad_x * 2)
     
     cursor_x -= wifi_box_w
-    if not overlaps_box(cursor_x, top_margin, wifi_box_w, box_h):
+    if should_draw("wifi", cursor_x, top_margin, wifi_box_w, box_h):
         draw_box(frame, cursor_x, top_margin, wifi_box_w, box_h)
 
         # Draw content
@@ -696,7 +738,7 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
     
     fps_box_w = tw + (pad_x * 2) + 6 # +6 for dot space
     cursor_x -= fps_box_w
-    if not overlaps_box(cursor_x, top_margin, fps_box_w, box_h):
+    if should_draw("fps", cursor_x, top_margin, fps_box_w, box_h):
         draw_box(frame, cursor_x, top_margin, fps_box_w, box_h)
 
         # Color logic: >= 7 Green, >= 5 Yellow, else Red
@@ -722,7 +764,7 @@ def draw_hud(frame: np.ndarray, fps: float, rssi: int | None, mem_pct: float | N
         mem_box_w = tw + icon_w + icon_pad + (pad_x * 2)
         
         cursor_x -= mem_box_w
-        if not overlaps_box(cursor_x, top_margin, mem_box_w, box_h):
+        if should_draw("memory", cursor_x, top_margin, mem_box_w, box_h):
             draw_box(frame, cursor_x, top_margin, mem_box_w, box_h)
 
             mem_color = get_status_color(mem_pct, [20, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)])

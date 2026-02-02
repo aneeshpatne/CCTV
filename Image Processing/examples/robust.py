@@ -2,7 +2,7 @@ import cv2
 import time
 from datetime import datetime, timezone, timedelta
 
-URL = "http://192.168.1.13:81/stream"  
+URL = "http://192.168.0.13:81/stream"  
 
 t0 = time.time()
 frames = 0

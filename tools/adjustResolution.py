@@ -5,7 +5,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CAMERA_IP = "192.168.1.13"
+CAMERA_IP = "192.168.0.13"
 
 def adjustResolution(val: int) -> str:
 

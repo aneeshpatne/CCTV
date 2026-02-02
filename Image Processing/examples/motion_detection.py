@@ -8,7 +8,7 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 from utilities.warn import NonBlockingBlinker
 
 
-URL = "http://192.168.1.13:81/stream"  
+URL = "http://192.168.0.13:81/stream"  
 cap = cv2.VideoCapture(URL)
 
 if not cap.isOpened():

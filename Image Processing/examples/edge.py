@@ -1,6 +1,6 @@
 import cv2
 
-URL = "http://192.168.1.13:81/stream"  
+URL = "http://192.168.0.13:81/stream"  
 
 cap = cv2.VideoCapture(URL)
 
