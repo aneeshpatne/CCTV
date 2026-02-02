@@ -35,6 +35,7 @@ NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), 'examples', 'no_signal.
 FRAME_RETRY_DELAY = 0.5
 FRAME_READ_TIMEOUT = 5.0  # seconds
 CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
+MAX_CONSECUTIVE_FRAME_FAILURES = 5  # tolerate brief MJPEG hiccups before restart
 
 # Recording configuration
 ENABLE_RECORDING = True
@@ -55,8 +56,8 @@ SEGMENT_SECONDS = 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
 USE_DYNAMIC_FPS = True  # Match source FPS dynamically instead of enforcing fixed rate
-VIDEO_BITRATE_KBPS = int(os.getenv("CCTV_VIDEO_BITRATE_KBPS", "1500"))
-VIDEO_BUFSIZE_KBPS = int(os.getenv("CCTV_VIDEO_BUFSIZE_KBPS", str(VIDEO_BITRATE_KBPS * 2)))
+VIDEO_BITRATE_KBPS = 6000
+VIDEO_BUFSIZE_KBPS = 12000
 
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
@@ -934,6 +935,7 @@ def main() -> None:
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
     attempt = 0
     cap = None
+    consecutive_failures = 0
 
     # Initialize motion detection components
     mog2 = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=True)
@@ -1021,7 +1023,17 @@ def main() -> None:
                 signal.setitimer(signal.ITIMER_REAL, 0)
 
             if not ret or frame is None:
-                print("Frame read failed - signal lost.")
+                consecutive_failures += 1
+                if consecutive_failures < MAX_CONSECUTIVE_FRAME_FAILURES:
+                    print(
+                        f"Frame read failed ({consecutive_failures}/{MAX_CONSECUTIVE_FRAME_FAILURES}) "
+                        "- retrying before restart."
+                    )
+                    time.sleep(FRAME_RETRY_DELAY)
+                    continue
+
+                print("Frame read failed repeatedly - signal lost.")
+                consecutive_failures = 0
                 cap.release()
                 cap = None
                 start_startup(force=True)
@@ -1032,6 +1044,8 @@ def main() -> None:
 
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
+
+            consecutive_failures = 0
 
             # Apply camera adjustments after first successful frame (only once per startup)
             with camera_adjustments_lock:
