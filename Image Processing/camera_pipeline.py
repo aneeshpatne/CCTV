@@ -55,8 +55,8 @@ SEGMENT_SECONDS = 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
 USE_DYNAMIC_FPS = True  # Match source FPS dynamically instead of enforcing fixed rate
-VIDEO_BITRATE_KBPS = 6000
-VIDEO_BUFSIZE_KBPS = 12000
+VIDEO_BITRATE_KBPS = 1500
+VIDEO_BUFSIZE_KBPS = 3000
 
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
