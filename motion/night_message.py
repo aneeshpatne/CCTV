@@ -10,6 +10,7 @@ from ai.ai import ai_summary
 def main():
     stats = day_summary_main()
     message = ai_summary(stats)
+    print(message)
 
 
 
