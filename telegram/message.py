@@ -36,7 +36,19 @@ async def send_message(message: str):
         logging.info("[Telegram] message sent successfully")
     except Exception as e:
         logging.error("[Telegram] message sending failure")
+async def send_picture(path):
+    try:
+        bot = Bot(token = TOKEN)
+        for chat_id in whitelist:
+            if path:
+                with open(path, "rb") as pic:
+                    await bot.send_photo(chat_id= chat_id, photo=pic)
+    except Exception as e:
+        logging.error("[Telegram] message pic failure")
+         
 
 
-if __name__ == "__main__":
-    asyncio.run(send_message("Hello"))
+
+
+# if __name__ == "__main__":
+#     asyncio.run(send_message("Hello"))

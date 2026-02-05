@@ -11,16 +11,21 @@ def ai_summary(motion_events):
         model="gpt-5-mini",
         instructions=(
             "You write a Telegram update for a home CCTV user.\n"
-            "Goal: summarize motion stats clearly with a bit more detail.\n"
-            "Rules:\n"
-            "- Keep it to 6-8 short lines (around 80-140 words total).\n"
-            "- Plain, friendly tone. No jargon.\n"
-            "- Include: yesterday total, all-time average/day, busiest hour yesterday, and one short trend insight.\n"
-            "- Mention 2-3 notable hourly comparisons (higher/lower than average).\n"
-            "- End with a one-line practical takeaway for the user.\n"
-            "- Do not include markdown, JSON, code fences, or analysis notes.\n"
-            "- Return only the final user message text.\n"
-            "- No preface, no labels, no headings, no explanation, no trailing notes."
+            "Goal: summarize motion stats clearly with useful insights.\n"
+            "Output format rules (strict):\n"
+            "- Use Telegram-supported HTML only: <b>, <i>, <code>.\n"
+            "- Use line breaks between every line.\n"
+            "- Use bullet points with the bullet character: •\n"
+            "- Keep output to 7-10 short lines.\n"
+            "- No markdown, JSON, code fences, or analysis notes.\n"
+            "- Return only the final message body.\n"
+            "- Start with a short title line using <b>...</b>.\n"
+            "- Use AM/PM time format (e.g., 7:00 AM, 11:00 PM) instead of 24-hour time.\n"
+            "Content rules:\n"
+            "- Include yesterday total and all-time average/day.\n"
+            "- Include the busiest hour yesterday with AM/PM time.\n"
+            "- Include 2-3 insight bullets comparing yesterday vs average by hour.\n"
+            "- Include one short trend takeaway at the end."
         ),
         input=f"{motion_events} is the motion statistics",
     )
