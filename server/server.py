@@ -16,7 +16,9 @@ from utilities.motion_db import (
     get_motion_events_by_hours,
     get_motion_events_by_date,
     get_motion_events_by_range,
-    get_total_motion_count
+    get_total_motion_count,
+    get_motion_event_stats_per_hour,
+    get_motion_event_stats_per_hour_last_month,
 )
 
 app = FastAPI(title="CCTV Video Server", version="1.0")
@@ -84,6 +86,8 @@ async def root():
             "motion_by_day": "/motion/day?date=YYYY-MM-DD",
             "motion_by_range": "/motion/range?start=ISO&end=ISO",
             "motion_stats": "/motion/stats",
+            "motion_hourly_stats": "/motion/stats/hourly?days=30",
+            "motion_hourly_stats_last_month": "/motion/stats/hourly-last-month",
             "night_events_list": "/nightevents",
             "night_event_by_index": "/nightevents/{index}",
             "docs": "/docs"
@@ -781,6 +785,46 @@ async def get_motion_stats():
             "last_hour": last_hour,
             "last_12_hours": last_12_hours,
             "last_24_hours": last_24_hours
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/motion/stats/hourly")
+async def get_motion_stats_hourly(days: int = 30):
+    """
+    Get motion event counts by hour-of-day (00-23) for the last N days.
+
+    Example:
+        /motion/stats/hourly?days=30
+    """
+    try:
+        if days <= 0:
+            raise HTTPException(status_code=400, detail="days must be > 0")
+
+        stats = get_motion_event_stats_per_hour(days)
+        return {
+            "days": days,
+            "count": len(stats),
+            "hourly_stats": stats,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/motion/stats/hourly-last-month")
+async def get_motion_stats_hourly_last_month():
+    """
+    Get motion event counts for every hourly bucket over the last 30 days.
+
+    Example:
+        /motion/stats/hourly-last-month
+    """
+    try:
+        stats = get_motion_event_stats_per_hour_last_month()
+        return {
+            "count": len(stats),
+            "hourly_stats": stats,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -2,11 +2,11 @@
 
 This module manages motion detection events in a SQLite database.
 """
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 import os
-from typing import Generator
-from sqlalchemy import create_engine, Column, Integer, DateTime
+from typing import Generator, Optional
+from sqlalchemy import create_engine, Column, Integer, DateTime, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
@@ -74,7 +74,7 @@ def get_db_session() -> Generator[Session, None, None]:
         session.close()
 
 
-def log_motion_event(timestamp: datetime | None = None) -> MotionEvent:
+def log_motion_event(timestamp: Optional[datetime] = None) -> MotionEvent:
     """Log a motion detection event to the database.
     
     Args:
@@ -182,3 +182,103 @@ def get_total_motion_count() -> int:
     """Get total count of motion events."""
     with get_db_session() as session:
         return session.query(MotionEvent).count()
+
+
+def get_motion_event_stats_per_hour(last_days: int = 30) -> list[dict]:
+    """Get motion event counts by hour-of-day (00-23) for the last N days."""
+    end_time = datetime.now()
+    start_time = end_time - timedelta(days=last_days)
+
+    with get_db_session() as session:
+        rows = (
+            session.query(
+                func.strftime("%H", MotionEvent.timestamp).label("hour"),
+                func.count(MotionEvent.id).label("count"),
+            )
+            .filter(
+                MotionEvent.timestamp >= start_time,
+                MotionEvent.timestamp <= end_time,
+            )
+            .group_by("hour")
+            .all()
+        )
+
+    counts_by_hour = {int(row.hour): int(row.count) for row in rows}
+    return [
+        {"hour": f"{hour:02d}:00", "count": counts_by_hour.get(hour, 0)}
+        for hour in range(24)
+    ]
+
+
+def get_motion_event_stats_per_hour_last_month() -> list[dict]:
+    """Get motion event counts for each hourly bucket over the last 30 days."""
+    end_time = datetime.now()
+    start_time = end_time - timedelta(days=30)
+
+    with get_db_session() as session:
+        rows = (
+            session.query(
+                func.strftime("%Y-%m-%d %H:00:00", MotionEvent.timestamp).label("bucket"),
+                func.count(MotionEvent.id).label("count"),
+            )
+            .filter(
+                MotionEvent.timestamp >= start_time,
+                MotionEvent.timestamp <= end_time,
+            )
+            .group_by("bucket")
+            .all()
+        )
+
+    counts_by_bucket = {row.bucket: int(row.count) for row in rows}
+    current = start_time.replace(minute=0, second=0, microsecond=0)
+    last_bucket = end_time.replace(minute=0, second=0, microsecond=0)
+    buckets: list[dict] = []
+
+    while current <= last_bucket:
+        bucket_key = current.strftime("%Y-%m-%d %H:00:00")
+        buckets.append(
+            {
+                "hour": bucket_key,
+                "count": counts_by_bucket.get(bucket_key, 0),
+            }
+        )
+        current += timedelta(hours=1)
+
+    return buckets
+
+
+def get_motion_event_hourly_avg_all_time() -> list[dict]:
+    """Get average events per day for each hour (00-23) across all stored dates."""
+    with get_db_session() as session:
+        min_ts, max_ts = session.query(
+            func.min(MotionEvent.timestamp),
+            func.max(MotionEvent.timestamp),
+        ).one()
+
+        if not min_ts or not max_ts:
+            return [
+                {"hour": f"{hour:02d}:00", "avg_per_day": 0.0, "total_events": 0, "days": 0}
+                for hour in range(24)
+            ]
+
+        rows = (
+            session.query(
+                func.strftime("%H", MotionEvent.timestamp).label("hour"),
+                func.count(MotionEvent.id).label("count"),
+            )
+            .group_by("hour")
+            .all()
+        )
+
+    total_days = (max_ts.date() - min_ts.date()).days + 1
+    counts_by_hour = {int(row.hour): int(row.count) for row in rows}
+
+    return [
+        {
+            "hour": f"{hour:02d}:00",
+            "avg_per_day": round(counts_by_hour.get(hour, 0) / total_days, 3),
+            "total_events": counts_by_hour.get(hour, 0),
+            "days": total_days,
+        }
+        for hour in range(24)
+    ]
