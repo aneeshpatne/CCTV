@@ -54,7 +54,8 @@ except (PermissionError, OSError):
 SEGMENT_SECONDS = 60  # 1 minute per segment
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
 ENABLE_RTSP = True  # Set to True if you want RTSP streaming
-USE_DYNAMIC_FPS = True  # Match source FPS dynamically instead of enforcing fixed rate
+USE_DYNAMIC_FPS = False  # Use fixed output FPS for stream stability
+FIXED_OUTPUT_FPS = 9.0
 VIDEO_BITRATE_KBPS = 1500
 VIDEO_BUFSIZE_KBPS = 3000
 
@@ -159,7 +160,7 @@ ffmpeg_record_proc: Optional[subprocess.Popen] = None
 ffmpeg_rtsp_proc: Optional[subprocess.Popen] = None
 ffmpeg_lock = threading.Lock()
 expected_frame_size: Optional[tuple[int, int]] = None  # (width, height) that FFmpeg expects
-current_fps: Optional[float] = None  # Dynamically calculated FPS for FFmpeg
+current_fps: Optional[float] = None  # Active FPS used by FFmpeg
 
 
 def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
@@ -167,7 +168,7 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
     safe_fps = max(1.0, fps)
-    gop_size = max(1, int(round(safe_fps * 2)))
+    gop_size = max(1, int(round(safe_fps)))
 
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
@@ -193,7 +194,7 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
         "-maxrate", f"{VIDEO_BITRATE_KBPS}k",
         "-bufsize", f"{VIDEO_BUFSIZE_KBPS}k",
 
-        # GOP: ~2 seconds based on current FPS
+        # GOP: ~1 second for smoother HLS segment cadence
         "-g", str(gop_size),
         "-bf", "0",
 
@@ -229,7 +230,7 @@ def start_ffmpeg_record(width: int, height: int, fps: float) -> Optional[subproc
 def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
     """Start FFmpeg process for variable frame rate RTSP restream."""
     safe_fps = max(1.0, fps)
-    gop_size = max(1, int(round(safe_fps * 2)))
+    gop_size = max(1, int(round(safe_fps)))
     cmd = [
         "ffmpeg", "-nostdin", "-hide_banner", "-y",
 
@@ -255,7 +256,7 @@ def start_ffmpeg_rtsp(width: int, height: int, fps: float) -> Optional[subproces
         "-bufsize", f"{VIDEO_BUFSIZE_KBPS}k",
 
         # GOP / latency
-        "-g", str(gop_size),                     # ~2 seconds of frames
+        "-g", str(gop_size),                     # ~1 second of frames
         "-bf", "0",
 
         # RTSP output
@@ -313,7 +314,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
 
         # Get current FPS from the FPS tracker
         with fps_lock:
-            measured_fps = fps_value if fps_value > 0 else 10.0  # fallback to 10 if not calculated yet
+            measured_fps = fps_value if fps_value > 0 else FIXED_OUTPUT_FPS
 
         # Check if we need to restart FFmpeg due to size or FPS change
         fps_changed = False
@@ -326,7 +327,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         # Track the canonical size expected by the encoders
         if expected_frame_size is None:
             expected_frame_size = new_size
-            current_fps = measured_fps
+            current_fps = measured_fps if USE_DYNAMIC_FPS else FIXED_OUTPUT_FPS
         elif new_size != expected_frame_size or fps_changed:
             if new_size != expected_frame_size:
                 print(
@@ -340,10 +341,13 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             expected_frame_size = new_size
-            current_fps = measured_fps
+            current_fps = measured_fps if USE_DYNAMIC_FPS else FIXED_OUTPUT_FPS
 
         target_width, target_height = expected_frame_size
-        target_fps = current_fps if current_fps is not None else measured_fps
+        if USE_DYNAMIC_FPS:
+            target_fps = current_fps if current_fps is not None else measured_fps
+        else:
+            target_fps = FIXED_OUTPUT_FPS
 
         # Ensure recording process is alive when recording enabled
         if ENABLE_RECORDING:
@@ -955,7 +959,7 @@ def main() -> None:
         if USE_DYNAMIC_FPS:
             print(f"Segment duration: {SEGMENT_SECONDS}s, FPS: Dynamic (matches source)")
         else:
-            print(f"Segment duration: {SEGMENT_SECONDS}s, FPS: 10 (fixed)")
+            print(f"Segment duration: {SEGMENT_SECONDS}s, FPS: {FIXED_OUTPUT_FPS:.0f} (fixed)")
     if not SHOW_LOCAL_VIEW:
         print("Local view disabled - running in headless mode")
         print("Press Ctrl+C to stop")

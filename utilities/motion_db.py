@@ -116,6 +116,24 @@ def get_motion_events_by_hours(hours: int) -> list[MotionEvent]:
         # Detach from session
         return [MotionEvent(id=e.id, timestamp=e.timestamp) for e in events]
 
+def get_motion_events_daytime(date: datetime) -> list[MotionEvent]:
+    """Get motion events between 7:00 AM and 11:00 PM on a given date."""
+    
+    start_time = datetime.combine(date.date(), time(7, 0))
+    end_time = datetime.combine(date.date(), time(23, 0))
+
+    with get_db_session() as session:
+        events = (
+            session.query(MotionEvent)
+            .filter(
+                MotionEvent.timestamp >= start_time,
+                MotionEvent.timestamp <= end_time,
+            )
+            .order_by(MotionEvent.timestamp.asc())
+            .all()
+        )
+
+        return [MotionEvent(id=e.id, timestamp=e.timestamp) for e in events]
 
 def get_motion_events_by_date(date: datetime) -> list[MotionEvent]:
     """Get motion events for a specific date.
