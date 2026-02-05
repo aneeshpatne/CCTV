@@ -119,22 +119,26 @@ def main():
     print(f"Hourly motion stats for {yesterday.date()} vs all-time daily average")
     print(f"Yesterday total: {total_yesterday}")
     print(f"All-time avg/day: {avg_total:.2f}")
-    print("-" * 44)
-    print(f"{'Hour':<8}{'Yesterday':>12}{'Avg/Day (All)':>18}")
-    print("-" * 44)
-
+    table_lines = [
+        "-" * 44,
+        f"{'Hour':<8}{'Yesterday':>12}{'Avg/Day (All)':>18}",
+        "-" * 44,
+    ]
     for hour in range(24):
-        print(
+        table_lines.append(
             f"{hour:02d}:00"
             f"{yesterday_counts[hour]:>12}"
             f"{all_time_avg[hour]['avg_per_day']:>18.2f}"
         )
+    stats_table = "\n".join(table_lines)
+    print(stats_table)
 
     events_plot = generate_event_vs_time_plot(yesterday)
     compare_plot = generate_hourly_compare_plot(yesterday, yesterday_counts, all_time_avg)
     print("-" * 44)
     print(f"Saved plot: {events_plot}")
     print(f"Saved plot: {compare_plot}")
+    return stats_table
 
 
 if __name__ == "__main__":
