@@ -1,54 +1,42 @@
 import os
-import json
+from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import asyncio
+import json
+from telegram import Bot
+from telegram.constants import ParseMode
+import logging
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Telegram bot token (replace or set BOT_TOKEN in your environment)
-TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-print(TOKEN)
-# File to store user IDs
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ist = pytz.timezone("Asia/Kolkata")
+
+
+TOKEN = os.getenv("BOT_TOKEN")
 WHITELIST_FILE = "whitelist.json"
 
-# Load existing whitelist
+p = Path("whitelist.json")
 def load_whitelist():
-    if os.path.exists(WHITELIST_FILE):
+    if p.exists() and p.is_file():
         with open(WHITELIST_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+            return list(json.load(f))
+    return []
 
-# Save whitelist to file
-def save_whitelist(user_ids):
-    with open(WHITELIST_FILE, "w") as f:
-        json.dump(list(user_ids), f, indent=2)
+whitelist = load_whitelist()
 
-# Start command handler
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-    username = user.username or user.first_name or "Unknown"
+async def send_message(message: str):
+    try:
+        bot = Bot(token = TOKEN)
+        for chat_id in whitelist:
+            await bot.send_message(chat_id= chat_id, text = message, parse_mode = ParseMode.HTML)
+        logging.info("[Telegram] message sent successfully")
+    except Exception as e:
+        logging.error("[Telegram] message sending failure")
 
-    # Load and update whitelist
-    whitelist = load_whitelist()
-    if user_id not in whitelist:
-        whitelist.add(user_id)
-        save_whitelist(whitelist)
-        print(f"✅ New user added: {username} ({user_id})")
-        await update.message.reply_text(
-            f"Hi {username}! You’ve been added to the whitelist ✅"
-        )
-    else:
-        print(f"User {username} ({user_id}) already in whitelist.")
-        await update.message.reply_text("You’re already on the list.")
-
-# Run the bot
-def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(send_message("Hello"))

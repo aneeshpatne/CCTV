@@ -1,5 +1,7 @@
 from pathlib import Path
 import sys
+from pathlib import Path
+p = Path('./plots')
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -10,7 +12,9 @@ from ai.ai import ai_summary
 def main():
     stats = day_summary_main()
     message = ai_summary(stats)
-    print(message)
+
+    for file in p.iterdir():
+        print(file.absolute())
 
 
 

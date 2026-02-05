@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from telegram import Bot
 from telegram.request import HTTPXRequest
 from telegram.constants import ParseMode
-
+from telegram.message import send_message
 
 load_dotenv()
 
@@ -105,7 +105,7 @@ try:
             "⏳ Total duration: 0.00 min\n\n"
             "No motion events detected."
         )
-        asyncio.run(send_telegram_notification(message))
+        asyncio.run(send_message(message))
         sys.exit(0)
 
     logging.info(f"[FETCH] Retrieved {len(events)} motion event(s)")
