@@ -116,9 +116,6 @@ def main():
     total_yesterday = sum(yesterday_counts)
     avg_total = sum(item["avg_per_day"] for item in all_time_avg)
 
-    print(f"Hourly motion stats for {yesterday.date()} vs all-time daily average")
-    print(f"Yesterday total: {total_yesterday}")
-    print(f"All-time avg/day: {avg_total:.2f}")
     table_lines = [
         "-" * 44,
         f"{'Hour':<8}{'Yesterday':>12}{'Avg/Day (All)':>18}",
@@ -131,7 +128,6 @@ def main():
             f"{all_time_avg[hour]['avg_per_day']:>18.2f}"
         )
     stats_table = "\n".join(table_lines)
-    print(stats_table)
 
     events_plot = generate_event_vs_time_plot(yesterday)
     compare_plot = generate_hourly_compare_plot(yesterday, yesterday_counts, all_time_avg)

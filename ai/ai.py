@@ -12,6 +12,4 @@ def ai_summary(motion_events):
         instructions="You are a motion event summariser bot, you will give general comments to the statistics passed to you. You will have to format your response as a message sent to the user directly.",
         input=f"{motion_events} is the motion statistics",
     )
-
-    print(response.output_text)
     return response.output_text
