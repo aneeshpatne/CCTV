@@ -28,6 +28,7 @@ def load_whitelist():
 
 
 whitelist = load_whitelist()
+logging.info(f"[Telegram] Whitelist loaded: {len(whitelist)} recipient(s)")
 
 
 async def send_message(message: str):
