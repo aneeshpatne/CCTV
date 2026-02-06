@@ -41,7 +41,7 @@ async def send_message(message: str):
             )
         logging.info("[Telegram] message sent successfully")
     except Exception as e:
-        logging.error("[Telegram] message sending failure")
+        logging.error("[Telegram] message sending failure", e)
 
 
 async def send_picture(path):
