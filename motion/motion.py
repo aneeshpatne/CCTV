@@ -11,12 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-TELEGRAM_DIR = REPO_ROOT / "telegram"
-if str(TELEGRAM_DIR) not in sys.path:
-    sys.path.insert(0, str(TELEGRAM_DIR))
-
-from message import send_message
+from telegram.message import send_message
 
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 WHITELIST_FILE = "whitelist.json"

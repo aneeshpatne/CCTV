@@ -1,12 +1,5 @@
-from pathlib import Path
-import sys
 from datetime import datetime, timedelta
 from math import exp
-
-# Allow running this file directly: `python motion/day_summary.py`
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from utilities.motion_db import (
     get_motion_events_by_date,
