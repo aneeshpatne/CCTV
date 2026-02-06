@@ -17,13 +17,11 @@ logging.basicConfig(
 
 
 TOKEN = os.getenv("BOT_TOKEN")
-WHITELIST_FILE = "whitelist.json"
-
-p = Path("whitelist.json")
+WHITELIST_FILE = Path(__file__).parent / "whitelist.json"
 
 
 def load_whitelist():
-    if p.exists() and p.is_file():
+    if WHITELIST_FILE.exists() and WHITELIST_FILE.is_file():
         with open(WHITELIST_FILE, "r") as f:
             return list(json.load(f))
     return []
