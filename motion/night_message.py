@@ -5,7 +5,7 @@ PLOTS_DIR = Path(__file__).resolve().parent / "plots"
 
 from motion.day_summary import main as day_summary_main
 from ai.ai import ai_summary
-from telegram.message import send_message, send_picture
+from cctv_telegram.message import send_message, send_picture
 
 
 def main():
