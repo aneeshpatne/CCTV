@@ -26,6 +26,7 @@ from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
 from utilities.EventAccumulator import EventAccumulator
+from utilities.motion_db_new import log_motion_event
 
 URL = "http://192.168.0.13:81/stream"
 IST = pytz.timezone("Asia/Kolkata")
@@ -221,8 +222,26 @@ class BoxVisibilityCooldown:
 
 HUD_COOLDOWN = BoxVisibilityCooldown()
 
+
+def _save_accumulated_motion_event(event: dict[str, float]) -> None:
+    """Persist an EventAccumulator event using the new motion DB schema."""
+    start_ts = event.get("start_time")
+    end_ts = event.get("end_time")
+    duration = event.get("duration")
+    if start_ts is None or end_ts is None or duration is None:
+        return
+    try:
+        log_motion_event(
+            start_time=datetime.fromtimestamp(start_ts),
+            end_time=datetime.fromtimestamp(end_ts),
+            duration=float(duration),
+        )
+    except Exception as e:
+        print(f"Failed to log motion event: {e}")
+
+
 # Accumulator For Event Tracking
-acc = EventAccumulator(cooldown=15)
+acc = EventAccumulator(cooldown=15, onSave=_save_accumulated_motion_event)
 
 # Recording state
 ffmpeg_record_proc: Optional[subprocess.Popen] = None
