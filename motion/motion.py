@@ -94,17 +94,38 @@ try:
 
     logging.info(f"[FETCH] Retrieved {len(events)} motion event(s)")
 
-    timestamps = []
+    interval_events = []
     for d in events:
         try:
-            dt = datetime.fromisoformat(d.get("timestamp"))
-            timestamps.append(dt)
-            logging.info(f"[FETCH] Motion detected at {dt.time()}")
+            start_raw = d.get("start_time")
+            end_raw = d.get("end_time")
+            duration_raw = d.get("duration")
+
+            if not start_raw:
+                continue
+
+            start_dt = datetime.fromisoformat(start_raw)
+            if end_raw:
+                end_dt = datetime.fromisoformat(end_raw)
+            else:
+                duration_seconds = float(duration_raw or 0)
+                end_dt = start_dt + timedelta(seconds=duration_seconds)
+
+            interval_events.append(
+                {
+                    "start_time": start_dt,
+                    "end_time": end_dt,
+                }
+            )
+            logging.info(
+                f"[FETCH] Motion event {start_dt.time()} -> {end_dt.time()} "
+                f"({(end_dt - start_dt).total_seconds():.0f}s)"
+            )
         except (ValueError, TypeError):
             continue
 
-    if not timestamps:
-        logging.warning("[FETCH] No valid timestamps found")
+    if not interval_events:
+        logging.warning("[FETCH] No valid interval events found")
         message = (
             "<b>Tonights events</b>\n"
             f"📅 Date: {now_ist}\n"
@@ -126,26 +147,27 @@ except Exception as e:
 
 logging.info("[MERGE] Starting to merge nearby motion events")
 
+interval_events.sort(key=lambda x: x["start_time"])
+
 motion_events = []
-i = 0
-while i < len(timestamps):
-    start_time = timestamps[i]
-    duration = 1
-    j = i + 1
-    while j < len(timestamps):
-        diff = timestamps[j] - timestamps[j - 1]
-        if diff < timedelta(minutes=2):
-            duration += diff.total_seconds() / 60
-            j += 1
-        else:
-            break
+for event in interval_events:
+    if not motion_events:
+        motion_events.append(event.copy())
+        continue
 
-    motion_events.append({"timestamp": start_time, "duration": duration})
+    last = motion_events[-1]
+    if event["start_time"] <= last["end_time"] + timedelta(minutes=2):
+        if event["end_time"] > last["end_time"]:
+            last["end_time"] = event["end_time"]
+    else:
+        motion_events.append(event.copy())
 
+for item in motion_events:
+    duration_seconds = (item["end_time"] - item["start_time"]).total_seconds()
     logging.info(
-        f"[MERGE] Motion event: {start_time.time()} - Duration: {duration:.2f} minutes"
+        f"[MERGE] Motion event: {item['start_time'].time()} - "
+        f"Duration: {duration_seconds / 60:.2f} minutes"
     )
-    i = j if j < len(timestamps) else len(timestamps)
 
 logging.info(f"[MERGE] Total merged motion events: {len(motion_events)}")
 
@@ -155,14 +177,17 @@ failed_downloads = 0
 
 for idx, item in enumerate(motion_events, 1):
     try:
-        start_time = item.get("timestamp") - timedelta(minutes=1)
-        duration = item.get("duration")
+        event_start = item.get("start_time")
+        event_end = item.get("end_time")
+        if event_start is None or event_end is None:
+            raise ValueError("Missing start_time/end_time in merged event")
 
         logging.info(
-            f"[DOWNLOAD] ({idx}/{len(motion_events)}) Fetching video for motion at {start_time.time()}"
+            f"[DOWNLOAD] ({idx}/{len(motion_events)}) Fetching video for motion "
+            f"{event_start.time()} -> {event_end.time()}"
         )
 
-        video_url = f"{API_BASE_URL}/video/by-duration?timestamp={start_time.isoformat()}&minutes={int(duration)}"
+        video_url = f"{API_BASE_URL}/video/v2/by-event?start={event_start.isoformat()}&end={event_end.isoformat()}"
         res = requests.get(video_url, timeout=120)
         res.raise_for_status()
 
@@ -196,10 +221,13 @@ logging.info("=" * 50)
 logging.info("[TELEGRAM] Sending motion summary")
 
 # Build Telegram message
-total_duration = sum(e.get("duration", 0) for e in motion_events)
+total_duration = (
+    sum((e["end_time"] - e["start_time"]).total_seconds() for e in motion_events) / 60
+)
 
 events_str = "\n".join(
-    f"{idx} - {e.get('timestamp').strftime('%H:%M:%S')} — {e.get('duration'):.2f} min\n"
+    f"{idx} - {e.get('start_time').strftime('%H:%M:%S')} — "
+    f"{((e.get('end_time') - e.get('start_time')).total_seconds() / 60):.2f} min\n"
     f"http://192.168.0.99:8005/nightevents/{idx}"
     for idx, e in enumerate(motion_events, start=1)
 )

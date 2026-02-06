@@ -2,6 +2,7 @@ import logging
 import time
 import threading
 from typing import Callable, Dict, Optional
+from datetime import timedelta
 
 
 class EventAccumulator:
@@ -37,6 +38,7 @@ class EventAccumulator:
         with self._lock:
             if self._start_time is None or self._end_time is None:
                 return
+            self._start_time -= 15.0
             event = {
                 "start_time": self._start_time,
                 "end_time": self._end_time,

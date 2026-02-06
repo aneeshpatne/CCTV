@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import hashlib
 
-from utilities.motion_db import (
+from utilities.motion_db_new import (
     get_motion_events_by_hours,
     get_motion_events_by_date,
     get_motion_events_by_range,
@@ -78,6 +78,7 @@ async def root():
             "last_videos": "/video/last?minutes=5|15|30|60",
             "by_timestamp": "/video/by-timestamp?timestamp=YYYY-MM-DDTHH:MM:SS",
             "by_duration": "/video/by-duration?timestamp=YYYY-MM-DDTHH:MM:SS&minutes=X",
+            "by_event_v2": "/video/v2/by-event?start=ISO&end=ISO",
             "by_hour": "/video/by-hour?timestamp=YYYY-MM-DDTHH:MM:SS",
             "by_day": "/video/by-day?timestamp=YYYY-MM-DDTHH:MM:SS",
             "stream_file": "/video/stream/{filename}",
@@ -291,6 +292,137 @@ async def get_video_by_duration(
         raise HTTPException(
             status_code=400,
             detail="Invalid timestamp format. Use ISO format (2025-11-05T19:40:00)",
+        )
+
+
+@app.get("/video/v2/by-event")
+async def get_video_by_event(start: str, end: str, background_tasks: BackgroundTasks):
+    """
+    Get video trimmed to the exact start and end timestamps of an event.
+    No padding before or after — just the precise time window.
+
+    Args:
+        start: ISO format start time (e.g., "2025-11-05T01:23:45")
+        end:   ISO format end time   (e.g., "2025-11-05T01:25:10")
+
+    Example:
+        /video/v2/by-event?start=2025-11-05T01:23:45&end=2025-11-05T01:25:10
+    """
+    try:
+        try:
+            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        except Exception:
+            start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
+
+        try:
+            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        except Exception:
+            end_dt = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
+
+        if start_dt >= end_dt:
+            raise HTTPException(status_code=400, detail="start must be before end")
+
+        # Collect and sort all recordings
+        folder = Path(CCTV_FOLDER)
+        all_videos = []
+        for file in folder.glob("recording_*.mp4"):
+            try:
+                ts = file.stem.replace("recording_", "")
+                file_dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+                all_videos.append((file_dt, file))
+            except ValueError:
+                continue
+
+        if not all_videos:
+            raise HTTPException(status_code=404, detail="No videos found")
+
+        all_videos.sort(key=lambda x: x[0])
+
+        # Find videos that overlap with [start_dt, end_dt].
+        # A recording starting at file_dt covers [file_dt, next_file_dt).
+        # We need every file whose period overlaps the requested window.
+        # Include the file that starts at-or-before start_dt (it contains the start)
+        # through the file that starts at-or-before end_dt.
+        first_idx = None
+        for i, (file_dt, _) in enumerate(all_videos):
+            if file_dt <= start_dt:
+                first_idx = i
+            if file_dt > end_dt:
+                break
+
+        if first_idx is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No video covers the start time {start_dt.isoformat()}",
+            )
+
+        last_idx = first_idx
+        for i in range(first_idx, len(all_videos)):
+            if all_videos[i][0] <= end_dt:
+                last_idx = i
+            else:
+                break
+
+        videos_to_use = [all_videos[i][1] for i in range(first_idx, last_idx + 1)]
+
+        # Offset from the first file's timestamp to our desired start
+        first_file_dt = all_videos[first_idx][0]
+        ss_offset = (start_dt - first_file_dt).total_seconds()
+        duration = (end_dt - start_dt).total_seconds()
+
+        # Build a unique cache filename
+        tag = hashlib.md5(f"{start}_{end}".encode()).hexdigest()[:10]
+        merged_filename = f"event_{tag}.mp4"
+        merged_path = Path(TEMP_FOLDER) / merged_filename
+
+        if not merged_path.exists():
+            if len(videos_to_use) == 1:
+                # Trim the single file directly
+                cmd = [
+                    "ffmpeg", "-ss", str(ss_offset),
+                    "-i", str(videos_to_use[0]),
+                    "-t", str(duration),
+                    "-c", "copy", "-y", str(merged_path),
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise HTTPException(status_code=500, detail="Failed to trim video")
+            else:
+                # Concat then trim
+                list_file = merged_path.parent / f"{merged_path.stem}_list.txt"
+                try:
+                    with open(list_file, "w") as f:
+                        for v in videos_to_use:
+                            f.write(f"file '{v}'\n")
+                    cmd = [
+                        "ffmpeg",
+                        "-f", "concat", "-safe", "0",
+                        "-i", str(list_file),
+                        "-ss", str(ss_offset),
+                        "-t", str(duration),
+                        "-c", "copy", "-y", str(merged_path),
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise HTTPException(
+                            status_code=500, detail="Failed to merge/trim videos"
+                        )
+                finally:
+                    if list_file.exists():
+                        list_file.unlink()
+
+        background_tasks.add_task(cleanup_old_merged_videos)
+
+        return FileResponse(
+            path=str(merged_path), media_type="video/mp4", filename=merged_filename
+        )
+
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid timestamp format. Use ISO format (2025-11-05T01:23:45)",
         )
 
 
