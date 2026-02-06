@@ -121,7 +121,8 @@ try:
                 f"[FETCH] Motion event {start_dt.time()} -> {end_dt.time()} "
                 f"({(end_dt - start_dt).total_seconds():.0f}s)"
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logging.warning(f"[FETCH] Skipping event {d}: {e}")
             continue
 
     if not interval_events:
