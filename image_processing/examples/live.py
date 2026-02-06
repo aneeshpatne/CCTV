@@ -2,11 +2,13 @@ import cv2, time
 
 URL = "http://192.168.0.13:81/stream"
 
+
 def open_cap(url):
     cap = cv2.VideoCapture(url)
     if not cap.isOpened():
         return None
     return cap
+
 
 cap = open_cap(URL)
 last_ok = time.time()
@@ -34,11 +36,18 @@ while True:
 
     # overlay timestamp + FPS
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    cv2.putText(frame, f"{ts}  |  {fps:.1f} FPS", (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(
+        frame,
+        f"{ts}  |  {fps:.1f} FPS",
+        (10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+    )
 
     cv2.imshow("ESP32-CAM (q=quit)", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
 if cap is not None:

@@ -1,5 +1,6 @@
 import requests
 
+
 def status():
     try:
         res = requests.get("http://192.168.0.13/status", timeout=2)
@@ -9,4 +10,3 @@ def status():
     except (requests.exceptions.RequestException, ValueError, KeyError) as e:
         data = None
     return data
-    

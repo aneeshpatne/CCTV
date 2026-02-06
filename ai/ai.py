@@ -6,6 +6,7 @@ load_dotenv()
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
+
 def ai_summary(motion_events):
     response = client.responses.create(
         model="gpt-5-mini",

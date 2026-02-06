@@ -71,7 +71,9 @@ def generate_event_vs_time_plot(yesterday: datetime):
     return output_file
 
 
-def generate_hourly_compare_plot(yesterday: datetime, yesterday_counts: list[int], all_time_avg: list[dict]):
+def generate_hourly_compare_plot(
+    yesterday: datetime, yesterday_counts: list[int], all_time_avg: list[dict]
+):
     import matplotlib.pyplot as plt
 
     output_dir = Path(__file__).resolve().parent / "plots"
@@ -85,7 +87,13 @@ def generate_hourly_compare_plot(yesterday: datetime, yesterday_counts: list[int
     smooth_avg = _gaussian_smooth(avg_values, sigma=1.2)
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(hours, smooth_yesterday, linewidth=2.6, color="#1d4ed8", label=f"{yesterday.date()} count")
+    ax.plot(
+        hours,
+        smooth_yesterday,
+        linewidth=2.6,
+        color="#1d4ed8",
+        label=f"{yesterday.date()} count",
+    )
     ax.plot(hours, smooth_avg, linewidth=2.2, color="#dc2626", label="All-time avg/day")
     ax.fill_between(hours, smooth_yesterday, color="#3b82f6", alpha=0.12)
     ax.fill_between(hours, smooth_avg, color="#ef4444", alpha=0.08)
@@ -123,7 +131,9 @@ def main():
     stats_table = "\n".join(table_lines)
 
     events_plot = generate_event_vs_time_plot(yesterday)
-    compare_plot = generate_hourly_compare_plot(yesterday, yesterday_counts, all_time_avg)
+    compare_plot = generate_hourly_compare_plot(
+        yesterday, yesterday_counts, all_time_avg
+    )
     print("-" * 44)
     print(f"Saved plot: {events_plot}")
     print(f"Saved plot: {compare_plot}")

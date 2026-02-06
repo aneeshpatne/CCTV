@@ -16,6 +16,5 @@ def main():
         asyncio.run(send_picture(file.absolute()))
 
 
-
 if __name__ == "__main__":
     main()

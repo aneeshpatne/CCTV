@@ -10,7 +10,9 @@ from tools.reset import reset
 from tools.changeClock import change_clock
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 count = 1
 
@@ -21,8 +23,10 @@ def startup():
         cam_stat = check_mjpeg_stream()[0]
         stat = status()
         if cam_stat == False or stat == None:
-            logger.warning(f"Camera Connection Failed Retrying, Attempt Number: {count}")
-            count +=1
+            logger.warning(
+                f"Camera Connection Failed Retrying, Attempt Number: {count}"
+            )
+            count += 1
             reset()
             time.sleep(10)
             continue
@@ -38,7 +42,7 @@ def startup():
                 logger.warning("Camera not ready")
                 time.sleep(10)
                 continue
-            
+
             # Wrap change_quality in try-except to handle connection timeouts
             try:
                 change_quality(i + 1)
@@ -52,7 +56,7 @@ def startup():
                 logger.warning(f"Unexpected error changing quality: {err}")
                 time.sleep(5)
                 break
-            
+
             stat = status()
             cam_stat = check_mjpeg_stream()[0]
             if cam_stat == False or stat == None or int(stat) != i + 1:
@@ -61,7 +65,7 @@ def startup():
                 time.sleep(5)
                 continue
             i += 1
-        
+
         # Only log success if we actually completed the loop
         if i >= 12:
             time.sleep(6)
@@ -69,14 +73,14 @@ def startup():
         else:
             logger.warning("Resolution setting incomplete - will retry")
             continue
-        
+
         # Set camera clock
         try:
             logger.info("Setting camera clock to 20")
             change_clock(20)
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
-        
+
         time.sleep(2)
         logger.info("Camera startup sequence completed")
         break

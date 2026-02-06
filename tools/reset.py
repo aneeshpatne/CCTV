@@ -4,6 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 def reset():
     """Reset the camera. Returns True on success, False on failure."""
     try:
@@ -17,4 +18,3 @@ def reset():
     except Exception as err:
         logger.error(f"Unexpected error during camera reset: {err}")
         return False
-    

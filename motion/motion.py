@@ -15,7 +15,7 @@ from telegram.message import send_message
 
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
 WHITELIST_FILE = "whitelist.json"
-API_BASE_URL =  "http://127.0.0.1:8005"
+API_BASE_URL = "http://127.0.0.1:8005"
 
 
 def load_whitelist():
@@ -71,7 +71,9 @@ now_ist = datetime.now(ist).date()
 logging.info(f"[FETCH] Fetching motion events between 12:00 AM to 7:00 AM on {now_ist}")
 
 try:
-    api_url = f"{API_BASE_URL}/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
+    api_url = (
+        f"{API_BASE_URL}/motion/range?start={now_ist}T00:00:00&end={now_ist}T07:00:00"
+    )
     data = requests.get(api_url, timeout=30)
     data.raise_for_status()
 

@@ -2,6 +2,7 @@
 
 This module manages motion detection events in a SQLite database.
 """
+
 from datetime import datetime, time, timedelta
 from pathlib import Path
 import os
@@ -29,7 +30,7 @@ except (PermissionError, FileNotFoundError, OSError):
 DB_PATH = DB_DIR / "motion_logs.db"
 
 # Create engine
-engine = create_engine(f'sqlite:///{DB_PATH}', echo=False)
+engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
 
 # Base class for models
 Base = declarative_base()
@@ -40,20 +41,18 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class MotionEvent(Base):
     """Model for motion detection events."""
+
     __tablename__ = "motion_events"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     timestamp = Column(DateTime, nullable=False, index=True)
-    
+
     def __repr__(self):
         return f"<MotionEvent(id={self.id}, timestamp={self.timestamp})>"
-    
+
     def to_dict(self):
         """Convert to dictionary for JSON serialization."""
-        return {
-            "id": self.id,
-            "timestamp": self.timestamp.isoformat()
-        }
+        return {"id": self.id, "timestamp": self.timestamp.isoformat()}
 
 
 # Create tables
@@ -76,16 +75,16 @@ def get_db_session() -> Generator[Session, None, None]:
 
 def log_motion_event(timestamp: Optional[datetime] = None) -> MotionEvent:
     """Log a motion detection event to the database.
-    
+
     Args:
         timestamp: Optional timestamp. If None, uses current time.
-        
+
     Returns:
         The created MotionEvent instance
     """
     if timestamp is None:
         timestamp = datetime.now()
-    
+
     with get_db_session() as session:
         event = MotionEvent(timestamp=timestamp)
         session.add(event)
@@ -96,28 +95,32 @@ def log_motion_event(timestamp: Optional[datetime] = None) -> MotionEvent:
 
 def get_motion_events_by_hours(hours: int) -> list[MotionEvent]:
     """Get motion events from the last N hours.
-    
+
     Args:
         hours: Number of hours to look back
-        
+
     Returns:
         List of MotionEvent instances
     """
     from datetime import timedelta
-    
+
     start_time = datetime.now() - timedelta(hours=hours)
-    
+
     with get_db_session() as session:
-        events = session.query(MotionEvent).filter(
-            MotionEvent.timestamp >= start_time
-        ).order_by(MotionEvent.timestamp.desc()).all()
-        
+        events = (
+            session.query(MotionEvent)
+            .filter(MotionEvent.timestamp >= start_time)
+            .order_by(MotionEvent.timestamp.desc())
+            .all()
+        )
+
         # Detach from session
         return [MotionEvent(id=e.id, timestamp=e.timestamp) for e in events]
 
+
 def get_motion_events_daytime(date: datetime) -> list[MotionEvent]:
     """Get motion events between 7:00 AM and 11:00 PM on a given date."""
-    
+
     start_time = datetime.combine(date.date(), time(7, 0))
     end_time = datetime.combine(date.date(), time(23, 0))
 
@@ -134,46 +137,53 @@ def get_motion_events_daytime(date: datetime) -> list[MotionEvent]:
 
         return [MotionEvent(id=e.id, timestamp=e.timestamp) for e in events]
 
+
 def get_motion_events_by_date(date: datetime) -> list[MotionEvent]:
     """Get motion events for a specific date.
-    
+
     Args:
         date: Date to query (time component will be ignored)
-        
+
     Returns:
         List of MotionEvent instances
     """
     from datetime import timedelta
-    
+
     start_time = date.replace(hour=0, minute=0, second=0, microsecond=0)
     end_time = start_time + timedelta(days=1)
-    
+
     with get_db_session() as session:
-        events = session.query(MotionEvent).filter(
-            MotionEvent.timestamp >= start_time,
-            MotionEvent.timestamp < end_time
-        ).order_by(MotionEvent.timestamp.asc()).all()
-        
+        events = (
+            session.query(MotionEvent)
+            .filter(
+                MotionEvent.timestamp >= start_time, MotionEvent.timestamp < end_time
+            )
+            .order_by(MotionEvent.timestamp.asc())
+            .all()
+        )
+
         # Detach from session
         return [MotionEvent(id=e.id, timestamp=e.timestamp) for e in events]
 
 
 def get_motion_events_by_range(start: datetime, end: datetime) -> list[MotionEvent]:
     """Get motion events within a time range.
-    
+
     Args:
         start: Start timestamp
         end: End timestamp
-        
+
     Returns:
         List of MotionEvent instances
     """
     with get_db_session() as session:
-        events = session.query(MotionEvent).filter(
-            MotionEvent.timestamp >= start,
-            MotionEvent.timestamp <= end
-        ).order_by(MotionEvent.timestamp.asc()).all()
-        
+        events = (
+            session.query(MotionEvent)
+            .filter(MotionEvent.timestamp >= start, MotionEvent.timestamp <= end)
+            .order_by(MotionEvent.timestamp.asc())
+            .all()
+        )
+
         # Detach from session
         return [MotionEvent(id=e.id, timestamp=e.timestamp) for e in events]
 
@@ -218,7 +228,9 @@ def get_motion_event_stats_per_hour_last_month() -> list[dict]:
     with get_db_session() as session:
         rows = (
             session.query(
-                func.strftime("%Y-%m-%d %H:00:00", MotionEvent.timestamp).label("bucket"),
+                func.strftime("%Y-%m-%d %H:00:00", MotionEvent.timestamp).label(
+                    "bucket"
+                ),
                 func.count(MotionEvent.id).label("count"),
             )
             .filter(
@@ -257,7 +269,12 @@ def get_motion_event_hourly_avg_all_time() -> list[dict]:
 
         if not min_ts or not max_ts:
             return [
-                {"hour": f"{hour:02d}:00", "avg_per_day": 0.0, "total_events": 0, "days": 0}
+                {
+                    "hour": f"{hour:02d}:00",
+                    "avg_per_day": 0.0,
+                    "total_events": 0,
+                    "days": 0,
+                }
                 for hour in range(24)
             ]
 

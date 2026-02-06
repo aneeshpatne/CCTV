@@ -7,9 +7,11 @@ URL = "http://192.168.0.13:81/stream"
 t0 = time.time()
 frames = 0
 
+
 def get_coordinates(event, x, y, flags, param):
     if event == cv2.EVENT_LBUTTONDOWN:
         print(f"Left Click at: X={x}, Y={y}")
+
 
 def open_cap(url):
     cap = cv2.VideoCapture(url)
@@ -17,12 +19,13 @@ def open_cap(url):
         return None
     return cap
 
+
 cap = open_cap(URL)
 open_attempts = 0
 read_attempts = 0
 fps = 0.0
 
-win_name = "ESP32-CAM (q/Esc to quit)" 
+win_name = "ESP32-CAM (q/Esc to quit)"
 cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
 cv2.setMouseCallback(win_name, get_coordinates)
 
@@ -52,7 +55,6 @@ while True:
     else:
         read_attempts = 0
 
-
     frames += 1
     now = time.time()
     if now - t0 >= 1.0:
@@ -62,13 +64,20 @@ while True:
     ist = timezone(timedelta(hours=5, minutes=30))
     ts = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
-    cv2.putText(frame, f"{ts}  |  {fps:.1f} FPS", (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(
+        frame,
+        f"{ts}  |  {fps:.1f} FPS",
+        (10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (0, 255, 0),
+        2,
+    )
 
     cv2.imshow(win_name, frame)
 
     k = cv2.waitKey(1) & 0xFF
-    if k == ord('q') or k == 27:
+    if k == ord("q") or k == 27:
         break
 
 

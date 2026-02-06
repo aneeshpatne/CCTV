@@ -9,10 +9,10 @@ import requests
 
 def get_rssi(timeout: float = 2.0) -> int | None:
     """Fetch RSSI value from ESP32-CAM.
-    
+
     Args:
         timeout: Request timeout in seconds
-        
+
     Returns:
         RSSI value in dBm (e.g., -50) or None if request fails
     """

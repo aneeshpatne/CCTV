@@ -53,11 +53,18 @@ def _resolve_python_command() -> str:
         if not candidate:
             continue
         try:
-            subprocess.run([str(candidate), "--version"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                [str(candidate), "--version"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             return str(candidate)
         except Exception:
             continue
-    raise RuntimeError("Unable to locate a usable Python interpreter. Set the PYTHON environment variable.")
+    raise RuntimeError(
+        "Unable to locate a usable Python interpreter. Set the PYTHON environment variable."
+    )
 
 
 def _is_camera_running() -> bool:
@@ -71,16 +78,24 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
 
     with _camera_process_lock:
         if _camera_process and _camera_process.poll() is None:
-            logging.info("[orchestrator] Camera pipeline already running (pid=%s).", _camera_process.pid)
+            logging.info(
+                "[orchestrator] Camera pipeline already running (pid=%s).",
+                _camera_process.pid,
+            )
             return _camera_process
 
         python_cmd = _resolve_python_command()
-        logging.info("[orchestrator] Starting camera pipeline with %s -m image_processing.camera_pipeline", python_cmd)
+        logging.info(
+            "[orchestrator] Starting camera pipeline with %s -m image_processing.camera_pipeline",
+            python_cmd,
+        )
         try:
             proc = subprocess.Popen(
                 [python_cmd, "-m", "image_processing.camera_pipeline"],
                 cwd=str(REPO_ROOT),
-                stdin=None, stdout=None, stderr=None,
+                stdin=None,
+                stdout=None,
+                stderr=None,
             )
         except Exception as exc:
             logging.exception("[orchestrator] Failed to start camera pipeline")
@@ -118,7 +133,10 @@ def stop_camera_pipeline(sig: signal.Signals = signal.SIGTERM) -> None:
         time.sleep(0.1)
 
     if proc.poll() is None:
-        logging.warning("[orchestrator] Pipeline did not exit in %.1fs, sending SIGKILL.", STOP_TIMEOUT_SECONDS)
+        logging.warning(
+            "[orchestrator] Pipeline did not exit in %.1fs, sending SIGKILL.",
+            STOP_TIMEOUT_SECONDS,
+        )
         try:
             proc.kill()
         except Exception:
@@ -127,7 +145,9 @@ def stop_camera_pipeline(sig: signal.Signals = signal.SIGTERM) -> None:
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                logging.warning("[orchestrator] Pipeline did not terminate after SIGKILL.")
+                logging.warning(
+                    "[orchestrator] Pipeline did not terminate after SIGKILL."
+                )
 
 
 def restart_camera_pipeline() -> Optional[subprocess.Popen]:
@@ -171,7 +191,7 @@ def _delete_oldest_files_until_threshold(directory: Path, target_percent: int) -
 
     for mtime, size, file_path in files:
         current_usage = _get_usage_percent(directory)
-        
+
         if current_usage < target_percent:
             logging.info(
                 "[cleanup] Target usage reached: %s%% < %s%%. Deleted %d files (%d MB).",
@@ -186,7 +206,11 @@ def _delete_oldest_files_until_threshold(directory: Path, target_percent: int) -
             file_path.unlink()
             deleted_count += 1
             deleted_size += size
-            logging.info("[cleanup] Deleted old file: %s (%d MB)", file_path.name, size // (1024 * 1024))
+            logging.info(
+                "[cleanup] Deleted old file: %s (%d MB)",
+                file_path.name,
+                size // (1024 * 1024),
+            )
         except FileNotFoundError:
             continue
         except Exception:
@@ -206,17 +230,25 @@ def _delete_oldest_files_until_threshold(directory: Path, target_percent: int) -
 def check_storage_and_cleanup() -> None:
     """Check storage and delete old files if needed (runs in background thread)."""
     if not RECORDINGS_DIR.exists():
-        logging.warning("[cleanup] Recordings directory %s not found; skipping.", RECORDINGS_DIR)
+        logging.warning(
+            "[cleanup] Recordings directory %s not found; skipping.", RECORDINGS_DIR
+        )
         return
 
     try:
         usage_percent = _get_usage_percent(RECORDINGS_DIR)
     except Exception:
-        logging.exception("[cleanup] Unable to calculate disk usage for %s", RECORDINGS_DIR)
+        logging.exception(
+            "[cleanup] Unable to calculate disk usage for %s", RECORDINGS_DIR
+        )
         return
 
     # Always log disk usage so you can see it's working
-    logging.info("[cleanup] Disk usage check: %s%% (threshold: %s%%)", usage_percent, DISK_USAGE_THRESHOLD)
+    logging.info(
+        "[cleanup] Disk usage check: %s%% (threshold: %s%%)",
+        usage_percent,
+        DISK_USAGE_THRESHOLD,
+    )
 
     if usage_percent < DISK_USAGE_THRESHOLD:
         return
@@ -246,7 +278,9 @@ class StorageMonitor(threading.Thread):
         self._stop_event.set()
 
     def run(self) -> None:
-        logging.info("[monitor] Storage monitor thread started (interval=%ss).", self.interval)
+        logging.info(
+            "[monitor] Storage monitor thread started (interval=%ss).", self.interval
+        )
         while not self._stop_event.is_set():
             try:
                 check_storage_and_cleanup()
@@ -267,7 +301,10 @@ def start_orchestrator() -> None:
         if _storage_monitor is None or not _storage_monitor.is_alive():
             _storage_monitor = StorageMonitor(CHECK_INTERVAL_SECONDS)
             _storage_monitor.start()
-            logging.info("[orchestrator] Storage cleanup job scheduled every %s seconds.", CHECK_INTERVAL_SECONDS)
+            logging.info(
+                "[orchestrator] Storage cleanup job scheduled every %s seconds.",
+                CHECK_INTERVAL_SECONDS,
+            )
 
 
 def shutdown_orchestrator(sig: signal.Signals = signal.SIGTERM) -> None:
@@ -298,7 +335,11 @@ def _handle_signal(signum: int, _frame) -> None:
 def main() -> None:
     start_orchestrator()
 
-    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGQUIT", signal.SIGTERM)):
+    for sig in (
+        signal.SIGINT,
+        signal.SIGTERM,
+        getattr(signal, "SIGQUIT", signal.SIGTERM),
+    ):
         try:
             signal.signal(sig, _handle_signal)
         except (ValueError, OSError):
