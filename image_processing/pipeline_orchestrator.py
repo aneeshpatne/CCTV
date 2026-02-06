@@ -23,7 +23,6 @@ LOG_FORMAT = "[%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 BASE_DIR = Path(__file__).resolve().parent
-CAMERA_SCRIPT = BASE_DIR / "camera_pipeline.py"
 REPO_ROOT = BASE_DIR.parent
 RECORDINGS_DIR = Path(
     os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
@@ -75,13 +74,14 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
             logging.info("[orchestrator] Camera pipeline already running (pid=%s).", _camera_process.pid)
             return _camera_process
 
-        if not CAMERA_SCRIPT.exists():
-            raise FileNotFoundError(f"Camera script not found at {CAMERA_SCRIPT}")
-
         python_cmd = _resolve_python_command()
-        logging.info("[orchestrator] Starting camera pipeline with %s %s", python_cmd, CAMERA_SCRIPT)
+        logging.info("[orchestrator] Starting camera pipeline with %s -m image_processing.camera_pipeline", python_cmd)
         try:
-            proc = subprocess.Popen([python_cmd, str(CAMERA_SCRIPT)], stdin=None, stdout=None, stderr=None)
+            proc = subprocess.Popen(
+                [python_cmd, "-m", "image_processing.camera_pipeline"],
+                cwd=str(REPO_ROOT),
+                stdin=None, stdout=None, stderr=None,
+            )
         except Exception as exc:
             logging.exception("[orchestrator] Failed to start camera pipeline")
             raise RuntimeError("Unable to start camera pipeline") from exc

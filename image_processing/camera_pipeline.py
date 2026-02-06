@@ -1,5 +1,4 @@
 import os
-import sys
 
 # CRITICAL: Set FFMPEG options BEFORE importing cv2
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -23,7 +22,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytz
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi

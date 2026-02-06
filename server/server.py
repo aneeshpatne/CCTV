@@ -8,10 +8,7 @@ import socket
 import subprocess
 import tempfile
 import hashlib
-import sys
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from utilities.motion_db import (
     get_motion_events_by_hours,
     get_motion_events_by_date,

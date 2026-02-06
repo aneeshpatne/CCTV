@@ -2,9 +2,6 @@ import cv2
 from datetime import datetime
 import pytz
 import numpy as np
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parents[2]))
 from utilities.warn import NonBlockingBlinker
 
 
