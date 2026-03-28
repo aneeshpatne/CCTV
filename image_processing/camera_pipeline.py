@@ -704,10 +704,23 @@ def update_fps() -> None:
                 fps_value = (len(fps_frame_times) - 1) / time_span
 
 
-def draw_box(frame, x, y, w, h, bg_color=(10, 10, 10), alpha=0.85):
-    """Draws a semi-transparent background box."""
+def draw_box(
+    frame,
+    x,
+    y,
+    w,
+    h,
+    bg_color=(15, 15, 15),
+    alpha=0.6,
+    border_color=None,
+    accent_color=None,
+):
+    """Draw a modern, minimal, and sleek HUD panel."""
+    x2 = x + w
+    y2 = y + h
+
     overlay = frame.copy()
-    cv2.rectangle(overlay, (x, y), (x + w, y + h), bg_color, -1)
+    cv2.rectangle(overlay, (x, y), (x2, y2), bg_color, -1)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
 
@@ -716,7 +729,7 @@ def draw_wifi_icon(frame, x, y, size, rssi, color):
     # center is bottom-middle of the icon area
     cx, cy = x + size // 2, y + size - 4
     radius_step = size // 3
-    thickness = 2
+    thickness = 1
 
     # Dot
     cv2.circle(frame, (cx, cy), 2, color, -1)
@@ -733,7 +746,7 @@ def draw_wifi_icon(frame, x, y, size, rssi, color):
             bars = 1
 
     # Draw background (dim) arcs
-    grey = (60, 60, 60)
+    grey = (72, 76, 82)
 
     for i in range(1, 4):
         r = i * radius_step
@@ -775,15 +788,21 @@ def draw_hud(
     gap = 10
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.55  # Increased slightly
-    font_color = (230, 230, 230)
+    font_scale = 0.5
+    font_color = (255, 255, 255)
     thickness = 1
+    panel_color = (15, 15, 15)
+    panel_border = None
+    neutral_accent = None
+    danger_panel = (50, 15, 15)
+    danger_border = None
+    danger_accent = None
     # --- 1. Timestamp (Top Left) ---
     ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
     (tw, th), baseline = cv2.getTextSize(ts, font, font_scale, thickness)
     ts_box_w = tw + (pad_x * 2)
 
-    text_y = top_margin + (box_h + th) // 2 - 2
+    text_y = top_margin + (box_h + th) // 2 - 3
     overlap_pad = 4
 
     def overlaps_box(box_x: int, box_y: int, box_w: int, box_h: int) -> bool:
@@ -801,7 +820,16 @@ def draw_hud(
         return not HUD_COOLDOWN.is_hidden(key, now)
 
     if should_draw("timestamp", gap, top_margin, ts_box_w, box_h):
-        draw_box(frame, gap, top_margin, ts_box_w, box_h)
+        draw_box(
+            frame,
+            gap,
+            top_margin,
+            ts_box_w,
+            box_h,
+            bg_color=panel_color,
+            border_color=panel_border,
+            accent_color=neutral_accent,
+        )
         cv2.putText(
             frame,
             ts,
@@ -817,7 +845,7 @@ def draw_hud(
     if motion_detected:
         warn_text = "MOTION DETECTED"
         (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
-        warn_box_w = tw + (pad_x * 2)
+        warn_box_w = tw + (pad_x * 2) + 12
         warn_x = gap + ts_box_w + gap
         if should_draw("motion_warn", warn_x, top_margin, warn_box_w, box_h):
             draw_box(
@@ -826,13 +854,23 @@ def draw_hud(
                 top_margin,
                 warn_box_w,
                 box_h,
-                bg_color=(180, 40, 40),
-                alpha=0.9,
+                bg_color=danger_panel,
+                alpha=0.84,
+                border_color=danger_border,
+                accent_color=danger_accent,
+            )
+            cv2.circle(
+                frame,
+                (warn_x + pad_x + 4, top_margin + box_h // 2),
+                3,
+                danger_accent,
+                -1,
+                cv2.LINE_AA,
             )
             cv2.putText(
                 frame,
                 warn_text,
-                (warn_x + pad_x, text_y),
+                (warn_x + pad_x + 12, text_y),
                 font,
                 font_scale,
                 (255, 255, 255),
@@ -853,13 +891,22 @@ def draw_hud(
 
     cursor_x -= wifi_box_w
     if should_draw("wifi", cursor_x, top_margin, wifi_box_w, box_h):
-        draw_box(frame, cursor_x, top_margin, wifi_box_w, box_h)
+        draw_box(
+            frame,
+            cursor_x,
+            top_margin,
+            wifi_box_w,
+            box_h,
+            bg_color=panel_color,
+            border_color=panel_border,
+            accent_color=(93, 156, 255),
+        )
 
         # Draw content
         wifi_color = get_status_color(
             rssi,
             [-60, -70, -80],
-            [(100, 255, 100), (0, 255, 255), (0, 165, 255), (50, 50, 255)],
+            [(129, 224, 139), (114, 214, 255), (74, 167, 255), (82, 88, 245)],
         )
 
         # Icon
@@ -888,11 +935,20 @@ def draw_hud(
     fps_box_w = tw + (pad_x * 2) + 6  # +6 for dot space
     cursor_x -= fps_box_w
     if should_draw("fps", cursor_x, top_margin, fps_box_w, box_h):
-        draw_box(frame, cursor_x, top_margin, fps_box_w, box_h)
+        draw_box(
+            frame,
+            cursor_x,
+            top_margin,
+            fps_box_w,
+            box_h,
+            bg_color=panel_color,
+            border_color=panel_border,
+            accent_color=(118, 136, 255),
+        )
 
         # Color logic: >= 7 Green, >= 5 Yellow, else Red
         fps_color = get_status_color(
-            fps, [7, 5], [(100, 255, 100), (0, 255, 255), (50, 50, 255)]
+            fps, [7, 5], [(129, 224, 139), (114, 214, 255), (82, 88, 245)]
         )
 
         # Dot
@@ -925,10 +981,19 @@ def draw_hud(
 
         cursor_x -= mem_box_w
         if should_draw("memory", cursor_x, top_margin, mem_box_w, box_h):
-            draw_box(frame, cursor_x, top_margin, mem_box_w, box_h)
+            draw_box(
+                frame,
+                cursor_x,
+                top_margin,
+                mem_box_w,
+                box_h,
+                bg_color=panel_color,
+                border_color=panel_border,
+                accent_color=(160, 168, 180),
+            )
 
             mem_color = get_status_color(
-                mem_pct, [20, 10], [(220, 220, 220), (0, 255, 255), (50, 50, 255)]
+                mem_pct, [20, 10], [(220, 224, 230), (114, 214, 255), (82, 88, 245)]
             )
 
             # Icon (Simple Chip)
