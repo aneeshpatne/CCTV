@@ -357,6 +357,8 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         "-hide_banner",
         "-y",
         # Raw video frames from Python over stdin.
+        "-use_wallclock_as_timestamps",
+        "1",
         "-thread_queue_size",
         "512",
         "-f",
@@ -436,25 +438,31 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
     )
 
     if AUDIO_ENABLED:
-        cmd.extend(
-            [
-                "-c:a",
-                "aac",
-                "-b:a",
-                f"{AUDIO_BITRATE_KBPS}k",
-                "-ar",
-                str(AUDIO_OUTPUT_SAMPLE_RATE),
-                "-ac",
-                str(AUDIO_CHANNELS),
-                "-af",
-                f"aresample=async=1000:min_hard_comp=0.1:first_pts=0,"
-                f"volume={AUDIO_GAIN_DB}dB,"
-                "alimiter=limit=0.95:level=disabled",
-            ]
-        )
+        audio_codec_args = [
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{AUDIO_BITRATE_KBPS}k",
+            "-ar",
+            str(AUDIO_OUTPUT_SAMPLE_RATE),
+            "-ac",
+            str(AUDIO_CHANNELS),
+        ]
+        # Only add -af when filter_complex is NOT used (it already handles audio)
+        if not AUDIO_DEBUG_LOGGING:
+            audio_codec_args.extend(
+                [
+                    "-af",
+                    f"aresample=async=1:first_pts=0,"
+                    f"volume={AUDIO_GAIN_DB}dB,"
+                    "alimiter=limit=0.95:level=disabled",
+                ]
+            )
+        cmd.extend(audio_codec_args)
 
     cmd.extend(
         [
+            "-shortest",
             "-max_muxing_queue_size",
             "9999",
             "-f",
