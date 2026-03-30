@@ -396,7 +396,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
     if AUDIO_ENABLED:
         audio_input_url = (
             f"udp://0.0.0.0:{AUDIO_UDP_PORT}"
-            "?listen=1&fifo_size=8192&overrun_nonfatal=1&timeout=5000000"
+            "?listen=1&reuse=1&fifo_size=8192&overrun_nonfatal=1&timeout=5000000"
         )
         cmd.extend(
             [
