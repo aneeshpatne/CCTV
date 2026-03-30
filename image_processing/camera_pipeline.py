@@ -372,6 +372,10 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         "-hide_banner",
         "-y",
         # Raw video frames from Python over stdin.
+        # Wallclock timestamps so video PTS tracks real-time even when
+        # frames arrive irregularly due to processing overhead.
+        "-use_wallclock_as_timestamps",
+        "1",
         "-thread_queue_size",
         "512",
         "-f",
@@ -381,7 +385,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         "-s",
         f"{width}x{height}",
         "-r",
-        f"{safe_fps:.2f}",  # Match input cadence to measured FPS
+        f"{safe_fps:.2f}",
         "-i",
         "-",
     ]
@@ -393,8 +397,10 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         )
         cmd.extend(
             [
-                # Raw UDP PCM from ESP32 microphone — near-zero buffering.
-                # Excess audio is dropped (overrun_nonfatal) rather than queued.
+                # Raw UDP PCM from ESP32 microphone.
+                # Wallclock timestamps to match video's time reference.
+                "-use_wallclock_as_timestamps",
+                "1",
                 "-probesize",
                 "32",
                 "-analyzeduration",
@@ -404,7 +410,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
                 "-flags",
                 "low_delay",
                 "-thread_queue_size",
-                "8",
+                "64",
                 "-f",
                 "s16le",
                 "-ar",
@@ -420,7 +426,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         if ENABLE_RECORDING and ENABLE_RTSP:
             audio_filter = "[1:a]asplit=2[audio_record_src][audio_live_src];"
             audio_filter += "[audio_record_src]anull[audio_record];"
-            audio_filter += "[audio_live_src]aresample=async=1:first_pts=0[audio_live]"
+            audio_filter += "[audio_live_src]anull[audio_live]"
             if AUDIO_DEBUG_LOGGING:
                 audio_filter += (
                     ";[audio_live]astats=metadata=1:reset=50:measure_overall=0,"
@@ -430,7 +436,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         elif ENABLE_RECORDING:
             audio_filter = "[1:a]anull[audio_record]"
         else:
-            audio_filter = "[1:a]aresample=async=1:first_pts=0[audio_live]"
+            audio_filter = "[1:a]anull[audio_live]"
             if AUDIO_DEBUG_LOGGING:
                 audio_filter += (
                     ";[audio_live]astats=metadata=1:reset=50:measure_overall=0,"
@@ -450,6 +456,10 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
             # Convert to videotoolbox-friendly format
             "-vf",
             f"setpts=PTS+{VIDEO_DELAY_SECONDS}/TB,format=nv12",
+            # Force constant frame rate output — duplicates frames during
+            # slow periods so video PTS stays smooth for seeking & streaming.
+            "-fps_mode",
+            "cfr",
             # Hardware encoder (Intel Quick Sync via VideoToolbox)
             "-c:v",
             "h264_videotoolbox",
