@@ -420,7 +420,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         if ENABLE_RECORDING and ENABLE_RTSP:
             audio_filter = "[1:a]asplit=2[audio_record_src][audio_live_src];"
             audio_filter += "[audio_record_src]anull[audio_record];"
-            audio_filter += "[audio_live_src]asetpts=N/SR/TB[audio_live]"
+            audio_filter += "[audio_live_src]aresample=async=1:first_pts=0[audio_live]"
             if AUDIO_DEBUG_LOGGING:
                 audio_filter += (
                     ";[audio_live]astats=metadata=1:reset=50:measure_overall=0,"
@@ -430,7 +430,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         elif ENABLE_RECORDING:
             audio_filter = "[1:a]anull[audio_record]"
         else:
-            audio_filter = "[1:a]asetpts=N/SR/TB[audio_live]"
+            audio_filter = "[1:a]aresample=async=1:first_pts=0[audio_live]"
             if AUDIO_DEBUG_LOGGING:
                 audio_filter += (
                     ";[audio_live]astats=metadata=1:reset=50:measure_overall=0,"
@@ -504,7 +504,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
     cmd.extend(
         [
             "-max_muxing_queue_size",
-            "9999",
+            "1024",
             "-f",
             "tee",
             "|".join(outputs),
