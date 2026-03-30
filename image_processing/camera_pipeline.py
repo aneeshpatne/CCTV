@@ -387,8 +387,6 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
                 str(AUDIO_SAMPLE_RATE),
                 "-ac",
                 str(AUDIO_CHANNELS),
-                "-use_wallclock_as_timestamps",
-                "1",
                 "-i",
                 audio_input_url,
             ]
@@ -459,7 +457,6 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
 
     cmd.extend(
         [
-            "-shortest",
             "-max_muxing_queue_size",
             "9999",
             "-f",
