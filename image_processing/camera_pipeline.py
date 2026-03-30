@@ -218,6 +218,9 @@ _pacer_frame: Optional[np.ndarray] = None
 _pacer_frame_lock = threading.Lock()
 _pacer_thread: Optional[threading.Thread] = None
 _pacer_running = False
+_ffmpeg_has_audio = True  # Whether current FFmpeg instance includes audio
+_ffmpeg_start_time: Optional[float] = None  # When current FFmpeg was started
+_audio_retry_time: float = 0.0  # When to next retry audio after fallback
 
 # FPS tracking state
 fps_value = 0.0
@@ -282,13 +285,13 @@ expected_frame_size: Optional[tuple[int, int]] = (
 current_fps: Optional[float] = None  # Active FPS used by FFmpeg
 
 
-def _build_ffmpeg_outputs() -> list[str]:
+def _build_ffmpeg_outputs(with_audio: bool = True) -> list[str]:
     outputs: list[str] = []
     if ENABLE_RECORDING:
         BASE_DIR.mkdir(parents=True, exist_ok=True)
         out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
         recording_select = "select='v\\:0"
-        if AUDIO_ENABLED:
+        if AUDIO_ENABLED and with_audio:
             recording_select += ",a\\:0"
         recording_select += "'"
         outputs.append(
@@ -305,7 +308,7 @@ def _build_ffmpeg_outputs() -> list[str]:
         )
     if ENABLE_RTSP:
         rtsp_select = "select='v\\:0"
-        if AUDIO_ENABLED:
+        if AUDIO_ENABLED and with_audio:
             live_audio_index = 1 if ENABLE_RECORDING else 0
             rtsp_select += f",a\\:{live_audio_index}"
         rtsp_select += "'"
@@ -358,15 +361,20 @@ def start_audio_monitor() -> None:
         )
 
 
-def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
-    """Start a single FFmpeg process that records and restreams shared A/V."""
+def start_ffmpeg(width: int, height: int, fps: float, with_audio: bool = True) -> Optional[subprocess.Popen]:
+    """Start a single FFmpeg process that records and restreams shared A/V.
+
+    When *with_audio* is False the command is built without the UDP audio
+    input, filters, maps, or codecs so the pipeline works even when no
+    microphone data is available.
+    """
     safe_fps = max(1.0, fps)
     gop_size = max(1, int(round(safe_fps)))
-    outputs = _build_ffmpeg_outputs()
+    outputs = _build_ffmpeg_outputs(with_audio=with_audio)
     if not outputs:
         return None
     audio_stats_path = BASE_DIR / "ffmpeg_audio_levels.log"
-    if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
+    if AUDIO_ENABLED and with_audio and AUDIO_DEBUG_LOGGING:
         try:
             audio_stats_path.write_text("", encoding="utf-8")
         except Exception as e:
@@ -393,7 +401,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         "-",
     ]
 
-    if AUDIO_ENABLED:
+    if AUDIO_ENABLED and with_audio:
         audio_input_url = (
             f"udp://0.0.0.0:{AUDIO_UDP_PORT}"
             "?listen=1&reuse=1&fifo_size=8192&overrun_nonfatal=1&timeout=5000000"
@@ -422,7 +430,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
             ]
         )
 
-    if AUDIO_ENABLED:
+    if AUDIO_ENABLED and with_audio:
         if ENABLE_RECORDING and ENABLE_RTSP:
             audio_filter = "[1:a]asplit=2[audio_record_src][audio_live_src];"
             audio_filter += "[audio_record_src]anull[audio_record];"
@@ -446,10 +454,10 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         cmd.extend(["-filter_complex", audio_filter])
 
     cmd.extend(["-map", "0:v:0"])
-    if AUDIO_ENABLED and ENABLE_RECORDING:
-        cmd.extend(["-map", "[audio_record]?"])
-    if AUDIO_ENABLED and ENABLE_RTSP:
-        cmd.extend(["-map", "[audio_live]?"])
+    if AUDIO_ENABLED and with_audio and ENABLE_RECORDING:
+        cmd.extend(["-map", "[audio_record]"])
+    if AUDIO_ENABLED and with_audio and ENABLE_RTSP:
+        cmd.extend(["-map", "[audio_live]"])
 
     cmd.extend(
         [
@@ -478,7 +486,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         ]
     )
 
-    if AUDIO_ENABLED:
+    if AUDIO_ENABLED and with_audio:
         if ENABLE_RECORDING:
             cmd.extend(
                 [
@@ -530,8 +538,8 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         print(
             "FFmpeg A/V pipeline started:"
             f" video={width}x{height}@{safe_fps:.2f}fps,"
-            f" audio_udp={'enabled' if AUDIO_ENABLED else 'disabled'}"
-            f" on port {AUDIO_UDP_PORT if AUDIO_ENABLED else 'n/a'}"
+            f" audio={'enabled' if (AUDIO_ENABLED and with_audio) else 'disabled'}"
+            f" (port {AUDIO_UDP_PORT if (AUDIO_ENABLED and with_audio) else 'n/a'})"
         )
         return proc
     except Exception as e:
@@ -569,12 +577,21 @@ def _pacer_loop() -> None:
     This guarantees video PTS advances at exactly real-time speed (matching
     audio) regardless of how fast or slow the main processing loop runs.
     When processing is slow, the previous frame is repeated (no gap).
+
+    Audio resilience: starts with audio enabled. If FFmpeg crashes quickly
+    (within 10 s), assumes audio is unavailable and restarts video-only.
+    Retries audio every 60 s.
     """
     global ffmpeg_proc, expected_frame_size, current_fps, _pacer_running
+    global _ffmpeg_has_audio, _ffmpeg_start_time, _audio_retry_time
+
+    AUDIO_CRASH_THRESHOLD = 10.0  # seconds — if FFmpeg dies within this, blame audio
+    AUDIO_RETRY_INTERVAL = 60.0   # seconds — how often to re-try enabling audio
 
     interval = 1.0 / FIXED_OUTPUT_FPS
     last_frame: Optional[np.ndarray] = None
     next_write = time.monotonic()
+    _ffmpeg_has_audio = AUDIO_ENABLED  # Start optimistically
 
     while _pacer_running:
         # Sleep precisely until the next frame slot
@@ -618,13 +635,42 @@ def _pacer_loop() -> None:
 
             target_width, target_height = expected_frame_size
 
+            # Detect FFmpeg crash and handle audio fallback
             if ffmpeg_proc is not None and ffmpeg_proc.poll() is not None:
                 exit_code = ffmpeg_proc.poll()
-                print(f"FFmpeg pipeline exited (code {exit_code}); restarting...")
+                uptime = time.monotonic() - (_ffmpeg_start_time or 0)
                 stop_ffmpeg(ffmpeg_proc)
                 ffmpeg_proc = None
+
+                if _ffmpeg_has_audio and uptime < AUDIO_CRASH_THRESHOLD:
+                    # FFmpeg died quickly with audio — fall back to video-only
+                    print(
+                        f"FFmpeg exited (code {exit_code}) after {uptime:.1f}s "
+                        "— audio may be unavailable, restarting without audio"
+                    )
+                    _ffmpeg_has_audio = False
+                    _audio_retry_time = time.monotonic() + AUDIO_RETRY_INTERVAL
+                else:
+                    print(f"FFmpeg pipeline exited (code {exit_code}); restarting...")
+
+            # Periodically retry enabling audio
+            if (
+                AUDIO_ENABLED
+                and not _ffmpeg_has_audio
+                and ffmpeg_proc is not None
+                and time.monotonic() >= _audio_retry_time
+            ):
+                print("Retrying FFmpeg with audio...")
+                stop_ffmpeg(ffmpeg_proc)
+                ffmpeg_proc = None
+                _ffmpeg_has_audio = True
+
             if ffmpeg_proc is None:
-                ffmpeg_proc = start_ffmpeg(target_width, target_height, target_fps)
+                ffmpeg_proc = start_ffmpeg(
+                    target_width, target_height, target_fps,
+                    with_audio=_ffmpeg_has_audio,
+                )
+                _ffmpeg_start_time = time.monotonic()
 
             # Resize if needed
             if (w, h) != expected_frame_size:
@@ -639,7 +685,11 @@ def _pacer_loop() -> None:
                 except (BrokenPipeError, IOError) as err:
                     print(f"FFmpeg pipe error ({err}); restarting...")
                     stop_ffmpeg(ffmpeg_proc)
-                    ffmpeg_proc = start_ffmpeg(target_width, target_height, target_fps)
+                    ffmpeg_proc = start_ffmpeg(
+                        target_width, target_height, target_fps,
+                        with_audio=_ffmpeg_has_audio,
+                    )
+                    _ffmpeg_start_time = time.monotonic()
 
 
 def start_frame_pacer() -> None:
