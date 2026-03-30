@@ -715,12 +715,25 @@ def draw_box(
     border_color=None,
     accent_color=None,
 ):
-    """Draw a modern, minimal, and sleek HUD panel."""
+    """Draw a modern rounded pill/rectangle HUD panel."""
     x2 = x + w
     y2 = y + h
-
+    radius = 8  # Smooth 8px rounded corners
+    
     overlay = frame.copy()
-    cv2.rectangle(overlay, (x, y), (x2, y2), bg_color, -1)
+    
+    # Construct a perfect filled rounded rectangle
+    cv2.rectangle(overlay, (x + radius, y), (x2 - radius, y2), bg_color, -1)
+    cv2.rectangle(overlay, (x, y + radius), (x + radius, y2 - radius), bg_color, -1)
+    cv2.rectangle(overlay, (x2 - radius, y + radius), (x2, y2 - radius), bg_color, -1)
+    
+    # Anti-aliased corner circles
+    cv2.circle(overlay, (x + radius, y + radius), radius, bg_color, -1, cv2.LINE_AA)
+    cv2.circle(overlay, (x2 - radius, y + radius), radius, bg_color, -1, cv2.LINE_AA)
+    cv2.circle(overlay, (x + radius, y2 - radius), radius, bg_color, -1, cv2.LINE_AA)
+    cv2.circle(overlay, (x2 - radius, y2 - radius), radius, bg_color, -1, cv2.LINE_AA)
+    
+    # Blend exactly where we drew to optimize performance and look clean
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
 
@@ -789,12 +802,12 @@ def draw_hud(
 
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.5
-    font_color = (255, 255, 255)
+    font_color = (250, 252, 255)  # Crisp ice-white
     thickness = 1
-    panel_color = (15, 15, 15)
+    panel_color = (15, 15, 15)    # Solid deep dark base
     panel_border = None
     neutral_accent = None
-    danger_panel = (50, 15, 15)
+    danger_panel = (20, 20, 180)  # Smooth dark warning red
     danger_border = None
     danger_accent = None
     # --- 1. Timestamp (Top Left) ---
