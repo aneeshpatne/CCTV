@@ -389,13 +389,17 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
     if AUDIO_ENABLED:
         audio_input_url = (
             f"udp://0.0.0.0:{AUDIO_UDP_PORT}"
-            "?listen=1&fifo_size=5000000&overrun_nonfatal=1&timeout=0"
+            "?listen=1&fifo_size=65536&overrun_nonfatal=1&timeout=0"
         )
         cmd.extend(
             [
-                # Raw UDP PCM from ESP32 microphone.
+                # Raw UDP PCM from ESP32 microphone — minimal buffering.
+                "-fflags",
+                "+nobuffer",
+                "-flags",
+                "low_delay",
                 "-thread_queue_size",
-                "8192",
+                "512",
                 "-f",
                 "s16le",
                 "-ar",
