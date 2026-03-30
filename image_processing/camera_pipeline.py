@@ -357,8 +357,6 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         "-hide_banner",
         "-y",
         # Raw video frames from Python over stdin.
-        "-use_wallclock_as_timestamps",
-        "1",
         "-thread_queue_size",
         "512",
         "-f",
