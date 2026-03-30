@@ -63,6 +63,7 @@ AUDIO_SAMPLE_RATE = int(os.getenv("CCTV_AUDIO_SAMPLE_RATE", "16000"))
 AUDIO_OUTPUT_SAMPLE_RATE = int(os.getenv("CCTV_AUDIO_OUTPUT_SAMPLE_RATE", "48000"))
 AUDIO_CHANNELS = int(os.getenv("CCTV_AUDIO_CHANNELS", "1"))
 AUDIO_BITRATE_KBPS = int(os.getenv("CCTV_AUDIO_BITRATE_KBPS", "64"))
+LIVE_AUDIO_BITRATE_KBPS = int(os.getenv("CCTV_LIVE_AUDIO_BITRATE_KBPS", "64"))
 AUDIO_GAIN_DB = float(os.getenv("CCTV_AUDIO_GAIN_DB", "18"))
 AUDIO_ENABLED = os.getenv("CCTV_AUDIO_ENABLED", "1").lower() not in {
     "0",
@@ -281,9 +282,14 @@ def _build_ffmpeg_outputs() -> list[str]:
     if ENABLE_RECORDING:
         BASE_DIR.mkdir(parents=True, exist_ok=True)
         out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
+        recording_select = ":select='v:0"
+        if AUDIO_ENABLED:
+            recording_select += ",a:0"
+        recording_select += "'"
         outputs.append(
             "[onfail=ignore:"
             "use_fifo=1:"
+            f"{recording_select}:"
             "f=segment:"
             f"segment_time={SEGMENT_SECONDS}:"
             "segment_format=mp4:"
@@ -293,8 +299,18 @@ def _build_ffmpeg_outputs() -> list[str]:
             f"{out_pattern}"
         )
     if ENABLE_RTSP:
+        rtsp_select = ":select='v:0"
+        if AUDIO_ENABLED:
+            live_audio_index = 1 if ENABLE_RECORDING else 0
+            rtsp_select += f",a:{live_audio_index}"
+        rtsp_select += "'"
         outputs.append(
-            f"[onfail=ignore:use_fifo=1:f=rtsp:rtsp_transport=tcp]{RTSP_OUT}"
+            "[onfail=ignore:"
+            "use_fifo=1:"
+            f"{rtsp_select}:"
+            "f=rtsp:"
+            "rtsp_transport=tcp]"
+            f"{RTSP_OUT}"
         )
     return outputs
 
@@ -392,23 +408,29 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
             ]
         )
 
-    if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
-        cmd.extend(
-            [
-                "-filter_complex",
-                f"[1:a]volume={AUDIO_GAIN_DB}dB,"
-                "alimiter=limit=0.95:level=disabled,"
-                "astats=metadata=1:reset=50:measure_overall=0,"
-                f"ametadata=mode=print:file={audio_stats_path}"
-                "[audio_out]",
-            ]
+    if AUDIO_ENABLED:
+        audio_filter = (
+            f"[1:a]volume={AUDIO_GAIN_DB}dB,"
+            "alimiter=limit=0.95:level=disabled"
         )
+        if AUDIO_DEBUG_LOGGING:
+            audio_filter += (
+                ",astats=metadata=1:reset=50:measure_overall=0,"
+                f"ametadata=mode=print:file={audio_stats_path}"
+            )
+        if ENABLE_RECORDING and ENABLE_RTSP:
+            audio_filter += ",asplit=2[audio_record][audio_live]"
+        elif ENABLE_RECORDING:
+            audio_filter += "[audio_record]"
+        else:
+            audio_filter += "[audio_live]"
+        cmd.extend(["-filter_complex", audio_filter])
 
     cmd.extend(["-map", "0:v:0"])
-    if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
-        cmd.extend(["-map", "[audio_out]"])
-    elif AUDIO_ENABLED:
-        cmd.extend(["-map", "1:a:0?"])
+    if AUDIO_ENABLED and ENABLE_RECORDING:
+        cmd.extend(["-map", "[audio_record]"])
+    if AUDIO_ENABLED and ENABLE_RTSP:
+        cmd.extend(["-map", "[audio_live]"])
 
     cmd.extend(
         [
@@ -434,26 +456,33 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
     )
 
     if AUDIO_ENABLED:
-        audio_codec_args = [
-            "-c:a",
-            "aac",
-            "-b:a",
-            f"{AUDIO_BITRATE_KBPS}k",
-            "-ar",
-            str(AUDIO_OUTPUT_SAMPLE_RATE),
-            "-ac",
-            str(AUDIO_CHANNELS),
-        ]
-        # Only add -af when filter_complex is NOT used (it already handles audio)
-        if not AUDIO_DEBUG_LOGGING:
-            audio_codec_args.extend(
+        if ENABLE_RECORDING:
+            cmd.extend(
                 [
-                    "-af",
-                    f"volume={AUDIO_GAIN_DB}dB,"
-                    "alimiter=limit=0.95:level=disabled",
+                    "-c:a:0",
+                    "aac",
+                    "-b:a:0",
+                    f"{AUDIO_BITRATE_KBPS}k",
+                    "-ar:a:0",
+                    str(AUDIO_OUTPUT_SAMPLE_RATE),
+                    "-ac:a:0",
+                    str(AUDIO_CHANNELS),
                 ]
             )
-        cmd.extend(audio_codec_args)
+        if ENABLE_RTSP:
+            live_audio_stream_index = 1 if ENABLE_RECORDING else 0
+            cmd.extend(
+                [
+                    f"-c:a:{live_audio_stream_index}",
+                    "libopus",
+                    f"-b:a:{live_audio_stream_index}",
+                    f"{LIVE_AUDIO_BITRATE_KBPS}k",
+                    f"-ar:a:{live_audio_stream_index}",
+                    str(AUDIO_OUTPUT_SAMPLE_RATE),
+                    f"-ac:a:{live_audio_stream_index}",
+                    str(AUDIO_CHANNELS),
+                ]
+            )
 
     cmd.extend(
         [
