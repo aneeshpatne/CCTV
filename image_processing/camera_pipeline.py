@@ -213,6 +213,12 @@ memory_update_interval = 10  # Update memory every 10 seconds
 # Audio activity monitoring state
 audio_monitor_thread = None
 
+# Frame pacer state — decouples processing from FFmpeg writes
+_pacer_frame: Optional[np.ndarray] = None
+_pacer_frame_lock = threading.Lock()
+_pacer_thread: Optional[threading.Thread] = None
+_pacer_running = False
+
 # FPS tracking state
 fps_value = 0.0
 fps_lock = threading.Lock()
@@ -372,10 +378,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         "-hide_banner",
         "-y",
         # Raw video frames from Python over stdin.
-        # Wallclock timestamps so video PTS tracks real-time even when
-        # frames arrive irregularly due to processing overhead.
-        "-use_wallclock_as_timestamps",
-        "1",
+        # Frame pacer thread feeds frames at steady fps — no wallclock needed.
         "-thread_queue_size",
         "512",
         "-f",
@@ -398,9 +401,6 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         cmd.extend(
             [
                 # Raw UDP PCM from ESP32 microphone.
-                # Wallclock timestamps to match video's time reference.
-                "-use_wallclock_as_timestamps",
-                "1",
                 "-probesize",
                 "32",
                 "-analyzeduration",
@@ -456,10 +456,6 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
             # Convert to videotoolbox-friendly format
             "-vf",
             f"setpts=PTS+{VIDEO_DELAY_SECONDS}/TB,format=nv12",
-            # Force constant frame rate output — duplicates frames during
-            # slow periods so video PTS stays smooth for seeking & streaming.
-            "-fps_mode",
-            "cfr",
             # Hardware encoder (Intel Quick Sync via VideoToolbox)
             "-c:v",
             "h264_videotoolbox",
@@ -560,82 +556,113 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
             pass
 
 
-def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
-    """Push a frame into the FFmpeg A/V pipeline, restarting it when needed."""
-    global ffmpeg_proc, expected_frame_size, current_fps
+def set_pacer_frame(frame: np.ndarray) -> None:
+    """Update the latest frame for the pacer thread to write to FFmpeg."""
+    global _pacer_frame
+    with _pacer_frame_lock:
+        _pacer_frame = frame
 
-    if not ENABLE_RECORDING and not ENABLE_RTSP:
-        return True
 
-    with ffmpeg_lock:
-        h, w = frame.shape[:2]
-        new_size = (w, h)
+def _pacer_loop() -> None:
+    """Background loop: writes the latest frame to FFmpeg at a steady fixed rate.
 
-        # Get current FPS from the FPS tracker
-        with fps_lock:
-            measured_fps = fps_value if fps_value > 0 else FIXED_OUTPUT_FPS
+    This guarantees video PTS advances at exactly real-time speed (matching
+    audio) regardless of how fast or slow the main processing loop runs.
+    When processing is slow, the previous frame is repeated (no gap).
+    """
+    global ffmpeg_proc, expected_frame_size, current_fps, _pacer_running
 
-        # Check if we need to restart FFmpeg due to size or FPS change
-        fps_changed = False
-        if USE_DYNAMIC_FPS and current_fps is not None:
-            # Restart if FPS changes by more than 1 FPS to avoid constant restarts from small fluctuations
-            if abs(measured_fps - current_fps) > 1.0:
-                fps_changed = True
-                print(
-                    f"FPS changed from {current_fps:.2f} to {measured_fps:.2f}; restarting FFmpeg pipeline."
-                )
+    interval = 1.0 / FIXED_OUTPUT_FPS
+    last_frame: Optional[np.ndarray] = None
+    next_write = time.monotonic()
 
-        # Track the canonical size expected by the encoders
-        if expected_frame_size is None:
-            expected_frame_size = new_size
-            current_fps = measured_fps if USE_DYNAMIC_FPS else FIXED_OUTPUT_FPS
-        elif new_size != expected_frame_size or fps_changed:
-            if new_size != expected_frame_size:
+    while _pacer_running:
+        # Sleep precisely until the next frame slot
+        now = time.monotonic()
+        sleep_time = next_write - now
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        next_write += interval
+
+        # Grab the latest processed frame (or repeat the last one)
+        with _pacer_frame_lock:
+            frame = _pacer_frame
+        if frame is None:
+            if last_frame is None:
+                continue  # No frame yet, skip
+            frame = last_frame
+        last_frame = frame
+
+        if not ENABLE_RECORDING and not ENABLE_RTSP:
+            continue
+
+        with ffmpeg_lock:
+            h, w = frame.shape[:2]
+            new_size = (w, h)
+            target_fps = FIXED_OUTPUT_FPS
+
+            # Track the canonical size expected by the encoders
+            if expected_frame_size is None:
+                expected_frame_size = new_size
+                current_fps = target_fps
+            elif new_size != expected_frame_size:
                 print(
                     f"Frame size changed from {expected_frame_size[0]}x{expected_frame_size[1]} to {w}x{h}; "
                     "restarting FFmpeg pipeline."
                 )
-            if ffmpeg_proc is not None:
+                if ffmpeg_proc is not None:
+                    stop_ffmpeg(ffmpeg_proc)
+                    ffmpeg_proc = None
+                expected_frame_size = new_size
+                current_fps = target_fps
+
+            target_width, target_height = expected_frame_size
+
+            if ffmpeg_proc is not None and ffmpeg_proc.poll() is not None:
+                exit_code = ffmpeg_proc.poll()
+                print(f"FFmpeg pipeline exited (code {exit_code}); restarting...")
                 stop_ffmpeg(ffmpeg_proc)
                 ffmpeg_proc = None
-            expected_frame_size = new_size
-            current_fps = measured_fps if USE_DYNAMIC_FPS else FIXED_OUTPUT_FPS
+            if ffmpeg_proc is None:
+                ffmpeg_proc = start_ffmpeg(target_width, target_height, target_fps)
 
-        target_width, target_height = expected_frame_size
-        if USE_DYNAMIC_FPS:
-            target_fps = current_fps if current_fps is not None else measured_fps
-        else:
-            target_fps = FIXED_OUTPUT_FPS
+            # Resize if needed
+            if (w, h) != expected_frame_size:
+                frame = cv2.resize(frame, expected_frame_size)
 
-        if ffmpeg_proc is not None and ffmpeg_proc.poll() is not None:
-            exit_code = ffmpeg_proc.poll()
-            print(f"FFmpeg pipeline exited (code {exit_code}); restarting...")
-            stop_ffmpeg(ffmpeg_proc)
-            ffmpeg_proc = None
-        if ffmpeg_proc is None:
-            ffmpeg_proc = start_ffmpeg(target_width, target_height, target_fps)
+            frame_bytes = frame.tobytes()
 
-        # If the current frame size differs from the expected size, resize once for both outputs
-        if (w, h) != expected_frame_size:
-            frame = cv2.resize(frame, expected_frame_size)
+            if ffmpeg_proc is not None:
+                try:
+                    if ffmpeg_proc.stdin:
+                        ffmpeg_proc.stdin.write(frame_bytes)
+                except (BrokenPipeError, IOError) as err:
+                    print(f"FFmpeg pipe error ({err}); restarting...")
+                    stop_ffmpeg(ffmpeg_proc)
+                    ffmpeg_proc = start_ffmpeg(target_width, target_height, target_fps)
 
-        frame_bytes = frame.tobytes()
 
-        def _write(proc: Optional[subprocess.Popen]) -> Optional[subprocess.Popen]:
-            if proc is None:
-                return None
-            try:
-                if proc.stdin:
-                    proc.stdin.write(frame_bytes)
-            except (BrokenPipeError, IOError) as err:
-                print(f"FFmpeg pipe error ({err}); restarting...")
-                stop_ffmpeg(proc)
-                return start_ffmpeg(target_width, target_height, target_fps)
-            return proc
+def start_frame_pacer() -> None:
+    """Start the background frame pacer thread."""
+    global _pacer_thread, _pacer_running
+    if _pacer_thread is not None and _pacer_thread.is_alive():
+        return
+    _pacer_running = True
+    _pacer_thread = threading.Thread(target=_pacer_loop, daemon=True)
+    _pacer_thread.start()
+    print(f"Frame pacer started at {FIXED_OUTPUT_FPS:.0f} fps")
 
-        ffmpeg_proc = _write(ffmpeg_proc)
 
-        return True
+def stop_frame_pacer() -> None:
+    """Stop the background frame pacer thread."""
+    global _pacer_running
+    _pacer_running = False
+
+
+def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
+    """Update the latest frame for the pacer to write to FFmpeg."""
+    set_pacer_frame(frame)
+    return True
 
 
 def start_startup(force: bool = False) -> None:
@@ -1400,6 +1427,7 @@ def main() -> None:
         start_memory_monitor()
     if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
         start_audio_monitor()
+    start_frame_pacer()
     show_placeholder("STARTUP: Initializing camera...")
     cv2.waitKey(1)
 
@@ -1568,9 +1596,8 @@ def main() -> None:
                     lineType=cv2.LINE_AA,
                 )
 
-            # Record frame with overlay (IN-PLACE recording with motion detection)
-            if ENABLE_RECORDING or ENABLE_RTSP:
-                write_frame_to_ffmpeg(disp)
+            # Update frame for the pacer thread (writes to FFmpeg at steady fps)
+            set_pacer_frame(disp)
 
             # Display only if flag is enabled
             if SHOW_LOCAL_VIEW:
@@ -1580,6 +1607,7 @@ def main() -> None:
     finally:
         # Cleanup
         print("\nShutting down...")
+        stop_frame_pacer()
         if cap is not None:
             cap.release()
         with ffmpeg_lock:
