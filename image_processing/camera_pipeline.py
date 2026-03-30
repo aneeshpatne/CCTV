@@ -57,14 +57,13 @@ USE_DYNAMIC_FPS = False  # Use fixed output FPS for stream stability
 FIXED_OUTPUT_FPS = 9.0
 VIDEO_BITRATE_KBPS = 1500
 VIDEO_BUFSIZE_KBPS = 3000
-VIDEO_DELAY_SECONDS = float(os.getenv("CCTV_VIDEO_DELAY_SECONDS", "0.2"))
+VIDEO_DELAY_SECONDS = float(os.getenv("CCTV_VIDEO_DELAY_SECONDS", "0"))
 AUDIO_UDP_PORT = int(os.getenv("CCTV_AUDIO_UDP_PORT", "12345"))
 AUDIO_SAMPLE_RATE = int(os.getenv("CCTV_AUDIO_SAMPLE_RATE", "16000"))
 AUDIO_OUTPUT_SAMPLE_RATE = int(os.getenv("CCTV_AUDIO_OUTPUT_SAMPLE_RATE", "48000"))
 AUDIO_CHANNELS = int(os.getenv("CCTV_AUDIO_CHANNELS", "1"))
 AUDIO_BITRATE_KBPS = int(os.getenv("CCTV_AUDIO_BITRATE_KBPS", "64"))
 LIVE_AUDIO_BITRATE_KBPS = int(os.getenv("CCTV_LIVE_AUDIO_BITRATE_KBPS", "64"))
-AUDIO_GAIN_DB = float(os.getenv("CCTV_AUDIO_GAIN_DB", "18"))
 AUDIO_ENABLED = os.getenv("CCTV_AUDIO_ENABLED", "1").lower() not in {
     "0",
     "false",
@@ -409,21 +408,26 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         )
 
     if AUDIO_ENABLED:
-        audio_filter = (
-            f"[1:a]volume={AUDIO_GAIN_DB}dB,"
-            "alimiter=limit=0.95:level=disabled"
-        )
-        if AUDIO_DEBUG_LOGGING:
-            audio_filter += (
-                ",astats=metadata=1:reset=50:measure_overall=0,"
-                f"ametadata=mode=print:file={audio_stats_path}"
-            )
         if ENABLE_RECORDING and ENABLE_RTSP:
-            audio_filter += ",asplit=2[audio_record][audio_live]"
+            audio_filter = "[1:a]asplit=2[audio_record_src][audio_live_src];"
+            audio_filter += "[audio_record_src]anull[audio_record];"
+            audio_filter += "[audio_live_src]asetpts=N/SR/TB[audio_live]"
+            if AUDIO_DEBUG_LOGGING:
+                audio_filter += (
+                    ";[audio_live]astats=metadata=1:reset=50:measure_overall=0,"
+                    f"ametadata=mode=print:file={audio_stats_path}"
+                    "[audio_live]"
+                )
         elif ENABLE_RECORDING:
-            audio_filter += "[audio_record]"
+            audio_filter = "[1:a]anull[audio_record]"
         else:
-            audio_filter += "[audio_live]"
+            audio_filter = "[1:a]asetpts=N/SR/TB[audio_live]"
+            if AUDIO_DEBUG_LOGGING:
+                audio_filter += (
+                    ";[audio_live]astats=metadata=1:reset=50:measure_overall=0,"
+                    f"ametadata=mode=print:file={audio_stats_path}"
+                    "[audio_live]"
+                )
         cmd.extend(["-filter_complex", audio_filter])
 
     cmd.extend(["-map", "0:v:0"])
@@ -440,6 +444,10 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
             # Hardware encoder (Intel Quick Sync via VideoToolbox)
             "-c:v",
             "h264_videotoolbox",
+            "-realtime",
+            "true",
+            "-prio_speed",
+            "true",
             # Stable bitrate (no pulsing)
             "-b:v",
             f"{VIDEO_BITRATE_KBPS}k",
@@ -1357,8 +1365,7 @@ def main() -> None:
             f" s16le {AUDIO_SAMPLE_RATE} Hz mono on udp://0.0.0.0:{AUDIO_UDP_PORT}"
         )
         print(
-            "Audio processing:"
-            f" gain={AUDIO_GAIN_DB:.1f}dB,"
+            "Audio output:"
             f" output_rate={AUDIO_OUTPUT_SAMPLE_RATE}Hz,"
             f" activity_timeout={AUDIO_ACTIVITY_TIMEOUT_SECONDS:.0f}s"
         )
