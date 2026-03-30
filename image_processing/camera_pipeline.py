@@ -57,6 +57,27 @@ USE_DYNAMIC_FPS = False  # Use fixed output FPS for stream stability
 FIXED_OUTPUT_FPS = 9.0
 VIDEO_BITRATE_KBPS = 1500
 VIDEO_BUFSIZE_KBPS = 3000
+VIDEO_DELAY_SECONDS = float(os.getenv("CCTV_VIDEO_DELAY_SECONDS", "0.2"))
+AUDIO_UDP_PORT = int(os.getenv("CCTV_AUDIO_UDP_PORT", "12345"))
+AUDIO_SAMPLE_RATE = int(os.getenv("CCTV_AUDIO_SAMPLE_RATE", "16000"))
+AUDIO_OUTPUT_SAMPLE_RATE = int(os.getenv("CCTV_AUDIO_OUTPUT_SAMPLE_RATE", "48000"))
+AUDIO_CHANNELS = int(os.getenv("CCTV_AUDIO_CHANNELS", "1"))
+AUDIO_BITRATE_KBPS = int(os.getenv("CCTV_AUDIO_BITRATE_KBPS", "64"))
+AUDIO_GAIN_DB = float(os.getenv("CCTV_AUDIO_GAIN_DB", "18"))
+AUDIO_ENABLED = os.getenv("CCTV_AUDIO_ENABLED", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+AUDIO_DEBUG_LOGGING = os.getenv("CCTV_AUDIO_DEBUG_LOGGING", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+AUDIO_LOG_INTERVAL_SECONDS = float(os.getenv("CCTV_AUDIO_LOG_INTERVAL_SECONDS", "10"))
+AUDIO_ACTIVITY_TIMEOUT_SECONDS = float(
+    os.getenv("CCTV_AUDIO_ACTIVITY_TIMEOUT_SECONDS", "20")
+)
 
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
@@ -189,6 +210,9 @@ memory_lock = threading.Lock()
 memory_thread = None
 memory_update_interval = 10  # Update memory every 10 seconds
 
+# Audio activity monitoring state
+audio_monitor_thread = None
+
 # FPS tracking state
 fps_value = 0.0
 fps_lock = threading.Lock()
@@ -244,8 +268,7 @@ def _save_accumulated_motion_event(event: dict[str, float]) -> None:
 acc = EventAccumulator(cooldown=15, onSave=_save_accumulated_motion_event)
 
 # Recording state
-ffmpeg_record_proc: Optional[subprocess.Popen] = None
-ffmpeg_rtsp_proc: Optional[subprocess.Popen] = None
+ffmpeg_proc: Optional[subprocess.Popen] = None
 ffmpeg_lock = threading.Lock()
 expected_frame_size: Optional[tuple[int, int]] = (
     None  # (width, height) that FFmpeg expects
@@ -253,99 +276,89 @@ expected_frame_size: Optional[tuple[int, int]] = (
 current_fps: Optional[float] = None  # Active FPS used by FFmpeg
 
 
-def start_ffmpeg_record(
-    width: int, height: int, fps: float
-) -> Optional[subprocess.Popen]:
-    """Start FFmpeg process for variable frame rate CCTV recording."""
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
-    safe_fps = max(1.0, fps)
-    gop_size = max(1, int(round(safe_fps)))
-
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-hide_banner",
-        "-y",
-        # raw frames over stdin
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "bgr24",
-        "-s",
-        f"{width}x{height}",
-        "-r",
-        f"{safe_fps:.2f}",  # Match input cadence to measured FPS
-        "-use_wallclock_as_timestamps",
-        "1",
-        "-i",
-        "-",
-        "-map",
-        "0:v",
-        # videotoolbox-friendly pixel format
-        "-vf",
-        "format=nv12",
-        # hardware encoder (Intel Mac)
-        "-c:v",
-        "h264_videotoolbox",
-        # stable quality (avoid blur/clear cycling)
-        "-b:v",
-        f"{VIDEO_BITRATE_KBPS}k",
-        "-maxrate",
-        f"{VIDEO_BITRATE_KBPS}k",
-        "-bufsize",
-        f"{VIDEO_BUFSIZE_KBPS}k",
-        # GOP: ~1 second for smoother HLS segment cadence
-        "-g",
-        str(gop_size),
-        "-bf",
-        "0",
-        # segmenting
-        "-f",
-        "segment",
-        "-segment_time",
-        str(SEGMENT_SECONDS),
-        "-segment_format",
-        "mp4",
-        "-segment_format_options",
-        "movflags=+faststart",
-        "-reset_timestamps",
-        "1",
-        "-strftime",
-        "1",
-        out_pattern,
-    ]
-
-    # ---- Spawn process with logging -------------------------------------------
-    try:
-        log_path = BASE_DIR / "ffmpeg_record.log"
-        logf = open(log_path, "ab", buffering=0)
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=logf,  # keep stderr for diagnostics
-            bufsize=0,
+def _build_ffmpeg_outputs() -> list[str]:
+    outputs: list[str] = []
+    if ENABLE_RECORDING:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
+        outputs.append(
+            "[onfail=ignore:"
+            "use_fifo=1:"
+            "f=segment:"
+            f"segment_time={SEGMENT_SECONDS}:"
+            "segment_format=mp4:"
+            "segment_format_options=movflags=+faststart:"
+            "reset_timestamps=1:"
+            "strftime=1]"
+            f"{out_pattern}"
         )
-        print(f"FFmpeg VFR recording started: {out_pattern}")
-        return proc
-    except Exception as e:
-        print(f"Failed to start FFmpeg: {e}")
-        return None
+    if ENABLE_RTSP:
+        outputs.append(
+            f"[onfail=ignore:use_fifo=1:f=rtsp:rtsp_transport=tcp]{RTSP_OUT}"
+        )
+    return outputs
 
 
-def start_ffmpeg_rtsp(
-    width: int, height: int, fps: float
-) -> Optional[subprocess.Popen]:
-    """Start FFmpeg process for variable frame rate RTSP restream."""
+def start_audio_monitor() -> None:
+    """Log whether FFmpeg has seen recent audio activity."""
+    global audio_monitor_thread
+
+    if not AUDIO_ENABLED or not AUDIO_DEBUG_LOGGING:
+        return
+
+    def _audio_monitor() -> None:
+        stats_path = BASE_DIR / "ffmpeg_audio_levels.log"
+        last_state: Optional[bool] = None
+        while True:
+            active = False
+            try:
+                if stats_path.exists():
+                    age = time.time() - stats_path.stat().st_mtime
+                    active = age <= AUDIO_ACTIVITY_TIMEOUT_SECONDS
+            except Exception as e:
+                print(f"Audio monitor error: {e}")
+
+            if active != last_state:
+                if active:
+                    print("Audio monitor: recent UDP audio detected.")
+                else:
+                    print("Audio monitor: no recent UDP audio detected.")
+                last_state = active
+
+            time.sleep(AUDIO_LOG_INTERVAL_SECONDS)
+
+    if audio_monitor_thread is None or not audio_monitor_thread.is_alive():
+        audio_monitor_thread = threading.Thread(target=_audio_monitor, daemon=True)
+        audio_monitor_thread.start()
+        print(
+            "Audio monitor started"
+            f" (checks every {AUDIO_LOG_INTERVAL_SECONDS:.0f}s,"
+            f" active window {AUDIO_ACTIVITY_TIMEOUT_SECONDS:.0f}s)"
+        )
+
+
+def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Popen]:
+    """Start a single FFmpeg process that records and restreams shared A/V."""
     safe_fps = max(1.0, fps)
     gop_size = max(1, int(round(safe_fps)))
+    outputs = _build_ffmpeg_outputs()
+    if not outputs:
+        return None
+    audio_stats_path = BASE_DIR / "ffmpeg_audio_levels.log"
+    if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
+        try:
+            audio_stats_path.write_text("", encoding="utf-8")
+        except Exception as e:
+            print(f"Failed to reset audio stats log {audio_stats_path}: {e}")
+
     cmd = [
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
         "-y",
-        # Raw frames from Python
+        # Raw video frames from Python over stdin.
+        "-thread_queue_size",
+        "512",
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -354,40 +367,104 @@ def start_ffmpeg_rtsp(
         f"{width}x{height}",
         "-r",
         f"{safe_fps:.2f}",  # Match input cadence to measured FPS
-        "-use_wallclock_as_timestamps",
-        "1",
         "-i",
         "-",
-        "-map",
-        "0:v",
-        # Convert to videotoolbox-friendly format
-        "-vf",
-        "format=nv12",
-        # Hardware encoder (Intel Quick Sync via VideoToolbox)
-        "-c:v",
-        "h264_videotoolbox",
-        # Stable bitrate (no pulsing)
-        "-b:v",
-        f"{VIDEO_BITRATE_KBPS}k",
-        "-maxrate",
-        f"{VIDEO_BITRATE_KBPS}k",
-        "-bufsize",
-        f"{VIDEO_BUFSIZE_KBPS}k",
-        # GOP / latency
-        "-g",
-        str(gop_size),  # ~1 second of frames
-        "-bf",
-        "0",
-        # RTSP output
-        "-rtsp_transport",
-        "tcp",
-        "-f",
-        "rtsp",
-        RTSP_OUT,
     ]
 
+    if AUDIO_ENABLED:
+        audio_input_url = (
+            f"udp://0.0.0.0:{AUDIO_UDP_PORT}"
+            "?listen=1&fifo_size=5000000&overrun_nonfatal=1&timeout=0"
+        )
+        cmd.extend(
+            [
+                # Raw UDP PCM from ESP32 microphone.
+                "-thread_queue_size",
+                "8192",
+                "-f",
+                "s16le",
+                "-ar",
+                str(AUDIO_SAMPLE_RATE),
+                "-ac",
+                str(AUDIO_CHANNELS),
+                "-use_wallclock_as_timestamps",
+                "1",
+                "-i",
+                audio_input_url,
+            ]
+        )
+
+    if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
+        cmd.extend(
+            [
+                "-filter_complex",
+                f"[1:a]aresample=async=1:first_pts=0,volume={AUDIO_GAIN_DB}dB,"
+                "alimiter=limit=0.95:level=disabled,"
+                "astats=metadata=1:reset=50:measure_overall=0,"
+                f"ametadata=mode=print:file={audio_stats_path}"
+                "[audio_out]",
+            ]
+        )
+
+    cmd.extend(["-map", "0:v:0"])
+    if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
+        cmd.extend(["-map", "[audio_out]"])
+    elif AUDIO_ENABLED:
+        cmd.extend(["-map", "1:a:0?"])
+
+    cmd.extend(
+        [
+            # Convert to videotoolbox-friendly format
+            "-vf",
+            f"setpts=PTS+{VIDEO_DELAY_SECONDS}/TB,format=nv12",
+            # Hardware encoder (Intel Quick Sync via VideoToolbox)
+            "-c:v",
+            "h264_videotoolbox",
+            # Stable bitrate (no pulsing)
+            "-b:v",
+            f"{VIDEO_BITRATE_KBPS}k",
+            "-maxrate",
+            f"{VIDEO_BITRATE_KBPS}k",
+            "-bufsize",
+            f"{VIDEO_BUFSIZE_KBPS}k",
+            # GOP / latency
+            "-g",
+            str(gop_size),  # ~1 second of frames
+            "-bf",
+            "0",
+        ]
+    )
+
+    if AUDIO_ENABLED:
+        cmd.extend(
+            [
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{AUDIO_BITRATE_KBPS}k",
+                "-ar",
+                str(AUDIO_OUTPUT_SAMPLE_RATE),
+                "-ac",
+                str(AUDIO_CHANNELS),
+                "-af",
+                f"aresample=async=1000:min_hard_comp=0.1:first_pts=0,"
+                f"volume={AUDIO_GAIN_DB}dB,"
+                "alimiter=limit=0.95:level=disabled",
+            ]
+        )
+
+    cmd.extend(
+        [
+            "-max_muxing_queue_size",
+            "9999",
+            "-f",
+            "tee",
+            "|".join(outputs),
+        ]
+    )
+
     try:
-        log_path = BASE_DIR / "ffmpeg_rtsp.log"
+        log_path = BASE_DIR / "ffmpeg_pipeline.log"
         logf = open(log_path, "ab", buffering=0)
         proc = subprocess.Popen(
             cmd,
@@ -396,10 +473,15 @@ def start_ffmpeg_rtsp(
             stderr=logf,
             bufsize=0,
         )
-        print(f"FFmpeg VFR RTSP started: {RTSP_OUT}")
+        print(
+            "FFmpeg A/V pipeline started:"
+            f" video={width}x{height}@{safe_fps:.2f}fps,"
+            f" audio_udp={'enabled' if AUDIO_ENABLED else 'disabled'}"
+            f" on port {AUDIO_UDP_PORT if AUDIO_ENABLED else 'n/a'}"
+        )
         return proc
     except Exception as e:
-        print(f"Failed to start FFmpeg RTSP: {e}")
+        print(f"Failed to start FFmpeg pipeline: {e}")
         return None
 
 
@@ -411,7 +493,7 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
         if proc.stdin:
             proc.stdin.close()
         proc.wait(timeout=3)
-        print("FFmpeg recording stopped")
+        print("FFmpeg pipeline stopped")
     except Exception as e:
         print(f"Error stopping FFmpeg: {e}")
         try:
@@ -421,8 +503,8 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
 
 
 def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
-    """Push a frame into the recording/RTSP FFmpeg pipelines, restarting them when needed."""
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
+    """Push a frame into the FFmpeg A/V pipeline, restarting it when needed."""
+    global ffmpeg_proc, expected_frame_size, current_fps
 
     if not ENABLE_RECORDING and not ENABLE_RTSP:
         return True
@@ -442,7 +524,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             if abs(measured_fps - current_fps) > 1.0:
                 fps_changed = True
                 print(
-                    f"FPS changed from {current_fps:.2f} to {measured_fps:.2f}; restarting FFmpeg pipelines."
+                    f"FPS changed from {current_fps:.2f} to {measured_fps:.2f}; restarting FFmpeg pipeline."
                 )
 
         # Track the canonical size expected by the encoders
@@ -453,14 +535,11 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             if new_size != expected_frame_size:
                 print(
                     f"Frame size changed from {expected_frame_size[0]}x{expected_frame_size[1]} to {w}x{h}; "
-                    "restarting FFmpeg pipelines."
+                    "restarting FFmpeg pipeline."
                 )
-            if ffmpeg_record_proc is not None:
-                stop_ffmpeg(ffmpeg_record_proc)
-                ffmpeg_record_proc = None
-            if ffmpeg_rtsp_proc is not None:
-                stop_ffmpeg(ffmpeg_rtsp_proc)
-                ffmpeg_rtsp_proc = None
+            if ffmpeg_proc is not None:
+                stop_ffmpeg(ffmpeg_proc)
+                ffmpeg_proc = None
             expected_frame_size = new_size
             current_fps = measured_fps if USE_DYNAMIC_FPS else FIXED_OUTPUT_FPS
 
@@ -470,29 +549,13 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         else:
             target_fps = FIXED_OUTPUT_FPS
 
-        # Ensure recording process is alive when recording enabled
-        if ENABLE_RECORDING:
-            if ffmpeg_record_proc is not None and ffmpeg_record_proc.poll() is not None:
-                exit_code = ffmpeg_record_proc.poll()
-                print(f"Recording FFmpeg exited (code {exit_code}); restarting...")
-                stop_ffmpeg(ffmpeg_record_proc)
-                ffmpeg_record_proc = None
-            if ffmpeg_record_proc is None:
-                ffmpeg_record_proc = start_ffmpeg_record(
-                    target_width, target_height, target_fps
-                )
-
-        # Ensure RTSP process is alive when enabled
-        if ENABLE_RTSP:
-            if ffmpeg_rtsp_proc is not None and ffmpeg_rtsp_proc.poll() is not None:
-                exit_code = ffmpeg_rtsp_proc.poll()
-                print(f"RTSP FFmpeg exited (code {exit_code}); restarting...")
-                stop_ffmpeg(ffmpeg_rtsp_proc)
-                ffmpeg_rtsp_proc = None
-            if ffmpeg_rtsp_proc is None:
-                ffmpeg_rtsp_proc = start_ffmpeg_rtsp(
-                    target_width, target_height, target_fps
-                )
+        if ffmpeg_proc is not None and ffmpeg_proc.poll() is not None:
+            exit_code = ffmpeg_proc.poll()
+            print(f"FFmpeg pipeline exited (code {exit_code}); restarting...")
+            stop_ffmpeg(ffmpeg_proc)
+            ffmpeg_proc = None
+        if ffmpeg_proc is None:
+            ffmpeg_proc = start_ffmpeg(target_width, target_height, target_fps)
 
         # If the current frame size differs from the expected size, resize once for both outputs
         if (w, h) != expected_frame_size:
@@ -500,26 +563,19 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
 
         frame_bytes = frame.tobytes()
 
-        def _write(
-            proc: Optional[subprocess.Popen], label: str, starter
-        ) -> Optional[subprocess.Popen]:
+        def _write(proc: Optional[subprocess.Popen]) -> Optional[subprocess.Popen]:
             if proc is None:
                 return None
             try:
                 if proc.stdin:
                     proc.stdin.write(frame_bytes)
             except (BrokenPipeError, IOError) as err:
-                print(f"FFmpeg {label} pipe error ({err}); restarting...")
+                print(f"FFmpeg pipe error ({err}); restarting...")
                 stop_ffmpeg(proc)
-                return starter(target_width, target_height, target_fps)
+                return start_ffmpeg(target_width, target_height, target_fps)
             return proc
 
-        if ENABLE_RECORDING:
-            ffmpeg_record_proc = _write(
-                ffmpeg_record_proc, "recording", start_ffmpeg_record
-            )
-        if ENABLE_RTSP:
-            ffmpeg_rtsp_proc = _write(ffmpeg_rtsp_proc, "rtsp", start_ffmpeg_rtsp)
+        ffmpeg_proc = _write(ffmpeg_proc)
 
         return True
 
@@ -1170,7 +1226,7 @@ def record_no_signal_frame(message: str) -> None:
     """Show (if requested) and record a no-signal frame sized for the encoder."""
     display_frame = show_no_signal_frame(message)
 
-    if not ENABLE_RECORDING:
+    if not ENABLE_RECORDING and not ENABLE_RTSP:
         return
 
     if expected_frame_size:
@@ -1231,7 +1287,7 @@ def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
 
 
 def main() -> None:
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
+    global ffmpeg_proc, expected_frame_size, current_fps, camera_adjustments_done
     attempt = 0
     cap = None
 
@@ -1262,6 +1318,21 @@ def main() -> None:
             print(
                 f"Segment duration: {SEGMENT_SECONDS}s, FPS: {FIXED_OUTPUT_FPS:.0f} (fixed)"
             )
+    if ENABLE_RTSP:
+        print(f"RTSP enabled: {RTSP_OUT}")
+    if AUDIO_ENABLED:
+        print(
+            "UDP audio enabled:"
+            f" s16le {AUDIO_SAMPLE_RATE} Hz mono on udp://0.0.0.0:{AUDIO_UDP_PORT}"
+        )
+        print(
+            "Audio processing:"
+            f" gain={AUDIO_GAIN_DB:.1f}dB,"
+            f" output_rate={AUDIO_OUTPUT_SAMPLE_RATE}Hz,"
+            f" activity_timeout={AUDIO_ACTIVITY_TIMEOUT_SECONDS:.0f}s"
+        )
+        print(f"Video delay: {VIDEO_DELAY_SECONDS:.3f}s")
+        print(f"Audio debug logging: {'enabled' if AUDIO_DEBUG_LOGGING else 'disabled'}")
     if not SHOW_LOCAL_VIEW:
         print("Local view disabled - running in headless mode")
         print("Press Ctrl+C to stop")
@@ -1270,6 +1341,8 @@ def main() -> None:
     start_rssi_monitor()
     if SHOW_MEMORY_BADGE:
         start_memory_monitor()
+    if AUDIO_ENABLED and AUDIO_DEBUG_LOGGING:
+        start_audio_monitor()
     show_placeholder("STARTUP: Initializing camera...")
     cv2.waitKey(1)
 
@@ -1439,7 +1512,7 @@ def main() -> None:
                 )
 
             # Record frame with overlay (IN-PLACE recording with motion detection)
-            if ENABLE_RECORDING:
+            if ENABLE_RECORDING or ENABLE_RTSP:
                 write_frame_to_ffmpeg(disp)
 
             # Display only if flag is enabled
@@ -1453,12 +1526,9 @@ def main() -> None:
         if cap is not None:
             cap.release()
         with ffmpeg_lock:
-            if ffmpeg_record_proc is not None:
-                stop_ffmpeg(ffmpeg_record_proc)
-                ffmpeg_record_proc = None
-            if ffmpeg_rtsp_proc is not None:
-                stop_ffmpeg(ffmpeg_rtsp_proc)
-                ffmpeg_rtsp_proc = None
+            if ffmpeg_proc is not None:
+                stop_ffmpeg(ffmpeg_proc)
+                ffmpeg_proc = None
             expected_frame_size = None
         cv2.destroyAllWindows()
         print("Cleanup complete.")

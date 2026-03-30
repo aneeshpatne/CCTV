@@ -6,7 +6,7 @@ A self-hosted CCTV automation stack for ESP32-CAM devices. It captures the camer
 
 - Continuous ESP32-CAM management with automatic reboot, quality ramp-up, and clock sync via `utilities/startup.py`.
 - Real-time computer vision pipeline (`Image Processing/camera_pipeline.py`) with motion detection inside a configurable ROI, overlays for timestamp/RSSI/FPS/memory, and LED signalling.
-- Dual FFmpeg pipelines for segmented recordings and low-latency RTSP restreaming, including disk-usage watchdog and pruning (`Image Processing/pipeline_orchestrator.py`).
+- Single FFmpeg A/V pipeline for segmented recordings, plus low-latency RTSP video restreaming and optional UDP PCM audio ingest, with disk-usage watchdog and pruning (`Image Processing/pipeline_orchestrator.py`).
 - Motion-event persistence in SQLite via SQLAlchemy (`utilities/motion_db.py`) powering a FastAPI service at `server/server.py` for searching, merging, and streaming footage.
 - Nightly automation (`motion/motion.py`) that fetches motion windows, downloads footage, GPU-compresses clips, and pushes concise Telegram summaries.
 - Operator tooling for camera controls, LED brightness, stream health, RSSI checks, and Telegram broadcasting under `tools/` and `telegram/`.
@@ -26,8 +26,8 @@ run_motion.sh       Helper script for cron-style execution of the nightly job
 ## Architecture Overview
 
 ```
-ESP32-CAM MJPEG → camera_pipeline.py → FFmpeg ─┬─ segmented MP4 recordings (/media/.../esp_cam1)
-                                               └─ RTSP restream (rtsp://127.0.0.1:8554/esp_cam1_overlay)
+ESP32-CAM MJPEG + ESP32 UDP PCM audio → camera_pipeline.py → FFmpeg ─┬─ segmented MP4 recordings (/media/.../esp_cam1)
+                                                                     └─ RTSP restream (rtsp://127.0.0.1:8554/esp_cam1_overlay)
                                                      │
                                                      ├─ Storage monitor trims oldest footage when full
                                                      ├─ SQLite motion log (utilities/motion_db.py)
@@ -71,6 +71,16 @@ pip install -r requirements.txt
 
 ```
 BOT_TOKEN=your_telegram_bot_token
+CCTV_AUDIO_ENABLED=1
+CCTV_VIDEO_DELAY_SECONDS=0.2
+CCTV_AUDIO_UDP_PORT=12345
+CCTV_AUDIO_SAMPLE_RATE=16000
+CCTV_AUDIO_OUTPUT_SAMPLE_RATE=48000
+CCTV_AUDIO_CHANNELS=1
+CCTV_AUDIO_GAIN_DB=18
+CCTV_AUDIO_DEBUG_LOGGING=0
+CCTV_AUDIO_LOG_INTERVAL_SECONDS=10
+CCTV_AUDIO_ACTIVITY_TIMEOUT_SECONDS=20
 ```
 
 4. **Telegram whitelist** – `motion/whitelist.json` and `telegram/whitelist.json` hold user IDs. Populate them manually or run `python telegram/message.py` and issue `/start` from Telegram to register IDs.
