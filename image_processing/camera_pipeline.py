@@ -400,7 +400,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
         cmd.extend(
             [
                 "-filter_complex",
-                f"[1:a]aresample=async=1:first_pts=0,volume={AUDIO_GAIN_DB}dB,"
+                f"[1:a]volume={AUDIO_GAIN_DB}dB,"
                 "alimiter=limit=0.95:level=disabled,"
                 "astats=metadata=1:reset=50:measure_overall=0,"
                 f"ametadata=mode=print:file={audio_stats_path}"
@@ -453,7 +453,6 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
             audio_codec_args.extend(
                 [
                     "-af",
-                    f"aresample=async=1:first_pts=0,"
                     f"volume={AUDIO_GAIN_DB}dB,"
                     "alimiter=limit=0.95:level=disabled",
                 ]
