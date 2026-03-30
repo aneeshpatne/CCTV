@@ -282,9 +282,9 @@ def _build_ffmpeg_outputs() -> list[str]:
     if ENABLE_RECORDING:
         BASE_DIR.mkdir(parents=True, exist_ok=True)
         out_pattern = BASE_DIR / "recording_%Y%m%d_%H%M%S.mp4"
-        recording_select = ":select='v:0"
+        recording_select = "select='v\\:0"
         if AUDIO_ENABLED:
-            recording_select += ",a:0"
+            recording_select += ",a\\:0"
         recording_select += "'"
         outputs.append(
             "[onfail=ignore:"
@@ -299,10 +299,10 @@ def _build_ffmpeg_outputs() -> list[str]:
             f"{out_pattern}"
         )
     if ENABLE_RTSP:
-        rtsp_select = ":select='v:0"
+        rtsp_select = "select='v\\:0"
         if AUDIO_ENABLED:
             live_audio_index = 1 if ENABLE_RECORDING else 0
-            rtsp_select += f",a:{live_audio_index}"
+            rtsp_select += f",a\\:{live_audio_index}"
         rtsp_select += "'"
         outputs.append(
             "[onfail=ignore:"
