@@ -396,7 +396,7 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
     if AUDIO_ENABLED:
         audio_input_url = (
             f"udp://0.0.0.0:{AUDIO_UDP_PORT}"
-            "?listen=1&fifo_size=8192&overrun_nonfatal=1&timeout=0"
+            "?listen=1&fifo_size=8192&overrun_nonfatal=1&timeout=5000000"
         )
         cmd.extend(
             [
@@ -447,9 +447,9 @@ def start_ffmpeg(width: int, height: int, fps: float) -> Optional[subprocess.Pop
 
     cmd.extend(["-map", "0:v:0"])
     if AUDIO_ENABLED and ENABLE_RECORDING:
-        cmd.extend(["-map", "[audio_record]"])
+        cmd.extend(["-map", "[audio_record]?"])
     if AUDIO_ENABLED and ENABLE_RTSP:
-        cmd.extend(["-map", "[audio_live]"])
+        cmd.extend(["-map", "[audio_live]?"])
 
     cmd.extend(
         [
