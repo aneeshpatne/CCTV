@@ -585,16 +585,20 @@ def apply_camera_adjustments() -> None:
 
             time.sleep(2)
 
-            # Set auto exposure level
-            try:
-                print("Setting auto exposure level (ae_level=2)")
-                resp = requests.get(
-                    "http://192.168.0.13/control?var=ae_level&val=2", timeout=2
-                )
-                if resp.status_code == 200:
-                    print("AE level set successfully")
-            except Exception as e:
-                print(f"Setting AE level failed: {e}")
+            current_hour_ist = datetime.now(IST).hour
+            if not (12 <= current_hour_ist < 18):
+                # Set auto exposure level only outside the afternoon window in IST
+                try:
+                    print("Setting auto exposure level (ae_level=2)")
+                    resp = requests.get(
+                        "http://192.168.0.13/control?var=ae_level&val=2", timeout=2
+                    )
+                    if resp.status_code == 200:
+                        print("AE level set successfully")
+                except Exception as e:
+                    print(f"Setting AE level failed: {e}")
+            else:
+                print("Skipping AE level change during 12pm-6pm IST window")
 
             time.sleep(2)
 
