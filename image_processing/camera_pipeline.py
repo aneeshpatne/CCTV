@@ -22,6 +22,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytz
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
@@ -62,6 +66,17 @@ VIDEO_BUFSIZE_KBPS = 3000
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
 SHOW_LOCAL_VIEW = False  # Show CV2 preview windows
 SHOW_MEMORY_BADGE = True  # Show ESP32 memory usage badge
+PROJECT_LEXEND_FONT = REPO_ROOT / "font" / "Lexend-VariableFont_wght.ttf"
+PROJECT_ROBOTO_FONT = REPO_ROOT / "assets" / "fonts" / "Roboto-Regular.ttf"
+DEFAULT_HUD_FONT_PATH = next(
+    (
+        font_path
+        for font_path in (PROJECT_LEXEND_FONT, PROJECT_ROBOTO_FONT, Path("/System/Library/Fonts/SFNS.ttf"))
+        if font_path.exists()
+    ),
+    Path("/System/Library/Fonts/SFNS.ttf"),
+)
+HUD_FONT_PATH = os.getenv("CCTV_HUD_FONT", str(DEFAULT_HUD_FONT_PATH))
 
 # Motion detection configuration
 MIN_AREA = 800
@@ -714,31 +729,56 @@ def draw_box(
     y,
     w,
     h,
-    bg_color=(15, 15, 15),
-    alpha=0.6,
+    bg_color=(245, 247, 250),
+    alpha=0.88,
     border_color=None,
     accent_color=None,
 ):
-    """Draw a modern rounded pill/rectangle HUD panel."""
+    """Draw a minimal Material-style HUD chip."""
     x2 = x + w
     y2 = y + h
-    radius = 8  # Smooth 8px rounded corners
-    
+    radius = min(12, max(4, h // 2))
+
+    if x >= frame.shape[1] or y >= frame.shape[0] or x2 <= 0 or y2 <= 0:
+        return
+
+    x = max(0, x)
+    y = max(0, y)
+    x2 = min(frame.shape[1] - 1, x2)
+    y2 = min(frame.shape[0] - 1, y2)
+    w = x2 - x
+    h = y2 - y
+    radius = min(radius, max(2, w // 2), max(2, h // 2))
+
+    shadow = frame.copy()
+    shadow_y = min(frame.shape[0] - 1, y + 2)
+    shadow_y2 = min(frame.shape[0] - 1, y2 + 2)
+    cv2.rectangle(shadow, (x + radius, shadow_y), (x2 - radius, shadow_y2), (0, 0, 0), -1)
+    cv2.rectangle(shadow, (x, shadow_y + radius), (x2, shadow_y2 - radius), (0, 0, 0), -1)
+    cv2.circle(shadow, (x + radius, shadow_y + radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(shadow, (x2 - radius, shadow_y + radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(shadow, (x + radius, shadow_y2 - radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(shadow, (x2 - radius, shadow_y2 - radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
+    cv2.addWeighted(shadow, 0.12, frame, 0.88, 0, frame)
+
     overlay = frame.copy()
-    
-    # Construct a perfect filled rounded rectangle
     cv2.rectangle(overlay, (x + radius, y), (x2 - radius, y2), bg_color, -1)
-    cv2.rectangle(overlay, (x, y + radius), (x + radius, y2 - radius), bg_color, -1)
-    cv2.rectangle(overlay, (x2 - radius, y + radius), (x2, y2 - radius), bg_color, -1)
-    
-    # Anti-aliased corner circles
+    cv2.rectangle(overlay, (x, y + radius), (x2, y2 - radius), bg_color, -1)
     cv2.circle(overlay, (x + radius, y + radius), radius, bg_color, -1, cv2.LINE_AA)
     cv2.circle(overlay, (x2 - radius, y + radius), radius, bg_color, -1, cv2.LINE_AA)
     cv2.circle(overlay, (x + radius, y2 - radius), radius, bg_color, -1, cv2.LINE_AA)
     cv2.circle(overlay, (x2 - radius, y2 - radius), radius, bg_color, -1, cv2.LINE_AA)
-    
-    # Blend exactly where we drew to optimize performance and look clean
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    if accent_color is not None:
+        cv2.circle(
+            frame,
+            (x + radius + 4, y + h // 2),
+            4,
+            accent_color,
+            -1,
+            cv2.LINE_AA,
+        )
 
 
 def draw_wifi_icon(frame, x, y, size, rssi, color):
@@ -763,7 +803,7 @@ def draw_wifi_icon(frame, x, y, size, rssi, color):
             bars = 1
 
     # Draw background (dim) arcs
-    grey = (72, 76, 82)
+    grey = (178, 188, 196)
 
     for i in range(1, 4):
         r = i * radius_step
@@ -786,6 +826,66 @@ def get_status_color(value, thresholds, colors):
     return colors[-1]
 
 
+HUD_FONT_CACHE: dict[int, Optional[object]] = {}
+
+
+def get_hud_font(size: int) -> Optional[object]:
+    if ImageFont is None:
+        return None
+    if size not in HUD_FONT_CACHE:
+        try:
+            HUD_FONT_CACHE[size] = ImageFont.truetype(HUD_FONT_PATH, size)
+        except OSError:
+            HUD_FONT_CACHE[size] = None
+    return HUD_FONT_CACHE[size]
+
+
+def get_hud_text_size(text: str, font_size: int, fallback_font, fallback_scale: float, thickness: int) -> tuple[int, int]:
+    hud_font = get_hud_font(font_size)
+    if hud_font is None:
+        (tw, th), _ = cv2.getTextSize(text, fallback_font, fallback_scale, thickness)
+        return tw, th
+
+    bbox = hud_font.getbbox(text)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def put_hud_text(
+    frame: np.ndarray,
+    text: str,
+    x: int,
+    center_y: int,
+    color: tuple[int, int, int],
+    font_size: int,
+    fallback_font,
+    fallback_scale: float,
+    thickness: int,
+) -> None:
+    hud_font = get_hud_font(font_size)
+    if hud_font is None or Image is None or ImageDraw is None:
+        (_, th), _ = cv2.getTextSize(text, fallback_font, fallback_scale, thickness)
+        cv2.putText(
+            frame,
+            text,
+            (x, center_y + th // 2),
+            fallback_font,
+            fallback_scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+        return
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    image = Image.fromarray(rgb_frame)
+    draw = ImageDraw.Draw(image)
+    bbox = draw.textbbox((0, 0), text, font=hud_font)
+    text_h = bbox[3] - bbox[1]
+    y = int(center_y - text_h / 2 - bbox[1])
+    draw.text((x, y), text, font=hud_font, fill=(color[2], color[1], color[0]))
+    frame[:] = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+
 def draw_hud(
     frame: np.ndarray,
     fps: float,
@@ -795,31 +895,32 @@ def draw_hud(
     show_time: bool = True,
     coordinates: list = [0, 0],
 ):
-    """Draws the Head-Up Display with separated floating boxes."""
+    """Draws a minimal Material-style HUD with pastel status chips."""
     x, y = coordinates
-    h, w = frame.shape[:2]
-    # Configuration
-    top_margin = 15
+    _, w = frame.shape[:2]
+
+    top_margin = 16
     box_h = 36
-    pad_x = 12
-    gap = 10
+    pad_x = 14
+    gap = 8
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    font_color = (250, 252, 255)  # Crisp ice-white
+    font_size = 15
+    font_scale = 0.46
+    font_color = (232, 234, 237)
+    muted_color = (169, 174, 184)
     thickness = 1
-    panel_color = (15, 15, 15)    # Solid deep dark base
-    panel_border = None
-    neutral_accent = None
-    danger_panel = (20, 20, 180)  # Smooth dark warning red
-    danger_border = None
-    danger_accent = None
-    # --- 1. Timestamp (Top Left) ---
-    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-    (tw, th), baseline = cv2.getTextSize(ts, font, font_scale, thickness)
-    ts_box_w = tw + (pad_x * 2)
+    panel_color = (35, 38, 43)
+    panel_border = (67, 72, 80)
+    time_accent = (160, 196, 255)
+    motion_panel = (54, 48, 64)
+    motion_accent = (203, 182, 255)
 
-    text_y = top_margin + (box_h + th) // 2 - 3
+    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    tw, th = get_hud_text_size(ts, font_size, font, font_scale, thickness)
+    ts_box_w = tw + (pad_x * 2) + 16
+
+    text_center_y = top_margin + box_h // 2
     overlap_pad = 4
 
     def overlaps_box(box_x: int, box_y: int, box_w: int, box_h: int) -> bool:
@@ -845,24 +946,24 @@ def draw_hud(
             box_h,
             bg_color=panel_color,
             border_color=panel_border,
-            accent_color=neutral_accent,
+            accent_color=time_accent,
         )
-        cv2.putText(
+        put_hud_text(
             frame,
             ts,
-            (gap + pad_x, text_y),
+            gap + pad_x + 14,
+            text_center_y,
+            font_color,
+            font_size,
             font,
             font_scale,
-            font_color,
             thickness,
-            cv2.LINE_AA,
         )
 
-    # --- 2. Motion Warning (Next to Timestamp) ---
     if motion_detected:
-        warn_text = "MOTION DETECTED"
-        (tw, th), _ = cv2.getTextSize(warn_text, font, font_scale, thickness)
-        warn_box_w = tw + (pad_x * 2) + 12
+        warn_text = "Motion"
+        tw, th = get_hud_text_size(warn_text, font_size, font, font_scale, thickness)
+        warn_box_w = tw + (pad_x * 2) + 18
         warn_x = gap + ts_box_w + gap
         if should_draw("motion_warn", warn_x, top_margin, warn_box_w, box_h):
             draw_box(
@@ -871,153 +972,130 @@ def draw_hud(
                 top_margin,
                 warn_box_w,
                 box_h,
-                bg_color=danger_panel,
-                alpha=0.84,
-                border_color=danger_border,
-                accent_color=danger_accent,
+                bg_color=motion_panel,
+                alpha=0.9,
+                border_color=(91, 81, 112),
+                accent_color=motion_accent,
             )
-            cv2.circle(
-                frame,
-                (warn_x + pad_x + 4, top_margin + box_h // 2),
-                3,
-                danger_accent,
-                -1,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
+            put_hud_text(
                 frame,
                 warn_text,
-                (warn_x + pad_x + 12, text_y),
+                warn_x + pad_x + 14,
+                text_center_y,
+                (231, 222, 255),
+                font_size,
                 font,
                 font_scale,
-                (255, 255, 255),
                 thickness,
-                cv2.LINE_AA,
             )
 
-    # --- 3. Status Widgets (Top Right - Flowing Left) ---
     cursor_x = w - gap
 
-    # -- WiFi Box --
     wifi_text = f"{rssi}dBm" if rssi is not None else "--dBm"
-    (tw, th), _ = cv2.getTextSize(wifi_text, font, font_scale, thickness)
+    tw, th = get_hud_text_size(wifi_text, font_size, font, font_scale, thickness)
 
-    icon_size = 20
+    icon_size = 18
     icon_pad = 8
-    wifi_box_w = tw + icon_size + icon_pad + (pad_x * 2)
+    wifi_box_w = tw + icon_size + icon_pad + (pad_x * 2) + 2
 
     cursor_x -= wifi_box_w
     if should_draw("wifi", cursor_x, top_margin, wifi_box_w, box_h):
+        wifi_color = get_status_color(
+            rssi,
+            [-60, -70, -80],
+            [(166, 215, 181), (128, 203, 255), (174, 198, 255), (244, 184, 190)],
+        )
         draw_box(
             frame,
             cursor_x,
             top_margin,
             wifi_box_w,
             box_h,
-            bg_color=panel_color,
+            bg_color=(30, 47, 42),
             border_color=panel_border,
-            accent_color=(93, 156, 255),
+            accent_color=None,
         )
 
-        # Draw content
-        wifi_color = get_status_color(
-            rssi,
-            [-60, -70, -80],
-            [(129, 224, 139), (114, 214, 255), (74, 167, 255), (82, 88, 245)],
-        )
-
-        # Icon
         icon_x = cursor_x + pad_x
-        draw_wifi_icon(frame, icon_x, top_margin + 6, icon_size, rssi, wifi_color)
+        draw_wifi_icon(frame, icon_x, top_margin + 7, icon_size, rssi, wifi_color)
 
-        # Text
-        cv2.putText(
+        put_hud_text(
             frame,
             wifi_text,
-            (icon_x + icon_size + icon_pad, text_y),
+            icon_x + icon_size + icon_pad,
+            text_center_y,
+            font_color if rssi is not None else muted_color,
+            font_size,
             font,
             font_scale,
-            font_color,
             thickness,
-            cv2.LINE_AA,
         )
 
     cursor_x -= gap
 
-    # -- FPS Box --
     fps_val = int(fps)
     fps_str = f"{fps_val} fps"
-    (tw, th), _ = cv2.getTextSize(fps_str, font, font_scale, thickness)
+    tw, th = get_hud_text_size(fps_str, font_size, font, font_scale, thickness)
 
-    fps_box_w = tw + (pad_x * 2) + 6  # +6 for dot space
+    fps_box_w = tw + (pad_x * 2) + 18
     cursor_x -= fps_box_w
     if should_draw("fps", cursor_x, top_margin, fps_box_w, box_h):
+        fps_color = get_status_color(
+            fps, [7, 5], [(166, 215, 181), (255, 213, 154), (244, 184, 190)]
+        )
         draw_box(
             frame,
             cursor_x,
             top_margin,
             fps_box_w,
             box_h,
-            bg_color=panel_color,
+            bg_color=(42, 39, 58),
             border_color=panel_border,
-            accent_color=(118, 136, 255),
+            accent_color=fps_color,
         )
 
-        # Color logic: >= 7 Green, >= 5 Yellow, else Red
-        fps_color = get_status_color(
-            fps, [7, 5], [(129, 224, 139), (114, 214, 255), (82, 88, 245)]
-        )
-
-        # Dot
         dot_x = cursor_x + pad_x
-        dot_y = top_margin + box_h // 2
-        cv2.circle(frame, (dot_x + 2, dot_y), 3, fps_color, -1)
-
-        # Text
-        cv2.putText(
+        put_hud_text(
             frame,
             fps_str,
-            (dot_x + 10, text_y),
+            dot_x + 14,
+            text_center_y,
+            font_color,
+            font_size,
             font,
             font_scale,
-            font_color,
             thickness,
-            cv2.LINE_AA,
         )
 
     cursor_x -= gap
 
-    # -- Memory Box (if enabled) --
     if SHOW_MEMORY_BADGE:
         mem_val = f"{int(mem_pct)}%" if mem_pct is not None else "--%"
-        (tw, th), _ = cv2.getTextSize(mem_val, font, font_scale, thickness)
+        tw, th = get_hud_text_size(mem_val, font_size, font, font_scale, thickness)
 
-        icon_w = 12
+        icon_w = 13
         icon_pad = 6
-        mem_box_w = tw + icon_w + icon_pad + (pad_x * 2)
+        mem_box_w = tw + icon_w + icon_pad + (pad_x * 2) + 2
 
         cursor_x -= mem_box_w
         if should_draw("memory", cursor_x, top_margin, mem_box_w, box_h):
+            mem_color = get_status_color(
+                mem_pct, [20, 10], [(128, 203, 255), (255, 213, 154), (244, 184, 190)]
+            )
             draw_box(
                 frame,
                 cursor_x,
                 top_margin,
                 mem_box_w,
                 box_h,
-                bg_color=panel_color,
+                bg_color=(31, 45, 55),
                 border_color=panel_border,
-                accent_color=(160, 168, 180),
+                accent_color=None,
             )
 
-            mem_color = get_status_color(
-                mem_pct, [20, 10], [(220, 224, 230), (114, 214, 255), (82, 88, 245)]
-            )
-
-            # Icon (Simple Chip)
             ic_x = cursor_x + pad_x
             ic_y = top_margin + 10
-            cv2.rectangle(frame, (ic_x, ic_y), (ic_x + icon_w, ic_y + 14), mem_color, 1)
-            # Pins
+            cv2.rectangle(frame, (ic_x, ic_y), (ic_x + icon_w, ic_y + 14), mem_color, 1, cv2.LINE_AA)
             cv2.line(
                 frame, (ic_x + 2, ic_y + 3), (ic_x + icon_w - 2, ic_y + 3), mem_color, 1
             )
@@ -1029,16 +1107,16 @@ def draw_hud(
                 1,
             )
 
-            # Text
-            cv2.putText(
+            put_hud_text(
                 frame,
                 mem_val,
-                (ic_x + icon_w + icon_pad, text_y),
+                ic_x + icon_w + icon_pad,
+                text_center_y,
+                font_color if mem_pct is not None else muted_color,
+                font_size,
                 font,
                 font_scale,
-                font_color,
                 thickness,
-                cv2.LINE_AA,
             )
 
         cursor_x -= gap
