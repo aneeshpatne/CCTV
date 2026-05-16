@@ -162,12 +162,162 @@ def cleanup_old_merged_videos():
     temp_folder = Path(TEMP_FOLDER)
     current_time = datetime.now().timestamp()
 
-    for file in temp_folder.glob("merged_*.mp4"):
-        if current_time - file.stat().st_mtime > 3600:  # 1 hour
-            try:
-                file.unlink()
-            except:
-                pass
+    for pattern in ("merged_*.mp4", "event_*.mp4"):
+        for file in temp_folder.glob(pattern):
+            if current_time - file.stat().st_mtime > 3600:  # 1 hour
+                try:
+                    file.unlink()
+                except:
+                    pass
+
+
+def get_sorted_recordings() -> list[tuple[datetime, Path]]:
+    """Return recordings sorted by timestamp parsed from recording_YYYYMMDD_HHMMSS.mp4."""
+    folder = Path(CCTV_FOLDER)
+    recordings = []
+
+    for file in folder.glob("recording_*.mp4"):
+        try:
+            ts = file.stem.replace("recording_", "")
+            file_dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+            recordings.append((file_dt, file))
+        except ValueError:
+            continue
+
+    recordings.sort(key=lambda x: x[0])
+    return recordings
+
+
+def recording_ranges(
+    recordings: list[tuple[datetime, Path]],
+) -> list[tuple[datetime, datetime, Path]]:
+    """Infer each recording's coverage from its timestamp and the next segment start."""
+    ranges = []
+    for index, (file_dt, file) in enumerate(recordings):
+        if index + 1 < len(recordings):
+            next_dt = recordings[index + 1][0]
+        else:
+            next_dt = file_dt + timedelta(seconds=60)
+        ranges.append((file_dt, next_dt, file))
+    return ranges
+
+
+def run_ffmpeg(cmd: list[str], detail: str) -> None:
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        message = result.stderr.strip() or detail
+        raise HTTPException(status_code=500, detail=message[-500:])
+
+
+def trim_video_accurate(
+    input_path: Path, output_path: Path, offset_seconds: float, duration_seconds: float
+) -> None:
+    """Trim with re-encoding so clips do not start after the requested motion time."""
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(input_path),
+        "-ss",
+        f"{max(0, offset_seconds):.3f}",
+        "-t",
+        f"{max(0.1, duration_seconds):.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-an",
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(output_path),
+    ]
+    run_ffmpeg(cmd, "Failed to trim video")
+
+
+def concat_recordings(video_files: list[Path], output_path: Path) -> None:
+    list_file = output_path.parent / f"{output_path.stem}_list.txt"
+    try:
+        with open(list_file, "w") as f:
+            for video in video_files:
+                escaped = str(video).replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+
+        cmd = [
+            "ffmpeg",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
+            "-c",
+            "copy",
+            "-y",
+            str(output_path),
+        ]
+        run_ffmpeg(cmd, "Failed to concatenate videos")
+    finally:
+        if list_file.exists():
+            list_file.unlink()
+
+
+def get_event_clip(
+    start_dt: datetime,
+    end_dt: datetime,
+    merged_path: Path,
+    pre_seconds: float,
+    post_seconds: float,
+) -> None:
+    recordings = get_sorted_recordings()
+    if not recordings:
+        raise HTTPException(status_code=404, detail="No videos found")
+
+    clip_start = start_dt - timedelta(seconds=max(0, pre_seconds))
+    clip_end = end_dt + timedelta(seconds=max(0, post_seconds))
+
+    selected = [
+        (range_start, range_end, file)
+        for range_start, range_end, file in recording_ranges(recordings)
+        if range_start < clip_end and range_end > clip_start
+    ]
+
+    if not selected:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No video overlaps event window {clip_start.isoformat()} to {clip_end.isoformat()}",
+        )
+
+    first_file_dt = selected[0][0]
+    ss_offset = max(0, (clip_start - first_file_dt).total_seconds())
+    duration = (clip_end - clip_start).total_seconds()
+
+    if len(selected) == 1:
+        trim_video_accurate(selected[0][2], merged_path, ss_offset, duration)
+        return
+
+    concat_path = merged_path.with_name(f"{merged_path.stem}_concat.mp4")
+    try:
+        concat_recordings([item[2] for item in selected], concat_path)
+        trim_video_accurate(concat_path, merged_path, ss_offset, duration)
+    finally:
+        if concat_path.exists():
+            concat_path.unlink()
+
+
+def parse_datetime_param(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+
+def normalize_for_recording_time(value: datetime) -> datetime:
+    """Recordings are named with local naive wall-clock time."""
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
 
 
 def find_video_by_timestamp(timestamp: datetime) -> Path:
@@ -296,10 +446,17 @@ async def get_video_by_duration(
 
 
 @app.get("/video/v2/by-event")
-async def get_video_by_event(start: str, end: str, background_tasks: BackgroundTasks):
+async def get_video_by_event(
+    start: str,
+    end: str,
+    background_tasks: BackgroundTasks,
+    pre_seconds: float = 10,
+    post_seconds: float = 10,
+):
     """
-    Get video trimmed to the exact start and end timestamps of an event.
-    No padding before or after — just the precise time window.
+    Get video trimmed around a motion event.
+    Defaults to 10 seconds of padding before and after because event timestamps can
+    lag the visible motion and stream-copy trimming can miss short events.
 
     Args:
         start: ISO format start time (e.g., "2025-11-05T01:23:45")
@@ -309,107 +466,27 @@ async def get_video_by_event(start: str, end: str, background_tasks: BackgroundT
         /video/v2/by-event?start=2025-11-05T01:23:45&end=2025-11-05T01:25:10
     """
     try:
-        try:
-            start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        except Exception:
-            start_dt = datetime.strptime(start, "%Y-%m-%d %H:%M:%S")
-
-        try:
-            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        except Exception:
-            end_dt = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
+        start_dt = normalize_for_recording_time(parse_datetime_param(start))
+        end_dt = normalize_for_recording_time(parse_datetime_param(end))
 
         if start_dt >= end_dt:
             raise HTTPException(status_code=400, detail="start must be before end")
 
-        # Collect and sort all recordings
-        folder = Path(CCTV_FOLDER)
-        all_videos = []
-        for file in folder.glob("recording_*.mp4"):
-            try:
-                ts = file.stem.replace("recording_", "")
-                file_dt = datetime.strptime(ts, "%Y%m%d_%H%M%S")
-                all_videos.append((file_dt, file))
-            except ValueError:
-                continue
-
-        if not all_videos:
-            raise HTTPException(status_code=404, detail="No videos found")
-
-        all_videos.sort(key=lambda x: x[0])
-
-        # Find videos that overlap with [start_dt, end_dt].
-        # A recording starting at file_dt covers [file_dt, next_file_dt).
-        # We need every file whose period overlaps the requested window.
-        # Include the file that starts at-or-before start_dt (it contains the start)
-        # through the file that starts at-or-before end_dt.
-        first_idx = None
-        for i, (file_dt, _) in enumerate(all_videos):
-            if file_dt <= start_dt:
-                first_idx = i
-            if file_dt > end_dt:
-                break
-
-        if first_idx is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No video covers the start time {start_dt.isoformat()}",
-            )
-
-        last_idx = first_idx
-        for i in range(first_idx, len(all_videos)):
-            if all_videos[i][0] <= end_dt:
-                last_idx = i
-            else:
-                break
-
-        videos_to_use = [all_videos[i][1] for i in range(first_idx, last_idx + 1)]
-
-        # Offset from the first file's timestamp to our desired start
-        first_file_dt = all_videos[first_idx][0]
-        ss_offset = (start_dt - first_file_dt).total_seconds()
-        duration = (end_dt - start_dt).total_seconds()
-
         # Build a unique cache filename
-        tag = hashlib.md5(f"{start}_{end}".encode()).hexdigest()[:10]
+        tag = hashlib.md5(
+            f"{start}_{end}_{pre_seconds}_{post_seconds}".encode()
+        ).hexdigest()[:10]
         merged_filename = f"event_{tag}.mp4"
         merged_path = Path(TEMP_FOLDER) / merged_filename
 
         if not merged_path.exists():
-            if len(videos_to_use) == 1:
-                # Trim the single file directly
-                cmd = [
-                    "ffmpeg", "-ss", str(ss_offset),
-                    "-i", str(videos_to_use[0]),
-                    "-t", str(duration),
-                    "-c", "copy", "-y", str(merged_path),
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise HTTPException(status_code=500, detail="Failed to trim video")
-            else:
-                # Concat then trim
-                list_file = merged_path.parent / f"{merged_path.stem}_list.txt"
-                try:
-                    with open(list_file, "w") as f:
-                        for v in videos_to_use:
-                            f.write(f"file '{v}'\n")
-                    cmd = [
-                        "ffmpeg",
-                        "-f", "concat", "-safe", "0",
-                        "-i", str(list_file),
-                        "-ss", str(ss_offset),
-                        "-t", str(duration),
-                        "-c", "copy", "-y", str(merged_path),
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        raise HTTPException(
-                            status_code=500, detail="Failed to merge/trim videos"
-                        )
-                finally:
-                    if list_file.exists():
-                        list_file.unlink()
+            get_event_clip(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                merged_path=merged_path,
+                pre_seconds=pre_seconds,
+                post_seconds=post_seconds,
+            )
 
         background_tasks.add_task(cleanup_old_merged_videos)
 
