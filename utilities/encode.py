@@ -1,6 +1,13 @@
 import ffmpeg
+from tools.jpeg_ws_capture import JPEG_WS_URL
 
-ESP_URL = "http://192.168.0.13:81/stream"
+ESP_URL = JPEG_WS_URL
+
+raise RuntimeError(
+    "utilities/encode.py used FFmpeg's direct MJPEG input path. "
+    "The camera now streams raw JPEG frames over WebSocket, which this script "
+    "does not support directly."
+)
 
 (
     ffmpeg.input(

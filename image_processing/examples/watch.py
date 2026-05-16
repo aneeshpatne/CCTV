@@ -1,10 +1,12 @@
 import cv2
 from datetime import datetime
 import pytz
+from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
 
-URL = "http://192.168.0.13:81/stream"
+URL = JPEG_WS_URL
 
-cap = cv2.VideoCapture(URL)
+cap = JpegWebSocketCapture(URL)
+cap.open()
 
 if not cap.isOpened():
     raise RuntimeError("Could Not Open Stream")

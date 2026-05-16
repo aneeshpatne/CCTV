@@ -5,17 +5,21 @@ import subprocess
 import threading
 import queue
 import time
+from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
 
-URL = "http://192.168.0.13:81/stream"
-cap = cv2.VideoCapture(URL)
+URL = JPEG_WS_URL
+cap = JpegWebSocketCapture(URL)
+cap.open()
 
 if not cap.isOpened():
     raise RuntimeError("Could Not Open Stream")
 
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+ret, first_frame = cap.read()
+if not ret:
+    raise RuntimeError("Stopped Receiving Frames")
+height, width = first_frame.shape[:2]
 fps = 10  # Force 10 FPS
 
 ist = pytz.timezone("Asia/Kolkata")
@@ -24,6 +28,7 @@ running = True
 
 # Thread-safe queue with max size to prevent buffer buildup
 frame_queue = queue.Queue(maxsize=2)
+frame_queue.put(first_frame)
 
 
 def show_coordinates(event, x, y, flags, param):

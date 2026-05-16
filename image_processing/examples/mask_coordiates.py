@@ -1,8 +1,9 @@
 import cv2
 import time
 from datetime import datetime, timezone, timedelta
+from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
 
-URL = "http://192.168.0.13:81/stream"
+URL = JPEG_WS_URL
 
 t0 = time.time()
 frames = 0
@@ -14,7 +15,8 @@ def get_coordinates(event, x, y, flags, param):
 
 
 def open_cap(url):
-    cap = cv2.VideoCapture(url)
+    cap = JpegWebSocketCapture(url)
+    cap.open()
     if not cap.isOpened():
         return None
     return cap

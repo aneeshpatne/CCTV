@@ -31,10 +31,10 @@ except ImportError:
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
+from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
 from utilities.EventAccumulator import EventAccumulator
 from utilities.motion_db_new import log_motion_event
 
-URL = "http://192.168.0.13:81/stream"
 IST = pytz.timezone("Asia/Kolkata")
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), "examples", "no_signal.png")
 FRAME_RETRY_DELAY = 0.5
@@ -1271,16 +1271,12 @@ def record_no_signal_frame(message: str) -> None:
 def _open_capture_thread():
     """Open capture in background thread."""
     try:
-        open_timeout_ms = int(CAPTURE_OPEN_TIMEOUT * 1000)
-        read_timeout_ms = int(FRAME_READ_TIMEOUT * 1000)
-        cap = cv2.VideoCapture(URL, cv2.CAP_FFMPEG)
-
-        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_ms)
-        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, read_timeout_ms)
+        cap = JpegWebSocketCapture(
+            JPEG_WS_URL,
+            open_timeout=CAPTURE_OPEN_TIMEOUT,
+            read_timeout=FRAME_READ_TIMEOUT,
+        )
+        cap.open()
 
         with capture_lock:
             capture_result["cap"] = cap
