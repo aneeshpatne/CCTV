@@ -27,7 +27,7 @@ def startup():
                 f"Camera Connection Failed Retrying, Attempt Number: {count}"
             )
             count += 1
-            reset()
+            # reset()
             time.sleep(10)
             continue
         i = 1
