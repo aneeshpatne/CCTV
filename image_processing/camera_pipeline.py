@@ -3,6 +3,8 @@ import os
 # CRITICAL: Set FFMPEG options BEFORE importing cv2
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "protocol_whitelist;file,http,https,tcp|"
+    "timeout;2500000|"
+    "rw_timeout;2500000|"
     "analyzeduration;0|"
     "probesize;32|"  # tiny probe
     "fflags;nobuffer|"  # minimize internal buffering
@@ -36,8 +38,8 @@ URL = "http://192.168.0.13:81/stream"
 IST = pytz.timezone("Asia/Kolkata")
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), "examples", "no_signal.png")
 FRAME_RETRY_DELAY = 0.5
-FRAME_READ_TIMEOUT = 5.0  # seconds
-CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
+FRAME_READ_TIMEOUT = 2.5  # seconds
+CAPTURE_OPEN_TIMEOUT = 4.0  # seconds to wait for capture to open
 
 # Recording configuration
 ENABLE_RECORDING = True
@@ -1269,13 +1271,16 @@ def record_no_signal_frame(message: str) -> None:
 def _open_capture_thread():
     """Open capture in background thread."""
     try:
+        open_timeout_ms = int(CAPTURE_OPEN_TIMEOUT * 1000)
+        read_timeout_ms = int(FRAME_READ_TIMEOUT * 1000)
         cap = cv2.VideoCapture(URL, cv2.CAP_FFMPEG)
+
         if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, open_timeout_ms)
         if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, read_timeout_ms)
 
         with capture_lock:
             capture_result["cap"] = cap
