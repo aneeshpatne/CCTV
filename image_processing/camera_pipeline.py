@@ -63,6 +63,9 @@ USE_DYNAMIC_FPS = False  # Use fixed output FPS for stream stability
 FIXED_OUTPUT_FPS = 9.0
 VIDEO_BITRATE_KBPS = 1500
 VIDEO_BUFSIZE_KBPS = 3000
+RTSP_VIDEO_BITRATE_KBPS = 4000
+RTSP_VIDEO_MAXRATE_KBPS = 6000
+RTSP_VIDEO_BUFSIZE_KBPS = 12000
 
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
@@ -383,13 +386,13 @@ def start_ffmpeg_rtsp(
         # Hardware encoder (Intel Quick Sync via VideoToolbox)
         "-c:v",
         "h264_videotoolbox",
-        # Stable bitrate (no pulsing)
+        # Give the live stream enough headroom to avoid quality pulsing on complex frames.
         "-b:v",
-        f"{VIDEO_BITRATE_KBPS}k",
+        f"{RTSP_VIDEO_BITRATE_KBPS}k",
         "-maxrate",
-        f"{VIDEO_BITRATE_KBPS}k",
+        f"{RTSP_VIDEO_MAXRATE_KBPS}k",
         "-bufsize",
-        f"{VIDEO_BUFSIZE_KBPS}k",
+        f"{RTSP_VIDEO_BUFSIZE_KBPS}k",
         # GOP / latency
         "-g",
         str(gop_size),  # ~1 second of frames
@@ -736,10 +739,9 @@ def draw_box(
     border_color=None,
     accent_color=None,
 ):
-    """Draw a minimal Material-style HUD chip."""
+    """Draw a square Material dark HUD surface."""
     x2 = x + w
     y2 = y + h
-    radius = min(12, max(4, h // 2))
 
     if x >= frame.shape[1] or y >= frame.shape[0] or x2 <= 0 or y2 <= 0:
         return
@@ -750,51 +752,26 @@ def draw_box(
     y2 = min(frame.shape[0] - 1, y2)
     w = x2 - x
     h = y2 - y
-    radius = min(radius, max(2, w // 2), max(2, h // 2))
 
     shadow = frame.copy()
     shadow_y = min(frame.shape[0] - 1, y + 2)
     shadow_y2 = min(frame.shape[0] - 1, y2 + 2)
-    cv2.rectangle(shadow, (x + radius, shadow_y), (x2 - radius, shadow_y2), (0, 0, 0), -1)
-    cv2.rectangle(shadow, (x, shadow_y + radius), (x2, shadow_y2 - radius), (0, 0, 0), -1)
-    cv2.circle(shadow, (x + radius, shadow_y + radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
-    cv2.circle(shadow, (x2 - radius, shadow_y + radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
-    cv2.circle(shadow, (x + radius, shadow_y2 - radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
-    cv2.circle(shadow, (x2 - radius, shadow_y2 - radius), radius, (0, 0, 0), -1, cv2.LINE_AA)
-    cv2.addWeighted(shadow, 0.12, frame, 0.88, 0, frame)
+    cv2.rectangle(shadow, (x, shadow_y), (x2, shadow_y2), (0, 0, 0), -1)
+    cv2.addWeighted(shadow, 0.18, frame, 0.82, 0, frame)
 
     overlay = frame.copy()
-    cv2.rectangle(overlay, (x + radius, y), (x2 - radius, y2), bg_color, -1)
-    cv2.rectangle(overlay, (x, y + radius), (x2, y2 - radius), bg_color, -1)
-    cv2.circle(overlay, (x + radius, y + radius), radius, bg_color, -1, cv2.LINE_AA)
-    cv2.circle(overlay, (x2 - radius, y + radius), radius, bg_color, -1, cv2.LINE_AA)
-    cv2.circle(overlay, (x + radius, y2 - radius), radius, bg_color, -1, cv2.LINE_AA)
-    cv2.circle(overlay, (x2 - radius, y2 - radius), radius, bg_color, -1, cv2.LINE_AA)
+    cv2.rectangle(overlay, (x, y), (x2, y2), bg_color, -1)
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
+    if border_color is not None:
+        cv2.rectangle(frame, (x, y), (x2, y2), border_color, 1, cv2.LINE_AA)
     if accent_color is not None:
-        cv2.circle(
-            frame,
-            (x + radius + 4, y + h // 2),
-            4,
-            accent_color,
-            -1,
-            cv2.LINE_AA,
-        )
+        cv2.rectangle(frame, (x, y), (x + 3, y2), accent_color, -1)
 
 
 def draw_wifi_icon(frame, x, y, size, rssi, color):
-    """Draws a WiFi signal icon using arcs."""
-    # center is bottom-middle of the icon area
-    cx, cy = x + size // 2, y + size - 4
-    radius_step = size // 3
+    """Draw a compact signal-strength bar icon without dots."""
     thickness = 1
-
-    # Dot
-    cv2.circle(frame, (cx, cy), 2, color, -1)
-
-    # Arcs
-    # Logic: > -60: 3 arcs, > -70: 2 arcs, > -80: 1 arc
     bars = 0
     if rssi is not None:
         if rssi >= -60:
@@ -804,16 +781,17 @@ def draw_wifi_icon(frame, x, y, size, rssi, color):
         elif rssi >= -80:
             bars = 1
 
-    # Draw background (dim) arcs
-    grey = (178, 188, 196)
-
-    for i in range(1, 4):
-        r = i * radius_step
-        curr_color = color if i <= bars else grey
-        # StartAngle 225, EndAngle 315 for a top-up wedge look
-        cv2.ellipse(
-            frame, (cx, cy), (r, r), 0, 225, 315, curr_color, thickness, cv2.LINE_AA
-        )
+    grey = (88, 93, 101)
+    bar_w = 3
+    gap = 2
+    base_y = y + size - 3
+    for i in range(4):
+        bar_h = 4 + i * 4
+        x1 = x + i * (bar_w + gap)
+        y1 = base_y - bar_h
+        curr_color = color if i < bars else grey
+        cv2.rectangle(frame, (x1, y1), (x1 + bar_w, base_y), curr_color, -1)
+        cv2.rectangle(frame, (x1, y1), (x1 + bar_w, base_y), curr_color, thickness)
 
     return size
 
