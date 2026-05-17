@@ -4,7 +4,6 @@ import requests
 from requests.exceptions import RequestException
 
 from tools.status import status
-from tools.stream_status import check_mjpeg_stream
 from tools.changeQuality import change_quality
 from tools.reset import reset
 from tools.changeClock import change_clock
@@ -20,9 +19,8 @@ count = 1
 def startup():
     global count
     while True:
-        cam_stat = check_mjpeg_stream()[0]
         stat = status()
-        if cam_stat == False or stat == None:
+        if stat == None:
             logger.warning(
                 f"Camera Connection Failed Retrying, Attempt Number: {count}"
             )
@@ -37,11 +35,6 @@ def startup():
         while i < 12:
             logger.info(f"Current Resolution: {i}")
             logger.info(f"Attempting to set Current Resolution to: {i + 1}")
-            cam_stat = check_mjpeg_stream()[0]
-            if cam_stat == False:
-                logger.warning("Camera not ready")
-                time.sleep(10)
-                continue
 
             # Wrap change_quality in try-except to handle connection timeouts
             try:
@@ -58,8 +51,7 @@ def startup():
                 break
 
             stat = status()
-            cam_stat = check_mjpeg_stream()[0]
-            if cam_stat == False or stat == None or int(stat) != i + 1:
+            if stat == None or int(stat) != i + 1:
                 logger.warning("Resolution Change Failed")
                 i = 10
                 time.sleep(5)

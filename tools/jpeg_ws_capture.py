@@ -11,8 +11,8 @@ class JpegWebSocketCapture:
     def __init__(
         self,
         url: str = JPEG_WS_URL,
-        open_timeout: float = 4.0,
-        read_timeout: float = 2.5,
+        open_timeout: float = 10.0,
+        read_timeout: float = 6.0,
     ):
         self.url = url
         self.open_timeout = open_timeout
@@ -22,6 +22,7 @@ class JpegWebSocketCapture:
         self.last_frame_shape = None
 
     def open(self) -> bool:
+        self.release()
         try:
             self.websocket = connect(
                 self.url,

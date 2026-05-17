@@ -37,9 +37,9 @@ from utilities.motion_db_new import log_motion_event
 
 IST = pytz.timezone("Asia/Kolkata")
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), "examples", "no_signal.png")
-FRAME_RETRY_DELAY = 0.5
-FRAME_READ_TIMEOUT = 2.5  # seconds
-CAPTURE_OPEN_TIMEOUT = 4.0  # seconds to wait for capture to open
+FRAME_READ_TIMEOUT = 6.0  # seconds
+FRAME_FAILURE_RECONNECT_DELAY = 2.0  # seconds to let the ESP32 close the old stream
+CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for WebSocket handshake/open
 
 # Recording configuration
 ENABLE_RECORDING = True
@@ -193,10 +193,6 @@ startup_lock = threading.Lock()
 camera_adjustments_done = False
 camera_adjustments_lock = threading.Lock()
 
-# Capture opening state
-capture_result = {"cap": None, "done": False}
-capture_lock = threading.Lock()
-
 # RSSI monitoring state
 rssi_value = None
 rssi_lock = threading.Lock()
@@ -271,6 +267,8 @@ expected_frame_size: Optional[tuple[int, int]] = (
     None  # (width, height) that FFmpeg expects
 )
 current_fps: Optional[float] = None  # Active FPS used by FFmpeg
+last_record_write_time: Optional[float] = None
+MAX_RECORD_FRAME_DUPLICATES = 30
 
 
 def start_ffmpeg_record(
@@ -442,7 +440,7 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
 
 def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
     """Push a frame into the recording/RTSP FFmpeg pipelines, restarting them when needed."""
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, last_record_write_time
 
     if not ENABLE_RECORDING and not ENABLE_RTSP:
         return True
@@ -478,6 +476,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             if ffmpeg_record_proc is not None:
                 stop_ffmpeg(ffmpeg_record_proc)
                 ffmpeg_record_proc = None
+                last_record_write_time = None
             if ffmpeg_rtsp_proc is not None:
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
@@ -497,10 +496,12 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 print(f"Recording FFmpeg exited (code {exit_code}); restarting...")
                 stop_ffmpeg(ffmpeg_record_proc)
                 ffmpeg_record_proc = None
+                last_record_write_time = None
             if ffmpeg_record_proc is None:
                 ffmpeg_record_proc = start_ffmpeg_record(
                     target_width, target_height, target_fps
                 )
+                last_record_write_time = None
 
         # Ensure RTSP process is alive when enabled
         if ENABLE_RTSP:
@@ -520,17 +521,38 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
 
         frame_bytes = frame.tobytes()
 
+        def _record_frame_copies() -> int:
+            global last_record_write_time
+            now = time.monotonic()
+            if last_record_write_time is None:
+                last_record_write_time = now
+                return 1
+
+            frame_interval = 1.0 / max(1.0, target_fps)
+            elapsed = max(0.0, now - last_record_write_time)
+            copies = max(1, int(round(elapsed / frame_interval)))
+            copies = min(copies, MAX_RECORD_FRAME_DUPLICATES)
+            last_record_write_time += copies * frame_interval
+            if last_record_write_time > now:
+                last_record_write_time = now
+            return copies
+
         def _write(
             proc: Optional[subprocess.Popen], label: str, starter
         ) -> Optional[subprocess.Popen]:
+            global last_record_write_time
             if proc is None:
                 return None
             try:
                 if proc.stdin:
-                    proc.stdin.write(frame_bytes)
+                    copies = _record_frame_copies() if label == "recording" else 1
+                    for _ in range(copies):
+                        proc.stdin.write(frame_bytes)
             except (BrokenPipeError, IOError) as err:
                 print(f"FFmpeg {label} pipe error ({err}); restarting...")
                 stop_ffmpeg(proc)
+                if label == "recording":
+                    last_record_write_time = None
                 return starter(target_width, target_height, target_fps)
             return proc
 
@@ -653,6 +675,9 @@ def start_rssi_monitor() -> None:
     def _rssi_monitor() -> None:
         global rssi_value
         while True:
+            if not startup_complete.is_set():
+                time.sleep(1.0)
+                continue
             try:
                 new_rssi = get_rssi(timeout=2.0)
                 with rssi_lock:
@@ -676,6 +701,9 @@ def start_memory_monitor() -> None:
     def _memory_monitor() -> None:
         global memory_percent
         while True:
+            if not startup_complete.is_set():
+                time.sleep(1.0)
+                continue
             try:
                 response = requests.get("http://192.168.0.13/syshealth", timeout=3.0)
                 if response.status_code == 200:
@@ -775,10 +803,12 @@ def draw_wifi_icon(frame, x, y, size, rssi, color):
     bars = 0
     if rssi is not None:
         if rssi >= -60:
+            bars = 4
+        elif rssi >= -67:
             bars = 3
-        elif rssi >= -70:
+        elif rssi >= -75:
             bars = 2
-        elif rssi >= -80:
+        elif rssi >= -85:
             bars = 1
 
     grey = (88, 93, 101)
@@ -875,30 +905,34 @@ def draw_hud(
     show_time: bool = True,
     coordinates: list = [0, 0],
 ):
-    """Draws a minimal Material-style HUD with pastel status chips."""
+    """Draws a square Material dark HUD."""
     x, y = coordinates
     _, w = frame.shape[:2]
 
-    top_margin = 16
-    box_h = 36
-    pad_x = 14
-    gap = 8
+    top_margin = 14
+    box_h = 34
+    pad_x = 12
+    gap = 6
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_size = 15
-    font_scale = 0.46
+    font_size = 14
+    font_scale = 0.44
     font_color = (232, 234, 237)
-    muted_color = (169, 174, 184)
+    muted_color = (154, 160, 166)
     thickness = 1
-    panel_color = (35, 38, 43)
-    panel_border = (67, 72, 80)
-    time_accent = (160, 196, 255)
-    motion_panel = (54, 48, 64)
-    motion_accent = (203, 182, 255)
+    panel_color = (31, 31, 31)
+    panel_border = (70, 70, 70)
+    surface_variant = (38, 38, 38)
+    status_good = (129, 201, 149)
+    status_warn = (251, 188, 5)
+    status_bad = (242, 139, 130)
+    status_neutral = (189, 193, 198)
+    motion_panel = (37, 37, 37)
+    motion_accent = status_warn
 
-    ts = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
-    tw, th = get_hud_text_size(ts, font_size, font, font_scale, thickness)
-    ts_box_w = tw + (pad_x * 2) + 16
+    ts_label = datetime.now(IST).strftime("%Y-%m-%d %I:%M:%S %p")
+    tw, th = get_hud_text_size(ts_label, font_size, font, font_scale, thickness)
+    ts_box_w = tw + (pad_x * 2)
 
     text_center_y = top_margin + box_h // 2
     overlap_pad = 4
@@ -926,12 +960,11 @@ def draw_hud(
             box_h,
             bg_color=panel_color,
             border_color=panel_border,
-            accent_color=time_accent,
         )
         put_hud_text(
             frame,
-            ts,
-            gap + pad_x + 14,
+            ts_label,
+            gap + pad_x,
             text_center_y,
             font_color,
             font_size,
@@ -941,9 +974,9 @@ def draw_hud(
         )
 
     if motion_detected:
-        warn_text = "Motion"
+        warn_text = "MOTION"
         tw, th = get_hud_text_size(warn_text, font_size, font, font_scale, thickness)
-        warn_box_w = tw + (pad_x * 2) + 18
+        warn_box_w = tw + (pad_x * 2)
         warn_x = gap + ts_box_w + gap
         if should_draw("motion_warn", warn_x, top_margin, warn_box_w, box_h):
             draw_box(
@@ -953,16 +986,16 @@ def draw_hud(
                 warn_box_w,
                 box_h,
                 bg_color=motion_panel,
-                alpha=0.9,
-                border_color=(91, 81, 112),
+                alpha=0.94,
+                border_color=(92, 76, 31),
                 accent_color=motion_accent,
             )
             put_hud_text(
                 frame,
                 warn_text,
-                warn_x + pad_x + 14,
+                warn_x + pad_x + 4,
                 text_center_y,
-                (231, 222, 255),
+                font_color,
                 font_size,
                 font,
                 font_scale,
@@ -983,7 +1016,7 @@ def draw_hud(
         wifi_color = get_status_color(
             rssi,
             [-60, -70, -80],
-            [(166, 215, 181), (128, 203, 255), (174, 198, 255), (244, 184, 190)],
+            [status_good, status_neutral, status_warn, status_bad],
         )
         draw_box(
             frame,
@@ -991,7 +1024,7 @@ def draw_hud(
             top_margin,
             wifi_box_w,
             box_h,
-            bg_color=(30, 47, 42),
+            bg_color=surface_variant,
             border_color=panel_border,
             accent_color=None,
         )
@@ -1021,7 +1054,7 @@ def draw_hud(
     cursor_x -= fps_box_w
     if should_draw("fps", cursor_x, top_margin, fps_box_w, box_h):
         fps_color = get_status_color(
-            fps, [7, 5], [(166, 215, 181), (255, 213, 154), (244, 184, 190)]
+            fps, [7, 5], [status_good, status_warn, status_bad]
         )
         draw_box(
             frame,
@@ -1029,16 +1062,15 @@ def draw_hud(
             top_margin,
             fps_box_w,
             box_h,
-            bg_color=(42, 39, 58),
+            bg_color=surface_variant,
             border_color=panel_border,
             accent_color=fps_color,
         )
 
-        dot_x = cursor_x + pad_x
         put_hud_text(
             frame,
             fps_str,
-            dot_x + 14,
+            cursor_x + pad_x + 4,
             text_center_y,
             font_color,
             font_size,
@@ -1060,7 +1092,7 @@ def draw_hud(
         cursor_x -= mem_box_w
         if should_draw("memory", cursor_x, top_margin, mem_box_w, box_h):
             mem_color = get_status_color(
-                mem_pct, [20, 10], [(128, 203, 255), (255, 213, 154), (244, 184, 190)]
+                mem_pct, [20, 10], [status_good, status_warn, status_bad]
             )
             draw_box(
                 frame,
@@ -1068,7 +1100,7 @@ def draw_hud(
                 top_margin,
                 mem_box_w,
                 box_h,
-                bg_color=(31, 45, 55),
+                bg_color=surface_variant,
                 border_color=panel_border,
                 accent_color=None,
             )
@@ -1103,7 +1135,7 @@ def draw_hud(
 
 
 def backoff(attempt: int) -> float:
-    return min(5.0, 0.5 * (2**attempt))
+    return min(5.0, 2 ** max(0, attempt - 1))
 
 
 def show_placeholder(message: str) -> None:
@@ -1246,48 +1278,16 @@ def record_no_signal_frame(message: str) -> None:
         write_frame_to_ffmpeg(frame_for_record)
 
 
-def _open_capture_thread():
-    """Open capture in background thread."""
-    try:
-        cap = JpegWebSocketCapture(
-            JPEG_WS_URL,
-            open_timeout=CAPTURE_OPEN_TIMEOUT,
-            read_timeout=FRAME_READ_TIMEOUT,
-        )
-        cap.open()
-
-        with capture_lock:
-            capture_result["cap"] = cap
-            capture_result["done"] = True
-    except Exception as e:
-        print(f"Exception opening capture: {e}")
-        with capture_lock:
-            capture_result["cap"] = None
-            capture_result["done"] = True
-
-
-def open_capture_with_timeout() -> Optional[cv2.VideoCapture]:
-    """Open capture with timeout - if it takes too long, abort."""
-    global capture_result
-
-    # Reset state
-    with capture_lock:
-        capture_result = {"cap": None, "done": False}
-
-    # Start opening in background
-    thread = threading.Thread(target=_open_capture_thread, daemon=True)
-    thread.start()
-
-    # Wait with timeout
-    start_time = time.time()
-    while time.time() - start_time < CAPTURE_OPEN_TIMEOUT:
-        with capture_lock:
-            if capture_result["done"]:
-                return capture_result["cap"]
-        time.sleep(0.1)
-
-    # Timeout - abandon the thread and return None
-    print(f"Capture open timed out after {CAPTURE_OPEN_TIMEOUT}s")
+def open_capture_with_timeout() -> Optional[JpegWebSocketCapture]:
+    """Open the JPEG WebSocket stream with a bounded handshake timeout."""
+    cap = JpegWebSocketCapture(
+        JPEG_WS_URL,
+        open_timeout=CAPTURE_OPEN_TIMEOUT,
+        read_timeout=FRAME_READ_TIMEOUT,
+    )
+    if cap.open():
+        return cap
+    cap.release()
     return None
 
 
@@ -1359,6 +1359,8 @@ def main() -> None:
             if cap is None or not cap.isOpened():
                 if cap is not None:
                     cap.release()
+                    time.sleep(FRAME_FAILURE_RECONNECT_DELAY)
+                    cap = None
 
                 # Show and record "no signal" frame during connection attempts
                 # Startup is complete, but video stream not connected yet
@@ -1396,7 +1398,7 @@ def main() -> None:
                 # Camera crashed during operation - restarting everything
                 record_no_signal_frame("CRASH: Restarting camera...")
 
-                time.sleep(FRAME_RETRY_DELAY)
+                time.sleep(FRAME_FAILURE_RECONNECT_DELAY)
                 continue
 
             # Apply camera adjustments after first successful frame (only once per startup)
