@@ -3,10 +3,10 @@ from datetime import datetime
 import pytz
 import numpy as np
 from utilities.warn import NonBlockingBlinker
-from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
+from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 
-URL = JPEG_WS_URL
-cap = JpegWebSocketCapture(URL)
+URL = MJPEG_STREAM_URL
+cap = MjpegStreamCapture(URL)
 cap.open()
 
 if not cap.isOpened():

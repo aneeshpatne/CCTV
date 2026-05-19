@@ -5,10 +5,10 @@ import subprocess
 import threading
 import queue
 import time
-from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
+from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 
-URL = JPEG_WS_URL
-cap = JpegWebSocketCapture(URL)
+URL = MJPEG_STREAM_URL
+cap = MjpegStreamCapture(URL)
 cap.open()
 
 if not cap.isOpened():

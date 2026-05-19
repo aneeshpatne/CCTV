@@ -3,10 +3,10 @@ import cv2, time, threading, queue, subprocess, os
 import numpy as np
 from datetime import datetime
 import pytz
-from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
+from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 
 # ====== CONFIG ======
-URL = JPEG_WS_URL
+URL = MJPEG_STREAM_URL
 IST = pytz.timezone("Asia/Kolkata")
 
 # Output
@@ -239,10 +239,10 @@ running = True
 
 def reader():
     global running
-    cap = JpegWebSocketCapture(URL)
+    cap = MjpegStreamCapture(URL)
     cap.open()
     if not cap.isOpened():
-        raise RuntimeError("Could not open ESP JPEG WebSocket stream")
+        raise RuntimeError("Could not open ESP HTTP MJPEG stream")
     # prime first frame to get size
     ok, f = cap.read()
     if not ok:
@@ -258,7 +258,7 @@ def reader():
             # reconnect
             cap.release()
             time.sleep(0.5)
-            cap = JpegWebSocketCapture(URL)
+            cap = MjpegStreamCapture(URL)
             cap.open()
             continue
         if frame_q.full():

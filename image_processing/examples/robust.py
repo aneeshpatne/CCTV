@@ -1,16 +1,16 @@
 import cv2
 import time
 from datetime import datetime, timezone, timedelta
-from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
+from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 
-URL = JPEG_WS_URL
+URL = MJPEG_STREAM_URL
 
 t0 = time.time()
 frames = 0
 
 
 def open_cap(URL):
-    cap = JpegWebSocketCapture(URL)
+    cap = MjpegStreamCapture(URL)
     cap.open()
     if not cap.isOpened():
         return None

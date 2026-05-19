@@ -1,17 +1,17 @@
-from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
+from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 
-url = JPEG_WS_URL
+url = MJPEG_STREAM_URL
 
 
 def check_mjpeg_stream(url=url, timeout=2):
     try:
-        cap = JpegWebSocketCapture(url, open_timeout=timeout, read_timeout=timeout)
+        cap = MjpegStreamCapture(url, open_timeout=timeout, read_timeout=timeout)
         if not cap.open():
-            return False, "websocket open failed"
+            return False, "mjpeg stream open failed"
         ok, frame = cap.read()
         cap.release()
         if not ok or frame is None:
-            return False, "invalid jpeg websocket frame"
-        return True, "websocket jpeg stream"
+            return False, "invalid mjpeg frame"
+        return True, "http mjpeg stream"
     except Exception as e:
         return False, str(e)

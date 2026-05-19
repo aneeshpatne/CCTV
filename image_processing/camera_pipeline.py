@@ -31,7 +31,7 @@ except ImportError:
 from utilities.startup import startup
 from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
-from tools.jpeg_ws_capture import JPEG_WS_URL, JpegWebSocketCapture
+from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 from utilities.EventAccumulator import EventAccumulator
 from utilities.motion_db_new import log_motion_event
 
@@ -39,7 +39,7 @@ IST = pytz.timezone("Asia/Kolkata")
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), "examples", "no_signal.png")
 FRAME_READ_TIMEOUT = 6.0  # seconds
 FRAME_FAILURE_RECONNECT_DELAY = 2.0  # seconds to let the ESP32 close the old stream
-CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for WebSocket handshake/open
+CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for HTTP stream open
 
 # Recording configuration
 ENABLE_RECORDING = True
@@ -269,6 +269,9 @@ expected_frame_size: Optional[tuple[int, int]] = (
 current_fps: Optional[float] = None  # Active FPS used by FFmpeg
 last_record_write_time: Optional[float] = None
 MAX_RECORD_FRAME_DUPLICATES = 30
+FFMPEG_RESTART_COOLDOWN_SECONDS = 5.0
+last_record_restart_attempt: Optional[float] = None
+last_rtsp_restart_attempt: Optional[float] = None
 
 
 def start_ffmpeg_record(
@@ -306,6 +309,8 @@ def start_ffmpeg_record(
         # hardware encoder (Intel Mac)
         "-c:v",
         "h264_videotoolbox",
+        "-allow_sw",
+        "1",
         # stable quality (avoid blur/clear cycling)
         "-b:v",
         f"{VIDEO_BITRATE_KBPS}k",
@@ -384,6 +389,8 @@ def start_ffmpeg_rtsp(
         # Hardware encoder (Intel Quick Sync via VideoToolbox)
         "-c:v",
         "h264_videotoolbox",
+        "-allow_sw",
+        "1",
         # Give the live stream enough headroom to avoid quality pulsing on complex frames.
         "-b:v",
         f"{RTSP_VIDEO_BITRATE_KBPS}k",
@@ -441,6 +448,7 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
 def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
     """Push a frame into the recording/RTSP FFmpeg pipelines, restarting them when needed."""
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, last_record_write_time
+    global last_record_restart_attempt, last_rtsp_restart_attempt
 
     if not ENABLE_RECORDING and not ENABLE_RTSP:
         return True
@@ -489,6 +497,27 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         else:
             target_fps = FIXED_OUTPUT_FPS
 
+        def _can_restart(label: str) -> bool:
+            last_attempt = (
+                last_record_restart_attempt
+                if label == "recording"
+                else last_rtsp_restart_attempt
+            )
+            if last_attempt is None:
+                return True
+            return time.monotonic() - last_attempt >= FFMPEG_RESTART_COOLDOWN_SECONDS
+
+        def _start_with_backoff(label: str, starter) -> Optional[subprocess.Popen]:
+            global last_record_restart_attempt, last_rtsp_restart_attempt
+            if not _can_restart(label):
+                return None
+            now = time.monotonic()
+            if label == "recording":
+                last_record_restart_attempt = now
+            else:
+                last_rtsp_restart_attempt = now
+            return starter(target_width, target_height, target_fps)
+
         # Ensure recording process is alive when recording enabled
         if ENABLE_RECORDING:
             if ffmpeg_record_proc is not None and ffmpeg_record_proc.poll() is not None:
@@ -498,8 +527,8 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 ffmpeg_record_proc = None
                 last_record_write_time = None
             if ffmpeg_record_proc is None:
-                ffmpeg_record_proc = start_ffmpeg_record(
-                    target_width, target_height, target_fps
+                ffmpeg_record_proc = _start_with_backoff(
+                    "recording", start_ffmpeg_record
                 )
                 last_record_write_time = None
 
@@ -511,9 +540,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             if ffmpeg_rtsp_proc is None:
-                ffmpeg_rtsp_proc = start_ffmpeg_rtsp(
-                    target_width, target_height, target_fps
-                )
+                ffmpeg_rtsp_proc = _start_with_backoff("rtsp", start_ffmpeg_rtsp)
 
         # If the current frame size differs from the expected size, resize once for both outputs
         if (w, h) != expected_frame_size:
@@ -553,7 +580,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                 stop_ffmpeg(proc)
                 if label == "recording":
                     last_record_write_time = None
-                return starter(target_width, target_height, target_fps)
+                return _start_with_backoff(label, starter)
             return proc
 
         if ENABLE_RECORDING:
@@ -1278,10 +1305,10 @@ def record_no_signal_frame(message: str) -> None:
         write_frame_to_ffmpeg(frame_for_record)
 
 
-def open_capture_with_timeout() -> Optional[JpegWebSocketCapture]:
-    """Open the JPEG WebSocket stream with a bounded handshake timeout."""
-    cap = JpegWebSocketCapture(
-        JPEG_WS_URL,
+def open_capture_with_timeout() -> Optional[MjpegStreamCapture]:
+    """Open the HTTP MJPEG stream with a bounded connection timeout."""
+    cap = MjpegStreamCapture(
+        MJPEG_STREAM_URL,
         open_timeout=CAPTURE_OPEN_TIMEOUT,
         read_timeout=FRAME_READ_TIMEOUT,
     )
