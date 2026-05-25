@@ -5,7 +5,7 @@ A self-hosted CCTV automation stack for ESP32-CAM devices. It captures the camer
 ## Highlights
 
 - Continuous ESP32-CAM management with automatic reboot, quality ramp-up, and clock sync via `utilities/startup.py`.
-- Real-time computer vision pipeline (`Image Processing/camera_pipeline.py`) with motion detection inside a configurable ROI, overlays for timestamp/RSSI/FPS/memory, and LED signalling.
+- Real-time computer vision pipeline (`Image Processing/camera_pipeline.py`) with motion detection inside a configurable ROI, overlays for timestamp/RSSI/FPS/temperature, and LED signalling.
 - Dual FFmpeg pipelines for segmented recordings and low-latency RTSP restreaming, including disk-usage watchdog and pruning (`Image Processing/pipeline_orchestrator.py`).
 - Motion-event persistence in SQLite via SQLAlchemy (`utilities/motion_db.py`) powering a FastAPI service at `server/server.py` for searching, merging, and streaming footage.
 - Nightly automation (`motion/motion.py`) that fetches motion windows, downloads footage, GPU-compresses clips, and pushes concise Telegram summaries.
@@ -125,7 +125,7 @@ For scheduled execution (e.g., via cron), use `run_motion.sh`, which activates t
 
 - **Disk pruning** – The orchestrator trims the oldest MP4 segments when usage exceeds `DISK_USAGE_THRESHOLD`.
 - **Motion logging** – `camera_pipeline.py` debounces motion events and queues them for insertion into `motion_logs.db`. Review or rotate the database under the configured recordings directory.
-- **Health overlays** – Wi-Fi RSSI (`tools/get_rssi.py`) and ESP memory stats (`/syshealth`) power on-screen badges. These requests fail gracefully if endpoints are unreachable.
+- **Health overlays** – Wi-Fi RSSI (`tools/get_rssi.py`) and ESP SoC temperature (`/syshealth`) power on-screen badges. These requests fail gracefully if endpoints are unreachable.
 
 ## Development Tips
 

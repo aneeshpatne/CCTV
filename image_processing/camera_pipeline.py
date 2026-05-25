@@ -70,7 +70,7 @@ RTSP_VIDEO_BUFSIZE_KBPS = 12000
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
 SHOW_LOCAL_VIEW = False  # Show CV2 preview windows
-SHOW_MEMORY_BADGE = True  # Show ESP32 memory usage badge
+SHOW_TEMPERATURE_BADGE = True  # Show ESP32 SoC temperature badge
 PROJECT_LEXEND_FONT = REPO_ROOT / "font" / "Lexend-VariableFont_wght.ttf"
 PROJECT_ROBOTO_FONT = REPO_ROOT / "assets" / "fonts" / "Roboto-Regular.ttf"
 DEFAULT_HUD_FONT_PATH = next(
@@ -199,11 +199,11 @@ rssi_lock = threading.Lock()
 rssi_thread = None
 rssi_update_interval = 10  # Update RSSI every 10 seconds
 
-# Memory monitoring state
-memory_percent = None
-memory_lock = threading.Lock()
-memory_thread = None
-memory_update_interval = 10  # Update memory every 10 seconds
+# Temperature monitoring state
+soc_temperature_c = None
+temperature_lock = threading.Lock()
+temperature_thread = None
+temperature_update_interval = 10  # Update temperature every 10 seconds
 
 # FPS tracking state
 fps_value = 0.0
@@ -709,24 +709,21 @@ def start_rssi_monitor() -> None:
                 new_rssi = get_rssi(timeout=2.0)
                 with rssi_lock:
                     rssi_value = new_rssi
-                if new_rssi is not None:
-                    print(f"RSSI updated: {new_rssi} dBm")
-            except Exception as e:
-                print(f"RSSI monitoring error: {e}")
+            except Exception:
+                pass
             time.sleep(rssi_update_interval)
 
     if rssi_thread is None or not rssi_thread.is_alive():
         rssi_thread = threading.Thread(target=_rssi_monitor, daemon=True)
         rssi_thread.start()
-        print(f"RSSI monitor started (updates every {rssi_update_interval}s)")
 
 
-def start_memory_monitor() -> None:
-    """Start background thread to monitor ESP32 memory every 10 seconds."""
-    global memory_thread
+def start_temperature_monitor() -> None:
+    """Start background thread to monitor ESP32 SoC temperature every 10 seconds."""
+    global temperature_thread
 
-    def _memory_monitor() -> None:
-        global memory_percent
+    def _temperature_monitor() -> None:
+        global soc_temperature_c
         while True:
             if not startup_complete.is_set():
                 time.sleep(1.0)
@@ -735,31 +732,25 @@ def start_memory_monitor() -> None:
                 response = requests.get("http://192.168.0.13/syshealth", timeout=3.0)
                 if response.status_code == 200:
                     data = response.json()
-                    free_heap = data.get("freeHeap", 0)
-                    total_heap = data.get("totalHeap", 1)
+                    temp_c = data.get("socTempC")
 
-                    # Calculate percentage of free memory
-                    mem_pct = (free_heap / total_heap) * 100 if total_heap > 0 else 0
+                    if temp_c is None:
+                        raise ValueError("syshealth response missing socTempC")
 
-                    with memory_lock:
-                        memory_percent = mem_pct
-
-                    print(
-                        f"Memory updated: {mem_pct:.1f}% free ({free_heap}/{total_heap} bytes)"
-                    )
+                    with temperature_lock:
+                        soc_temperature_c = float(temp_c)
             except requests.exceptions.Timeout:
-                print("Memory monitoring: request timeout")
-            except requests.exceptions.RequestException as e:
-                print(f"Memory monitoring error: {e}")
-            except Exception as e:
-                print(f"Memory monitoring unexpected error: {e}")
+                pass
+            except requests.exceptions.RequestException:
+                pass
+            except Exception:
+                pass
 
-            time.sleep(memory_update_interval)
+            time.sleep(temperature_update_interval)
 
-    if memory_thread is None or not memory_thread.is_alive():
-        memory_thread = threading.Thread(target=_memory_monitor, daemon=True)
-        memory_thread.start()
-        print(f"Memory monitor started (updates every {memory_update_interval}s)")
+    if temperature_thread is None or not temperature_thread.is_alive():
+        temperature_thread = threading.Thread(target=_temperature_monitor, daemon=True)
+        temperature_thread.start()
 
 
 def update_fps() -> None:
@@ -927,7 +918,7 @@ def draw_hud(
     frame: np.ndarray,
     fps: float,
     rssi: int | None,
-    mem_pct: float | None,
+    soc_temp_c: float | None,
     motion_detected: bool = False,
     show_time: bool = True,
     coordinates: list = [0, 0],
@@ -1108,24 +1099,29 @@ def draw_hud(
 
     cursor_x -= gap
 
-    if SHOW_MEMORY_BADGE:
-        mem_val = f"{int(mem_pct)}%" if mem_pct is not None else "--%"
-        tw, th = get_hud_text_size(mem_val, font_size, font, font_scale, thickness)
+    if SHOW_TEMPERATURE_BADGE:
+        temp_val = f"{soc_temp_c:.1f}C" if soc_temp_c is not None else "--C"
+        tw, th = get_hud_text_size(temp_val, font_size, font, font_scale, thickness)
 
         icon_w = 13
         icon_pad = 6
-        mem_box_w = tw + icon_w + icon_pad + (pad_x * 2) + 2
+        temp_box_w = tw + icon_w + icon_pad + (pad_x * 2) + 2
 
-        cursor_x -= mem_box_w
-        if should_draw("memory", cursor_x, top_margin, mem_box_w, box_h):
-            mem_color = get_status_color(
-                mem_pct, [20, 10], [status_good, status_warn, status_bad]
-            )
+        cursor_x -= temp_box_w
+        if should_draw("temperature", cursor_x, top_margin, temp_box_w, box_h):
+            if soc_temp_c is None:
+                temp_color = (128, 128, 128)
+            elif soc_temp_c >= 80:
+                temp_color = status_bad
+            elif soc_temp_c >= 70:
+                temp_color = status_warn
+            else:
+                temp_color = status_good
             draw_box(
                 frame,
                 cursor_x,
                 top_margin,
-                mem_box_w,
+                temp_box_w,
                 box_h,
                 bg_color=surface_variant,
                 border_color=panel_border,
@@ -1133,25 +1129,48 @@ def draw_hud(
             )
 
             ic_x = cursor_x + pad_x
-            ic_y = top_margin + 10
-            cv2.rectangle(frame, (ic_x, ic_y), (ic_x + icon_w, ic_y + 14), mem_color, 1, cv2.LINE_AA)
+            ic_y = top_margin + 7
+            stem_x = ic_x + icon_w // 2
+            stem_top = ic_y + 2
+            stem_bottom = ic_y + 14
+            bulb_center = (stem_x, ic_y + 18)
+
             cv2.line(
-                frame, (ic_x + 2, ic_y + 3), (ic_x + icon_w - 2, ic_y + 3), mem_color, 1
+                frame,
+                (stem_x, stem_top),
+                (stem_x, stem_bottom),
+                temp_color,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.circle(frame, (stem_x, stem_top), 2, temp_color, 1, cv2.LINE_AA)
+            cv2.circle(frame, bulb_center, 5, temp_color, -1, cv2.LINE_AA)
+            cv2.circle(frame, bulb_center, 5, temp_color, 1, cv2.LINE_AA)
+
+            tick_color = font_color if soc_temp_c is not None else muted_color
+            cv2.line(
+                frame,
+                (stem_x + 4, ic_y + 5),
+                (stem_x + 7, ic_y + 5),
+                tick_color,
+                1,
+                cv2.LINE_AA,
             )
             cv2.line(
                 frame,
-                (ic_x + 2, ic_y + 10),
-                (ic_x + icon_w - 2, ic_y + 10),
-                mem_color,
+                (stem_x + 4, ic_y + 10),
+                (stem_x + 7, ic_y + 10),
+                tick_color,
                 1,
+                cv2.LINE_AA,
             )
 
             put_hud_text(
                 frame,
-                mem_val,
+                temp_val,
                 ic_x + icon_w + icon_pad,
                 text_center_y,
-                font_color if mem_pct is not None else muted_color,
+                font_color if soc_temp_c is not None else muted_color,
                 font_size,
                 font,
                 font_scale,
@@ -1188,7 +1207,7 @@ def show_placeholder(message: str) -> None:
     )
 
     # Use draw_hud with placeholders
-    draw_hud(frame, fps=0, rssi=None, mem_pct=None)
+    draw_hud(frame, fps=0, rssi=None, soc_temp_c=None)
 
     cv2.imshow("frame", frame)
 
@@ -1228,11 +1247,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
         current_rssi = rssi_value
     with fps_lock:
         current_fps = fps_value
-    with memory_lock:
-        current_memory = memory_percent
+    with temperature_lock:
+        current_temperature = soc_temperature_c
 
     # Draw HUD
-    draw_hud(frame, current_fps, current_rssi, current_memory)
+    draw_hud(frame, current_fps, current_rssi, current_temperature)
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -1278,11 +1297,11 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
         current_rssi = rssi_value
     with fps_lock:
         current_fps = fps_value
-    with memory_lock:
-        current_memory = memory_percent
+    with temperature_lock:
+        current_temperature = soc_temperature_c
 
     # Draw HUD
-    draw_hud(frame, current_fps, current_rssi, current_memory)
+    draw_hud(frame, current_fps, current_rssi, current_temperature)
 
     return frame
 
@@ -1356,8 +1375,8 @@ def main() -> None:
     start_startup(force=True)
     # Start monitoring threads early so they show status during startup
     start_rssi_monitor()
-    if SHOW_MEMORY_BADGE:
-        start_memory_monitor()
+    if SHOW_TEMPERATURE_BADGE:
+        start_temperature_monitor()
     show_placeholder("STARTUP: Initializing camera...")
     cv2.waitKey(1)
 
@@ -1465,7 +1484,6 @@ def main() -> None:
                 coordinates = [x, y]
                 if 10 <= x <= 46 and 15 <= y <= 276:
                     time_overlap = True
-                    print("time_overlap")
 
                 # Only draw motion boxes if flag is enabled
                 if SHOW_MOTION_BOXES:
@@ -1504,14 +1522,14 @@ def main() -> None:
                 current_rssi = rssi_value
             with fps_lock:
                 current_fps = fps_value
-            with memory_lock:
-                current_memory = memory_percent
+            with temperature_lock:
+                current_temperature = soc_temperature_c
 
             draw_hud(
                 disp,
                 current_fps,
                 current_rssi,
-                current_memory,
+                current_temperature,
                 motion_detected,
                 time_overlap,
                 coordinates,

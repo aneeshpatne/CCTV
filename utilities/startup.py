@@ -1,4 +1,6 @@
 import logging
+import os
+import socket
 import time
 import requests
 from requests.exceptions import RequestException
@@ -15,19 +17,104 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 count = 1
 
+CAMERA_BASE_URL = os.getenv("ESP32CAM_BASE_URL", "http://192.168.0.13")
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+ESP32CAM_RECOVERY_REDIS_KEY = "esp32cam:recovery"
+RECOVERY_TRIGGER_FAILURES = 3
+RECOVERY_STATUS_DELAY_SECONDS = 5
+
+
+def redis_set(key: str, value: str) -> None:
+    def encode_command(*command_parts: str) -> bytes:
+        payload = f"*{len(command_parts)}\r\n"
+        for part in command_parts:
+            encoded = part.encode("utf-8")
+            payload += f"${len(encoded)}\r\n{part}\r\n"
+        return payload.encode("utf-8")
+
+    def expect_ok(stream) -> None:
+        response = stream.readline()
+        if response.startswith(b"-"):
+            raise RuntimeError(response[1:].decode("utf-8", errors="replace").strip())
+        if response != b"+OK\r\n":
+            raise RuntimeError(f"Unexpected Redis response: {response!r}")
+
+    with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=2.0) as client:
+        stream = client.makefile("rb")
+
+        if REDIS_PASSWORD:
+            client.sendall(encode_command("AUTH", REDIS_PASSWORD))
+            expect_ok(stream)
+
+        if REDIS_DB:
+            client.sendall(encode_command("SELECT", str(REDIS_DB)))
+            expect_ok(stream)
+
+        client.sendall(encode_command("SET", key, value))
+        expect_ok(stream)
+
+
+def status_v2() -> dict | None:
+    try:
+        res = requests.get(f"{CAMERA_BASE_URL}/status-v2", timeout=2)
+        res.raise_for_status()
+        data = res.json()
+    except (RequestException, ValueError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def run_recovery_mode() -> bool:
+    logger.warning("Entering ESP32-CAM recovery mode")
+    try:
+        redis_set(ESP32CAM_RECOVERY_REDIS_KEY, "true")
+    except Exception as err:
+        logger.warning(f"Failed to enable recovery flag in Redis: {err}")
+        return False
+
+    time.sleep(RECOVERY_STATUS_DELAY_SECONDS)
+    data = status_v2()
+    logger.info(f"Recovery status-v2 response: {data}")
+
+    if data and data.get("mode") == "OTA":
+        try:
+            redis_set(ESP32CAM_RECOVERY_REDIS_KEY, "false")
+        except Exception as err:
+            logger.warning(f"Failed to disable recovery flag in Redis: {err}")
+            return False
+
+        logger.info("Recovery mode reached OTA; resetting camera")
+        reset()
+        return True
+
+    logger.warning("Recovery mode did not reach OTA")
+    return False
+
 
 def startup():
     global count
+    consecutive_connection_failures = 0
     while True:
         stat = status()
         if stat == None:
+            consecutive_connection_failures += 1
             logger.warning(
                 f"Camera Connection Failed Retrying, Attempt Number: {count}"
             )
             count += 1
+            if consecutive_connection_failures >= RECOVERY_TRIGGER_FAILURES:
+                run_recovery_mode()
+                consecutive_connection_failures = 0
             # reset()
             time.sleep(10)
             continue
+        consecutive_connection_failures = 0
         i = 1
         logger.info("Camera Initiated")
         logger.info(f"Initial Quality: {stat}")

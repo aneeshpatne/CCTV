@@ -32,6 +32,11 @@ app.add_middleware(
 # Configure your CCTV footage directory
 BASE_DIR = Path(__file__).resolve().parent.parent
 TEMP_FOLDER = Path(os.getenv("CCTV_TEMP_DIR", "/tmp/cctv_merged"))
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+ESP32CAM_RECOVERY_REDIS_KEY = "esp32cam:recovery"
 
 
 def resolve_path(env_keys: list[str], fallback_paths: list[Path]) -> Path:
@@ -64,6 +69,51 @@ NIGHT_EVENTS_FOLDER = resolve_path(
 TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
 
 
+def redis_command(*parts: str) -> str | None:
+    def encode_command(*command_parts: str) -> bytes:
+        payload = f"*{len(command_parts)}\r\n"
+        for part in command_parts:
+            encoded = part.encode("utf-8")
+            payload += f"${len(encoded)}\r\n{part}\r\n"
+        return payload.encode("utf-8")
+
+    with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=2.0) as client:
+        stream = client.makefile("rb")
+
+        if REDIS_PASSWORD:
+            client.sendall(encode_command("AUTH", REDIS_PASSWORD))
+            response = stream.readline()
+            if response.startswith(b"-"):
+                raise RuntimeError(response[1:].decode("utf-8", errors="replace").strip())
+
+        if REDIS_DB:
+            db = str(REDIS_DB)
+            client.sendall(encode_command("SELECT", db))
+            response = stream.readline()
+            if response.startswith(b"-"):
+                raise RuntimeError(response[1:].decode("utf-8", errors="replace").strip())
+
+        client.sendall(encode_command(*parts))
+        line = stream.readline()
+        if line == b"$-1\r\n":
+            return None
+        if line.startswith(b"-"):
+            raise RuntimeError(line[1:].decode("utf-8", errors="replace").strip())
+        if not line.startswith(b"$"):
+            raise RuntimeError(f"Unexpected Redis response: {line!r}")
+
+        length = int(line[1:].strip())
+        value = stream.read(length)
+        stream.read(2)
+        return value.decode("utf-8", errors="replace")
+
+
+def parse_bool(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @app.get("/")
 async def root():
     """Root endpoint with server info"""
@@ -90,9 +140,20 @@ async def root():
             "motion_hourly_stats_last_month": "/motion/stats/hourly-last-month",
             "night_events_list": "/nightevents",
             "night_event_by_index": "/nightevents/{index}",
+            "esp32cam_recovery": "/esp32cam/recovery",
             "docs": "/docs",
         },
     }
+
+
+@app.get("/esp32cam/recovery")
+async def get_esp32cam_recovery():
+    try:
+        value = redis_command("GET", ESP32CAM_RECOVERY_REDIS_KEY)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Redis unavailable: {e}")
+
+    return {"recovery": parse_bool(value)}
 
 
 def find_videos_in_range(start_time: datetime, end_time: datetime) -> list[Path]:
