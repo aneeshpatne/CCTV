@@ -1,14 +1,18 @@
+from __future__ import annotations
+
 import logging
 import os
 import socket
 import time
-import requests
 from requests.exceptions import RequestException
 
-from tools.status import status
 from tools.changeQuality import change_quality
-from tools.reset import reset
 from tools.changeClock import change_clock
+from utilities.esp32cam_client import (
+    CameraStatus,
+    get_camera_status,
+    get_camera_status_with_retry,
+)
 
 # Set up logging
 logging.basicConfig(
@@ -17,7 +21,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 count = 1
 
-CAMERA_BASE_URL = os.getenv("ESP32CAM_BASE_URL", "http://192.168.0.13")
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
@@ -25,6 +28,17 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 ESP32CAM_RECOVERY_REDIS_KEY = "esp32cam:recovery"
 RECOVERY_TRIGGER_FAILURES = 3
 RECOVERY_STATUS_DELAY_SECONDS = 5
+
+
+class CameraRecoveryMode(RuntimeError):
+    def __init__(self, status: CameraStatus):
+        self.status = status
+        detail = "Device is in recovery / OTA-only mode"
+        if status.reason:
+            detail = f"{detail}: {status.reason}"
+        if status.bad_boot_count is not None:
+            detail = f"{detail} (badBootCount={status.bad_boot_count})"
+        super().__init__(detail)
 
 
 def redis_set(key: str, value: str) -> None:
@@ -58,16 +72,10 @@ def redis_set(key: str, value: str) -> None:
 
 
 def status_v2() -> dict | None:
-    try:
-        res = requests.get(f"{CAMERA_BASE_URL}/status-v2", timeout=2)
-        res.raise_for_status()
-        data = res.json()
-    except (RequestException, ValueError):
+    status = get_camera_status(timeout=2)
+    if status.source != "status-v2":
         return None
-
-    if not isinstance(data, dict):
-        return None
-    return data
+    return status.raw
 
 
 def run_recovery_mode() -> bool:
@@ -79,18 +87,19 @@ def run_recovery_mode() -> bool:
         return False
 
     time.sleep(RECOVERY_STATUS_DELAY_SECONDS)
-    data = status_v2()
-    logger.info(f"Recovery status-v2 response: {data}")
+    status = get_camera_status(timeout=2)
+    logger.info(f"Recovery status response: {status.raw}")
 
-    if data and data.get("mode") == "OTA":
+    if status.ota_only:
         try:
             redis_set(ESP32CAM_RECOVERY_REDIS_KEY, "false")
         except Exception as err:
             logger.warning(f"Failed to disable recovery flag in Redis: {err}")
             return False
 
-        logger.info("Recovery mode reached OTA; resetting camera")
-        reset()
+        logger.warning(
+            "Device is in recovery / OTA-only mode. Leaving reset as explicit user action."
+        )
         return True
 
     logger.warning("Recovery mode did not reach OTA")
@@ -101,23 +110,34 @@ def startup():
     global count
     consecutive_connection_failures = 0
     while True:
-        stat = status()
-        if stat == None:
+        camera_status = get_camera_status_with_retry(attempts=3, timeout=2)
+        if camera_status.ota_only:
+            logger.warning("%s", CameraRecoveryMode(camera_status))
+            raise CameraRecoveryMode(camera_status)
+
+        if not camera_status.camera_online:
             consecutive_connection_failures += 1
             logger.warning(
-                f"Camera Connection Failed Retrying, Attempt Number: {count}"
+                f"Camera offline or starting, retrying, attempt number: {count}"
             )
             count += 1
             if consecutive_connection_failures >= RECOVERY_TRIGGER_FAILURES:
-                run_recovery_mode()
+                if run_recovery_mode():
+                    recovery_status = get_camera_status(timeout=2)
+                    if recovery_status.ota_only:
+                        raise CameraRecoveryMode(recovery_status)
                 consecutive_connection_failures = 0
-            # reset()
             time.sleep(10)
             continue
         consecutive_connection_failures = 0
+        stat = camera_status.framesize
         i = 1
         logger.info("Camera Initiated")
-        logger.info(f"Initial Quality: {stat}")
+        logger.info(f"Initial status: {camera_status.raw}")
+        if stat is None:
+            logger.warning("Camera status missing framesize; retrying startup")
+            time.sleep(5)
+            continue
         i = max(int(stat), 10)
         while i < 12:
             logger.info(f"Current Resolution: {i}")
@@ -137,7 +157,12 @@ def startup():
                 time.sleep(5)
                 break
 
-            stat = status()
+            camera_status = get_camera_status_with_retry(attempts=3, timeout=2)
+            if camera_status.ota_only:
+                logger.warning("%s", CameraRecoveryMode(camera_status))
+                raise CameraRecoveryMode(camera_status)
+
+            stat = camera_status.framesize if camera_status.camera_online else None
             if stat == None or int(stat) != i + 1:
                 logger.warning("Resolution Change Failed")
                 i = 10
