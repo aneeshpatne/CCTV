@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 
 # CRITICAL: Set FFMPEG options BEFORE importing cv2
@@ -28,10 +30,12 @@ try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
     Image = ImageDraw = ImageFont = None
-from utilities.startup import startup
+from utilities.startup import CameraRecoveryMode, startup
+from utilities.esp32cam_client import get_camera_status_with_retry
 from utilities.warn import NonBlockingBlinker
 from tools.get_rssi import get_rssi
 from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
+from tools.reset import reset
 from utilities.EventAccumulator import EventAccumulator
 from utilities.motion_db_new import log_motion_event
 
@@ -187,6 +191,9 @@ if no_signal_img is None:
 
 startup_complete = threading.Event()
 startup_thread = None
+device_state = "offline"
+device_state_detail = "waiting for first status check"
+device_state_lock = threading.Lock()
 startup_lock = threading.Lock()
 
 # Camera adjustment state (run after stream starts)
@@ -593,11 +600,89 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         return True
 
 
+def set_device_state(state: str, detail: str = "") -> None:
+    global device_state, device_state_detail
+    with device_state_lock:
+        device_state = state
+        device_state_detail = detail
+
+
+def get_device_state_message(prefix: str, attempt: int | None = None) -> str:
+    with device_state_lock:
+        state = device_state
+        detail = device_state_detail
+
+    if state == "ota-only":
+        base = "RECOVERY: OTA-only mode"
+    elif state == "wifi-online-camera-starting":
+        base = "STARTUP: WiFi online, camera server starting"
+    elif state == "camera-online":
+        base = "STREAM: Camera HTTP status online"
+    elif state == "offline":
+        base = "OFFLINE: Device unreachable"
+    else:
+        base = f"{prefix}: {state}"
+
+    if attempt is not None:
+        base = f"{base} | stream attempt {attempt}"
+    if detail:
+        base = f"{base}\n{detail}"
+    return base
+
+
+def is_device_ota_only() -> bool:
+    with device_state_lock:
+        return device_state == "ota-only"
+
+
+def status_detail(status) -> str:
+    details = []
+    if status.source:
+        details.append(f"status={status.source}")
+    if status.mode:
+        details.append(f"mode={status.mode}")
+    if status.framesize is not None:
+        details.append(f"framesize={status.framesize}")
+    if status.reason:
+        details.append(f"reason={status.reason}")
+    if status.bad_boot_count is not None:
+        details.append(f"badBootCount={status.bad_boot_count}")
+    return ", ".join(details)
+
+
+def exit_ota_recovery_and_check() -> bool:
+    set_device_state(
+        "restarting",
+        "clearing recovery flag in Redis, then sending ESP32 reset",
+    )
+    if not reset():
+        set_device_state(
+            "ota-only",
+            "failed to clear Redis recovery flag or send reset; manual intervention required",
+        )
+        return False
+
+    set_device_state(
+        "restarting",
+        "reset sent; waiting 10 seconds before checking /status-v2",
+    )
+    time.sleep(10)
+
+    status = get_camera_status_with_retry(attempts=3, timeout=2)
+    detail = status_detail(status)
+    set_device_state(status.state, detail)
+    return not status.ota_only
+
+
 def start_startup(force: bool = False) -> None:
     global startup_thread, camera_adjustments_done
     with startup_lock:
         if force:
             startup_complete.clear()
+            set_device_state(
+                "wifi-online-camera-starting",
+                "running quality/clock startup checks before opening MJPEG",
+            )
             # Reset camera adjustments flag so they run again after this startup
             with camera_adjustments_lock:
                 camera_adjustments_done = False
@@ -618,11 +703,32 @@ def start_startup(force: bool = False) -> None:
                 while not startup_complete.is_set():
                     try:
                         print(f"Running startup attempt {attempt}...")
+                        set_device_state(
+                            "wifi-online-camera-starting",
+                            f"startup attempt {attempt}: polling status and applying camera settings",
+                        )
                         startup()
+                        set_device_state(
+                            "camera-online",
+                            "startup complete; opening MJPEG stream next",
+                        )
                         startup_complete.set()
                         print("Startup completed successfully!")
                         # Monitoring threads are already started in main()
+                    except CameraRecoveryMode as exc:
+                        set_device_state("ota-only", str(exc))
+                        print(exc)
+                        print("Attempting to exit OTA-only recovery mode.")
+                        if exit_ota_recovery_and_check():
+                            attempt += 1
+                            continue
+                        print("Startup paused because device is still in OTA-only recovery mode.")
+                        break
                     except Exception as exc:
+                        set_device_state(
+                            "offline",
+                            f"startup attempt {attempt} failed: {exc}",
+                        )
                         print(f"Startup failed with error: {exc}")
                         print("Retrying startup in 5 s...")
                         time.sleep(5)
@@ -1184,6 +1290,20 @@ def backoff(attempt: int) -> float:
     return min(5.0, 2 ** max(0, attempt - 1))
 
 
+def draw_status_message(frame: np.ndarray, message: str) -> None:
+    for index, line in enumerate(message.splitlines()):
+        cv2.putText(
+            frame,
+            line[:82],
+            (30, 100 + index * 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA,
+        )
+
+
 def show_placeholder(message: str) -> None:
     if not SHOW_LOCAL_VIEW:
         return  # Don't show placeholder if local view is disabled
@@ -1194,17 +1314,7 @@ def show_placeholder(message: str) -> None:
     )
     frame = base.copy()
 
-    # Message
-    cv2.putText(
-        frame,
-        message,
-        (30, 100),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (200, 200, 200),
-        1,
-        cv2.LINE_AA,
-    )
+    draw_status_message(frame, message)
 
     # Use draw_hud with placeholders
     draw_hud(frame, fps=0, rssi=None, soc_temp_c=None)
@@ -1230,17 +1340,7 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
             cv2.LINE_AA,
         )
 
-    # Draw message below HUD area
-    cv2.putText(
-        frame,
-        message,
-        (30, 100),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (200, 200, 200),
-        1,
-        cv2.LINE_AA,
-    )
+    draw_status_message(frame, message)
 
     # Get current status values
     with rssi_lock:
@@ -1280,17 +1380,7 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
 
     frame = base.copy()
 
-    # Draw message
-    cv2.putText(
-        frame,
-        message,
-        (30, 100),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (200, 200, 200),
-        1,
-        cv2.LINE_AA,
-    )
+    draw_status_message(frame, message)
 
     # Get current status values
     with rssi_lock:
@@ -1326,13 +1416,27 @@ def record_no_signal_frame(message: str) -> None:
 
 def open_capture_with_timeout() -> Optional[MjpegStreamCapture]:
     """Open the HTTP MJPEG stream with a bounded connection timeout."""
+    status = get_camera_status_with_retry(attempts=3, timeout=2)
+    detail = status_detail(status)
+    set_device_state(status.state, detail)
+
+    if status.ota_only:
+        reason = f": {status.reason}" if status.reason else ""
+        print(f"Device is in recovery / OTA-only mode{reason}")
+        return None
+    if not status.camera_online:
+        print("Device is offline or camera is still starting; stream open deferred.")
+        return None
+
     cap = MjpegStreamCapture(
         MJPEG_STREAM_URL,
         open_timeout=CAPTURE_OPEN_TIMEOUT,
         read_timeout=FRAME_READ_TIMEOUT,
     )
     if cap.open():
+        set_device_state("camera-online", f"{detail}; MJPEG stream opened")
         return cap
+    set_device_state(status.state, f"{detail}; MJPEG stream open failed")
     cap.release()
     return None
 
@@ -1377,7 +1481,7 @@ def main() -> None:
     start_rssi_monitor()
     if SHOW_TEMPERATURE_BADGE:
         start_temperature_monitor()
-    show_placeholder("STARTUP: Initializing camera...")
+    show_placeholder(get_device_state_message("STARTUP"))
     cv2.waitKey(1)
 
     try:
@@ -1395,9 +1499,7 @@ def main() -> None:
                     cap.release()
                     cap = None
 
-                # Show and record "no signal" frame during initialization
-                # RSSI/Memory monitors are running, showing actual camera health
-                record_no_signal_frame("STARTUP: Configuring camera...")
+                record_no_signal_frame(get_device_state_message("STARTUP"))
 
                 time.sleep(0.05)
                 continue
@@ -1408,9 +1510,9 @@ def main() -> None:
                     time.sleep(FRAME_FAILURE_RECONNECT_DELAY)
                     cap = None
 
-                # Show and record "no signal" frame during connection attempts
-                # Startup is complete, but video stream not connected yet
-                record_no_signal_frame(f"STREAM: Connecting (attempt {attempt + 1})...")
+                record_no_signal_frame(
+                    get_device_state_message("STREAM", attempt=attempt + 1)
+                )
 
                 cap = open_capture_with_timeout()
                 if cap is None or not cap.isOpened():
@@ -1420,9 +1522,11 @@ def main() -> None:
                     cap = None
                     attempt += 1
                     time.sleep(backoff(attempt))
-                    start_startup(force=True)
+                    if not is_device_ota_only():
+                        start_startup(force=True)
                     continue
                 print("Connection established.")
+                set_device_state("camera-online", "MJPEG stream connected")
                 attempt = 0
 
             try:
