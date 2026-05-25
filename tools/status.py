@@ -1,12 +1,8 @@
-import requests
+from utilities.esp32cam_client import get_camera_status
 
 
 def status():
-    try:
-        res = requests.get("http://192.168.0.13/status", timeout=2)
-        data = res.json().get("framesize")
-    except requests.exceptions.Timeout:
-        data = None
-    except (requests.exceptions.RequestException, ValueError, KeyError) as e:
-        data = None
-    return data
+    camera_status = get_camera_status(timeout=2)
+    if not camera_status.camera_online:
+        return None
+    return camera_status.framesize

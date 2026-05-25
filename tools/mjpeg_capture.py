@@ -5,7 +5,9 @@ import cv2
 import numpy as np
 import requests
 
-MJPEG_STREAM_URL = "http://192.168.0.13:81/stream"
+from utilities.esp32cam_client import CAMERA_STREAM_URL
+
+MJPEG_STREAM_URL = CAMERA_STREAM_URL
 
 
 class MjpegStreamCapture:

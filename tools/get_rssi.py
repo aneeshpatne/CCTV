@@ -4,6 +4,8 @@ Fetches WiFi signal strength from the camera's /rssi endpoint.
 Returns signal strength in dBm (-30 to -90, where higher values = better signal).
 """
 
+from __future__ import annotations
+
 import requests
 
 

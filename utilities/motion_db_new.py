@@ -3,6 +3,8 @@
 This module manages motion detection events in a SQLite database.
 """
 
+from __future__ import annotations
+
 from datetime import datetime, time, timedelta
 from pathlib import Path
 import os
