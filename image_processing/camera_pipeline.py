@@ -1441,6 +1441,41 @@ def open_capture_with_timeout() -> Optional[MjpegStreamCapture]:
     return None
 
 
+class FrameReadTimeout(Exception):
+    pass
+
+
+def _timeout_handler(_signum, _frame):
+    raise FrameReadTimeout()
+
+
+def read_frame_with_timeout(cap: MjpegStreamCapture):
+    """Read one frame while making SIGALRM cleanup part of the recovery path."""
+    ret = False
+    frame = None
+    timed_out = False
+
+    try:
+        signal.setitimer(signal.ITIMER_REAL, FRAME_READ_TIMEOUT)
+        ret, frame = cap.read()
+    except FrameReadTimeout:
+        timed_out = True
+    finally:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        except FrameReadTimeout:
+            timed_out = True
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            except FrameReadTimeout:
+                pass
+
+    if timed_out:
+        print("Frame read timed out - forcing restart.")
+        return False, None
+    return ret, frame
+
+
 def main() -> None:
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
     attempt = 0
@@ -1454,12 +1489,6 @@ def main() -> None:
     blinker = NonBlockingBlinker(blink_interval=0.5)
 
     # Ensure SIGALRM interrupts blocking frame reads after FRAME_READ_TIMEOUT seconds.
-    class FrameReadTimeout(Exception):
-        pass
-
-    def _timeout_handler(_signum, _frame):
-        raise FrameReadTimeout()
-
     signal.signal(signal.SIGALRM, _timeout_handler)
 
     print("Starting camera initialization in background...")
@@ -1529,14 +1558,7 @@ def main() -> None:
                 set_device_state("camera-online", "MJPEG stream connected")
                 attempt = 0
 
-            try:
-                signal.setitimer(signal.ITIMER_REAL, FRAME_READ_TIMEOUT)
-                ret, frame = cap.read()
-            except FrameReadTimeout:
-                print("Frame read timed out - forcing restart.")
-                ret, frame = False, None
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
+            ret, frame = read_frame_with_timeout(cap)
 
             if not ret or frame is None:
                 print("Frame read failed - signal lost.")

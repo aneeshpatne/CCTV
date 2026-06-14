@@ -35,6 +35,8 @@ STOP_TIMEOUT_SECONDS = 5.0
 
 _camera_process_lock = threading.Lock()
 _camera_process: Optional[subprocess.Popen] = None
+_camera_monitor_lock = threading.Lock()
+_camera_monitor: Optional["CameraProcessMonitor"] = None
 _storage_monitor_lock = threading.Lock()
 _storage_monitor: Optional["StorageMonitor"] = None
 _shutdown_event = threading.Event()
@@ -291,11 +293,56 @@ class StorageMonitor(threading.Thread):
         logging.info("[monitor] Storage monitor thread stopped.")
 
 
+class CameraProcessMonitor(threading.Thread):
+    """Restart the camera pipeline if it exits while the orchestrator is running."""
+
+    def __init__(self, interval_seconds: float = 2.0) -> None:
+        super().__init__(daemon=True)
+        self.interval = interval_seconds
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        global _camera_process
+
+        logging.info("[monitor] Camera process monitor thread started.")
+        while not self._stop_event.is_set():
+            with _camera_process_lock:
+                proc = _camera_process
+
+            if proc is None:
+                if not _shutdown_event.is_set():
+                    logging.warning("[monitor] Camera pipeline missing; starting it.")
+                    start_camera_pipeline()
+            else:
+                return_code = proc.poll()
+                if return_code is not None and not _shutdown_event.is_set():
+                    logging.warning(
+                        "[monitor] Camera pipeline exited with code %s; restarting.",
+                        return_code,
+                    )
+                    with _camera_process_lock:
+                        if _camera_process is proc:
+                            _camera_process = None
+                    start_camera_pipeline()
+
+            if self._stop_event.wait(self.interval):
+                break
+        logging.info("[monitor] Camera process monitor thread stopped.")
+
+
 def start_orchestrator() -> None:
     """Start the camera pipeline and the storage monitor."""
-    global _storage_monitor
+    global _camera_monitor, _storage_monitor
 
     start_camera_pipeline()
+
+    with _camera_monitor_lock:
+        if _camera_monitor is None or not _camera_monitor.is_alive():
+            _camera_monitor = CameraProcessMonitor()
+            _camera_monitor.start()
 
     with _storage_monitor_lock:
         if _storage_monitor is None or not _storage_monitor.is_alive():
@@ -309,11 +356,19 @@ def start_orchestrator() -> None:
 
 def shutdown_orchestrator(sig: signal.Signals = signal.SIGTERM) -> None:
     """Stop the storage monitor and camera pipeline."""
-    global _storage_monitor
+    global _camera_monitor, _storage_monitor
 
     logging.info("[orchestrator] Shutting down (signal=%s).", sig.name)
 
     _shutdown_event.set()
+
+    with _camera_monitor_lock:
+        camera_monitor = _camera_monitor
+        _camera_monitor = None
+
+    if camera_monitor is not None:
+        camera_monitor.stop()
+        camera_monitor.join(timeout=STOP_TIMEOUT_SECONDS)
 
     with _storage_monitor_lock:
         monitor = _storage_monitor
