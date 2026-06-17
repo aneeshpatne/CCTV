@@ -5,8 +5,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$SCRIPT_DIR"
 VENV_DIR_DEFAULT="$BASE_DIR/.venv"
 VENV_DIR_FALLBACK="$BASE_DIR/venv"
-LOG_FILE_DEFAULT="$BASE_DIR/motion/motion.log"
-DATA_DIR_DEFAULT="$BASE_DIR/motion/data"
+LOG_FILE_DEFAULT="/Volumes/drive/CCTV/motion/motion.log"
+DATA_DIR_DEFAULT="/Volumes/drive/CCTV/motion/data"
+if [[ ! -d "$(dirname "$LOG_FILE_DEFAULT")" ]]; then
+  LOG_FILE_DEFAULT="$BASE_DIR/motion/motion.log"
+fi
+if [[ ! -d "$(dirname "$DATA_DIR_DEFAULT")" ]]; then
+  DATA_DIR_DEFAULT="$BASE_DIR/motion/data"
+fi
 
 VENV_DIR="${VENV_DIR:-$VENV_DIR_DEFAULT}"
 LOG_FILE="${LOG_FILE:-$LOG_FILE_DEFAULT}"
