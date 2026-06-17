@@ -15,6 +15,7 @@ import time
 import signal
 import subprocess
 import requests
+import sys
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
@@ -61,6 +62,9 @@ USE_DYNAMIC_FPS = False  # Use fixed output FPS for stream stability
 FIXED_OUTPUT_FPS = 9.0
 VIDEO_BITRATE_KBPS = 1500
 VIDEO_BUFSIZE_KBPS = 3000
+CCTV_H264_ENCODER = os.getenv("CCTV_H264_ENCODER", "auto").lower()
+USE_APPLE_VIDEOTOOLBOX = sys.platform == "darwin" and CCTV_H264_ENCODER != "libx264"
+_videotoolbox_failed = False
 
 # Display configuration
 SHOW_MOTION_BOXES = False  # Show motion detection boxes and ROI polygon
@@ -268,6 +272,47 @@ expected_frame_size: Optional[tuple[int, int]] = (
 current_fps: Optional[float] = None  # Active FPS used by FFmpeg
 
 
+def _using_videotoolbox() -> bool:
+    return USE_APPLE_VIDEOTOOLBOX and not _videotoolbox_failed
+
+
+def _mark_videotoolbox_failed(reason: str) -> None:
+    global _videotoolbox_failed
+    if _using_videotoolbox() and CCTV_H264_ENCODER != "videotoolbox":
+        _videotoolbox_failed = True
+        print(f"VideoToolbox encoder failed ({reason}); falling back to libx264.")
+
+
+def _h264_encoder_args(realtime: bool) -> list[str]:
+    """Return FFmpeg H.264 encoder args for the current platform."""
+    if _using_videotoolbox():
+        args = [
+            "-vf",
+            "format=nv12",
+            "-c:v",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "0",
+            "-power_efficient",
+            "1",
+        ]
+        if realtime:
+            args.extend(["-realtime", "1", "-prio_speed", "1"])
+        return args
+
+    args = [
+        "-vf",
+        "format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast" if realtime else "medium",
+    ]
+    if realtime:
+        args.extend(["-tune", "zerolatency"])
+    return args
+
+
 def start_ffmpeg_record(
     width: int, height: int, fps: float
 ) -> Optional[subprocess.Popen]:
@@ -297,12 +342,7 @@ def start_ffmpeg_record(
         "-",
         "-map",
         "0:v",
-        # videotoolbox-friendly pixel format
-        "-vf",
-        "format=nv12",
-        # hardware encoder (Intel Mac)
-        "-c:v",
-        "h264_videotoolbox",
+        *_h264_encoder_args(realtime=False),
         # stable quality (avoid blur/clear cycling)
         "-b:v",
         f"{VIDEO_BITRATE_KBPS}k",
@@ -342,7 +382,8 @@ def start_ffmpeg_record(
             stderr=logf,  # keep stderr for diagnostics
             bufsize=0,
         )
-        print(f"FFmpeg VFR recording started: {out_pattern}")
+        encoder = "h264_videotoolbox" if _using_videotoolbox() else "libx264"
+        print(f"FFmpeg VFR recording started with {encoder}: {out_pattern}")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg: {e}")
@@ -375,12 +416,7 @@ def start_ffmpeg_rtsp(
         "-",
         "-map",
         "0:v",
-        # Convert to videotoolbox-friendly format
-        "-vf",
-        "format=nv12",
-        # Hardware encoder (Intel Quick Sync via VideoToolbox)
-        "-c:v",
-        "h264_videotoolbox",
+        *_h264_encoder_args(realtime=True),
         # Stable bitrate (no pulsing)
         "-b:v",
         f"{VIDEO_BITRATE_KBPS}k",
@@ -411,7 +447,8 @@ def start_ffmpeg_rtsp(
             stderr=logf,
             bufsize=0,
         )
-        print(f"FFmpeg VFR RTSP started: {RTSP_OUT}")
+        encoder = "h264_videotoolbox" if _using_videotoolbox() else "libx264"
+        print(f"FFmpeg VFR RTSP started with {encoder}: {RTSP_OUT}")
         return proc
     except Exception as e:
         print(f"Failed to start FFmpeg RTSP: {e}")
@@ -490,6 +527,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             if ffmpeg_record_proc is not None and ffmpeg_record_proc.poll() is not None:
                 exit_code = ffmpeg_record_proc.poll()
                 print(f"Recording FFmpeg exited (code {exit_code}); restarting...")
+                _mark_videotoolbox_failed(f"recording exited with code {exit_code}")
                 stop_ffmpeg(ffmpeg_record_proc)
                 ffmpeg_record_proc = None
             if ffmpeg_record_proc is None:
@@ -502,6 +540,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             if ffmpeg_rtsp_proc is not None and ffmpeg_rtsp_proc.poll() is not None:
                 exit_code = ffmpeg_rtsp_proc.poll()
                 print(f"RTSP FFmpeg exited (code {exit_code}); restarting...")
+                _mark_videotoolbox_failed(f"rtsp exited with code {exit_code}")
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             if ffmpeg_rtsp_proc is None:
@@ -525,6 +564,7 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                     proc.stdin.write(frame_bytes)
             except (BrokenPipeError, IOError) as err:
                 print(f"FFmpeg {label} pipe error ({err}); restarting...")
+                _mark_videotoolbox_failed(f"{label} pipe error")
                 stop_ffmpeg(proc)
                 return starter(target_width, target_height, target_fps)
             return proc
