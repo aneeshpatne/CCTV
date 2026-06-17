@@ -39,6 +39,9 @@ NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), "examples", "no_signal.
 FRAME_RETRY_DELAY = 0.5
 FRAME_READ_TIMEOUT = 5.0  # seconds
 CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for capture to open
+STREAM_STARTUP_FAILURE_THRESHOLD = 3
+CAMERA_STARTUP_COOLDOWN = 60.0
+BLINKER_COOLDOWN = 3.0  # seconds between blinker activations (debounce)
 
 # Recording configuration
 ENABLE_RECORDING = True
@@ -62,6 +65,7 @@ USE_DYNAMIC_FPS = False  # Use fixed output FPS for stream stability
 FIXED_OUTPUT_FPS = 9.0
 VIDEO_BITRATE_KBPS = 1500
 VIDEO_BUFSIZE_KBPS = 3000
+FFMPEG_LOG_MAX_BYTES = 20 * 1024 * 1024
 CCTV_H264_ENCODER = os.getenv("CCTV_H264_ENCODER", "auto").lower()
 USE_APPLE_VIDEOTOOLBOX = sys.platform == "darwin" and CCTV_H264_ENCODER != "libx264"
 _videotoolbox_failed = False
@@ -313,6 +317,17 @@ def _h264_encoder_args(realtime: bool) -> list[str]:
     return args
 
 
+def open_ffmpeg_log(log_path: Path):
+    """Open an FFmpeg stderr log, truncating stale multi-GB progress logs."""
+    try:
+        if log_path.exists() and log_path.stat().st_size > FFMPEG_LOG_MAX_BYTES:
+            with open(log_path, "wb", buffering=0) as logf:
+                logf.write(b"[log truncated after exceeding size cap]\n")
+    except OSError as exc:
+        print(f"Warning: could not truncate FFmpeg log {log_path}: {exc}")
+    return open(log_path, "ab", buffering=0)
+
+
 def start_ffmpeg_record(
     width: int, height: int, fps: float
 ) -> Optional[subprocess.Popen]:
@@ -326,6 +341,9 @@ def start_ffmpeg_record(
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostats",
         "-y",
         # raw frames over stdin
         "-f",
@@ -374,7 +392,7 @@ def start_ffmpeg_record(
     # ---- Spawn process with logging -------------------------------------------
     try:
         log_path = BASE_DIR / "ffmpeg_record.log"
-        logf = open(log_path, "ab", buffering=0)
+        logf = open_ffmpeg_log(log_path)
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -400,6 +418,9 @@ def start_ffmpeg_rtsp(
         "ffmpeg",
         "-nostdin",
         "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostats",
         "-y",
         # Raw frames from Python
         "-f",
@@ -432,6 +453,8 @@ def start_ffmpeg_rtsp(
         # RTSP output
         "-rtsp_transport",
         "tcp",
+        "-pkt_size",
+        "1200",
         "-f",
         "rtsp",
         RTSP_OUT,
@@ -439,7 +462,7 @@ def start_ffmpeg_rtsp(
 
     try:
         log_path = BASE_DIR / "ffmpeg_rtsp.log"
-        logf = open(log_path, "ab", buffering=0)
+        logf = open_ffmpeg_log(log_path)
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -540,7 +563,6 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             if ffmpeg_rtsp_proc is not None and ffmpeg_rtsp_proc.poll() is not None:
                 exit_code = ffmpeg_rtsp_proc.poll()
                 print(f"RTSP FFmpeg exited (code {exit_code}); restarting...")
-                _mark_videotoolbox_failed(f"rtsp exited with code {exit_code}")
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             if ffmpeg_rtsp_proc is None:
@@ -564,7 +586,8 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
                     proc.stdin.write(frame_bytes)
             except (BrokenPipeError, IOError) as err:
                 print(f"FFmpeg {label} pipe error ({err}); restarting...")
-                _mark_videotoolbox_failed(f"{label} pipe error")
+                if label == "recording":
+                    _mark_videotoolbox_failed(f"{label} pipe error")
                 stop_ffmpeg(proc)
                 return starter(target_width, target_height, target_fps)
             return proc
@@ -1356,6 +1379,11 @@ def main() -> None:
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
     attempt = 0
     cap = None
+    stream_failure_count = 0
+    first_stream_failure_at = 0.0
+    consecutive_good_frames = 0
+    GOOD_FRAMES_TO_RESET = 30  # require N consecutive good frames before clearing failure state
+    last_blinker_trigger = 0.0
 
     # Initialize motion detection components
     mog2 = cv2.createBackgroundSubtractorMOG2(
@@ -1395,6 +1423,31 @@ def main() -> None:
     show_placeholder("STARTUP: Initializing camera...")
     cv2.waitKey(1)
 
+    def maybe_restart_camera(reason: str) -> bool:
+        nonlocal stream_failure_count, first_stream_failure_at
+        now = time.monotonic()
+        if first_stream_failure_at == 0.0:
+            first_stream_failure_at = now
+        failure_window = now - first_stream_failure_at
+        if (
+            stream_failure_count < STREAM_STARTUP_FAILURE_THRESHOLD
+            and failure_window < CAMERA_STARTUP_COOLDOWN
+        ):
+            print(
+                f"{reason}; reconnecting stream only "
+                f"(failure {stream_failure_count}/{STREAM_STARTUP_FAILURE_THRESHOLD})."
+            )
+            return False
+
+        print(
+            f"{reason}; running camera startup "
+            f"(failures={stream_failure_count}, window={failure_window:.1f}s)."
+        )
+        start_startup(force=True)
+        stream_failure_count = 0
+        first_stream_failure_at = 0.0
+        return True
+
     try:
         while True:
             # Only check for 'q' key if showing local view
@@ -1432,8 +1485,11 @@ def main() -> None:
                         cap.release()
                     cap = None
                     attempt += 1
+                    stream_failure_count += 1
+                    restarted = maybe_restart_camera("Stream open failed")
                     time.sleep(backoff(attempt))
-                    start_startup(force=True)
+                    if restarted:
+                        record_no_signal_frame("CRASH: Reconfiguring camera...")
                     continue
                 print("Connection established.")
                 attempt = 0
@@ -1451,16 +1507,24 @@ def main() -> None:
                 print("Frame read failed - signal lost.")
                 cap.release()
                 cap = None
-                start_startup(force=True)
+                consecutive_good_frames = 0
+                stream_failure_count += 1
+                restarted = maybe_restart_camera("Frame read failed")
 
                 # Show and record "no signal" frame
-                # Camera crashed during operation - restarting everything
-                record_no_signal_frame("CRASH: Restarting camera...")
+                if restarted:
+                    record_no_signal_frame("CRASH: Reconfiguring camera...")
+                else:
+                    record_no_signal_frame("STREAM: Reconnecting...")
 
                 time.sleep(FRAME_RETRY_DELAY)
                 continue
 
             # Apply camera adjustments after first successful frame (only once per startup)
+            consecutive_good_frames += 1
+            if consecutive_good_frames >= GOOD_FRAMES_TO_RESET:
+                stream_failure_count = 0
+                first_stream_failure_at = 0.0
             with camera_adjustments_lock:
                 if not camera_adjustments_done:
                     camera_adjustments_done = True
@@ -1515,10 +1579,13 @@ def main() -> None:
                         cv2.LINE_AA,
                     )
 
-            # Drive non-blocking blinker on motion
+            # Drive non-blocking blinker on motion (debounced to avoid
+            # hammering the ESP32 with LED HTTP requests)
             if motion_detected:
-                if not blinker.is_active:
+                now_mono = time.monotonic()
+                if not blinker.is_active and (now_mono - last_blinker_trigger) >= BLINKER_COOLDOWN:
                     blinker.start(duration=1)
+                    last_blinker_trigger = now_mono
                 # Trigger accumulated motion event tracking
                 acc.trigger()
 
@@ -1526,10 +1593,7 @@ def main() -> None:
             try:
                 blinker.update()
             except Exception as e:
-                # Camera might be having issues - trigger startup in background
-                # but let the frame reading logic handle the actual reconnect
-                print(f"Warning: Blinker update failed (camera may be crashed): {e}")
-                start_startup(force=True)
+                print(f"Warning: Blinker update failed: {e}")
 
             # Draw HUD (Timestamp, Status Badges, Motion Warning)
             with rssi_lock:
