@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import cv2, time, threading, queue, subprocess, os
+import cv2, time, threading, queue, subprocess, os, sys
 import numpy as np
 from datetime import datetime
 import pytz
@@ -10,10 +10,11 @@ URL = MJPEG_STREAM_URL
 IST = pytz.timezone("Asia/Kolkata")
 
 # Output
-BASE_DIR = "/srv/cctv/esp_cam1"
+BASE_DIR = os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
 SEGMENT_SECONDS = 300
 BITRATE = "4M"
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"
+USE_APPLE_VIDEOTOOLBOX = sys.platform == "darwin"
 
 # Motion
 MIN_AREA = 800
@@ -151,6 +152,39 @@ def detect_motion(frame):
 ffmpeg_proc = None
 
 
+def h264_encoder_args(*, realtime=False, bitrate=BITRATE):
+    if USE_APPLE_VIDEOTOOLBOX:
+        args = [
+            "-vf",
+            "format=nv12",
+            "-c:v",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "0",
+            "-power_efficient",
+            "1",
+            "-b:v",
+            bitrate,
+        ]
+        if realtime:
+            args.extend(["-realtime", "1", "-prio_speed", "1"])
+        return args
+
+    args = [
+        "-vf",
+        "format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast" if realtime else "medium",
+    ]
+    if realtime:
+        args.extend(["-tune", "zerolatency", "-b:v", bitrate])
+    else:
+        args.extend(["-crf", "20"])
+    return args
+
+
 def start_ffmpeg(width, height, fps):
     out_pattern = os.path.join(BASE_DIR, "recording_%Y%m%d_%H%M%S.mp4")
 
@@ -170,14 +204,7 @@ def start_ffmpeg(width, height, fps):
         "-i",
         "-",
         # Output 1: HIGH QUALITY for local recording
-        "-vf",
-        "format=yuv420p",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "20",  # High quality (18-23 range)
+        *h264_encoder_args(realtime=False, bitrate=BITRATE),
         "-g",
         str(int(fps)),
         "-bf",
@@ -196,16 +223,7 @@ def start_ffmpeg(width, height, fps):
         "1",
         out_pattern,
         # Output 2: LOWER QUALITY/BITRATE for RTSP streaming
-        "-vf",
-        "format=yuv420p",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",  # Faster encoding
-        "-tune",
-        "zerolatency",  # Low latency for streaming
-        "-b:v",
-        "1.5M",  # Lower bitrate
+        *h264_encoder_args(realtime=True, bitrate="1.5M"),
         "-maxrate",
         "1.5M",
         "-bufsize",

@@ -1,9 +1,15 @@
 from tools.adjustLED import adJustLED
 import time
+import threading
 
 
 class NonBlockingBlinker:
-    """A non-blocking LED blinker that updates based on time checks without sleep"""
+    """A non-blocking LED blinker that updates based on time checks without sleep.
+
+    LED control requests are dispatched in fire-and-forget background threads
+    so the main frame loop is never blocked, and a guard prevents piling up
+    concurrent HTTP requests to the ESP32.
+    """
 
     def __init__(self, blink_interval=0.5):
         self.blink_interval = blink_interval
@@ -12,6 +18,24 @@ class NonBlockingBlinker:
         self.is_active = False
         self.start_time = 0
         self.duration = 0
+        self._led_busy = threading.Lock()
+
+    def _set_led(self, brightness: int) -> None:
+        """Send LED command in a background thread (fire-and-forget).
+
+        A threading lock ensures at most one request is in-flight at a time;
+        if a previous request is still running the new one is silently dropped.
+        """
+        if not self._led_busy.acquire(blocking=False):
+            return  # previous request still in-flight, skip
+
+        def _do():
+            try:
+                adJustLED(brightness)
+            finally:
+                self._led_busy.release()
+
+        threading.Thread(target=_do, daemon=True).start()
 
     def start(self, duration=5):
         """Start the blink sequence"""
@@ -31,20 +55,20 @@ class NonBlockingBlinker:
         # Check if duration has elapsed
         if current_time - self.start_time >= self.duration:
             self.is_active = False
-            adJustLED(0)
+            self._set_led(0)
             self.led_state = False
             return
 
         # Toggle LED at intervals
         if current_time - self.last_toggle_time >= self.blink_interval:
             self.led_state = not self.led_state
-            adJustLED(10 if self.led_state else 0)
+            self._set_led(10 if self.led_state else 0)
             self.last_toggle_time = current_time
 
     def stop(self):
         """Stop the blink sequence"""
         self.is_active = False
-        adJustLED(0)
+        self._set_led(0)
         self.led_state = False
 
 

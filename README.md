@@ -41,7 +41,7 @@ ESP32-CAM MJPEG → camera_pipeline.py → FFmpeg ─┬─ segmented MP4 record
 - FFmpeg CLI with NVENC support if GPU compression is desired.
 - OpenCV build with FFMPEG support.
 - ESP32-CAM or compatible device serving MJPEG/HTTP control endpoints (defaults assume `192.168.0.13`).
-- SQLite (bundled with Python) and write access to `/media/aneesh/SSD/recordings/esp_cam1` or a custom path.
+- SQLite (bundled with Python) and write access to `/Volumes/drive/CCTV/recordings/esp_cam1` or a custom path.
 
 ### Python Dependencies
 
@@ -65,7 +65,7 @@ pip install -r requirements.txt
    - `tools/*.py`
    - `motion/motion.py`
 
-2. **Recording paths** – Change the constants pointing to `/media/aneesh/SSD/recordings/esp_cam1` to match your storage mount.
+2. **Recording paths** – By default recordings are written to `/Volumes/drive/CCTV/recordings/esp_cam1`. Override with `CCTV_RECORDINGS_DIR` if your storage mount changes.
 
 3. **Environment variables** – Copy `.env.example` (create if needed) to `.env` and set:
 
