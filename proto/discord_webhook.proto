@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package discord_webhook;
+
+service DiscordWebhook {
+  rpc SendText (SendTextRequest) returns (SendResponse);
+  rpc SendImage (SendImageRequest) returns (SendResponse);
+  rpc SendVideo (SendVideoRequest) returns (SendResponse);
+}
+
+message AllowedMentions {
+  repeated string parse = 1;
+  repeated string users = 2;
+  repeated string roles = 3;
+  optional bool replied_user = 4;
+}
+
+message EmbedFooter {
+  string text = 1;
+  optional string icon_url = 2;
+}
+
+message EmbedImage {
+  string url = 1;
+}
+
+message EmbedThumbnail {
+  string url = 1;
+}
+
+message EmbedAuthor {
+  string name = 1;
+  optional string url = 2;
+  optional string icon_url = 3;
+}
+
+message EmbedField {
+  string name = 1;
+  string value = 2;
+  bool inline = 3;
+}
+
+message Embed {
+  optional string title = 1;
+  optional string description = 2;
+  optional string url = 3;
+  optional int32 color = 4;
+  optional string timestamp = 5;
+  optional EmbedFooter footer = 6;
+  optional EmbedImage image = 7;
+  optional EmbedThumbnail thumbnail = 8;
+  optional EmbedAuthor author = 9;
+  repeated EmbedField fields = 10;
+}
+
+message SendTextRequest {
+  string channel_name = 1;
+  string content = 2;
+  optional string username = 3;
+  optional string avatar_url = 4;
+  optional AllowedMentions allowed_mentions = 5;
+  repeated Embed embeds = 6;
+}
+
+message SendImageRequest {
+  string channel_name = 1;
+  bytes data = 2;
+  string filename = 3;
+  optional string content = 4;
+  optional string username = 5;
+  optional string avatar_url = 6;
+  optional AllowedMentions allowed_mentions = 7;
+  repeated Embed embeds = 8;
+}
+
+message SendVideoRequest {
+  string channel_name = 1;
+  bytes data = 2;
+  string filename = 3;
+  optional string content = 4;
+  optional string username = 5;
+  optional string avatar_url = 6;
+  optional AllowedMentions allowed_mentions = 7;
+  repeated Embed embeds = 8;
+}
+
+message SendResponse {
+  bool success = 1;
+  optional string error = 2;
+}
