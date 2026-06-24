@@ -9,25 +9,39 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 import os
 from typing import Generator, Optional
-from sqlalchemy import create_engine, Column, Integer, DateTime, Float, func
+from sqlalchemy import create_engine, Column, Integer, DateTime, Float, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import DatabaseError
 from contextlib import contextmanager
 
-# Database path
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DB_DIR = REPO_ROOT / "motion" / "data"
-PRIMARY_DB_DIR = Path(
-    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
-).expanduser()
-try:
-    DB_DIR = PRIMARY_DB_DIR
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-except (PermissionError, FileNotFoundError, OSError):
-    # Fallback to local data directory
-    DB_DIR = DEFAULT_DB_DIR
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Warning: primary DB path unavailable, using: {DB_DIR}")
+def _resolve_db_dir() -> Path:
+    candidates = [
+        os.getenv("MOTION_DB_DIR"),
+        os.getenv("CCTV_RECORDINGS_DIR"),
+        os.getenv("MOTION_DATA_DIR"),
+        os.getenv("DATA_DIR"),
+        "/Volumes/drive/CCTV/recordings/esp_cam1",
+        "/Volumes/drive/CCTV/motion/data",
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate).expanduser()
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+
+    raise RuntimeError(
+        "No valid SSD-backed motion DB directory found. "
+        "Set MOTION_DB_DIR or CCTV_RECORDINGS_DIR to a mounted /Volumes/drive path."
+    )
+
+
+DB_DIR = _resolve_db_dir()
 
 DB_PATH = DB_DIR / "motion_logs.db"
 
@@ -123,6 +137,72 @@ def log_motion_event(
         return event
 
 
+def _clone_events(events: list[MotionEvent]) -> list[MotionEvent]:
+    return [
+        MotionEvent(
+            id=e.id,
+            start_time=e.start_time,
+            end_time=e.end_time,
+            duration=e.duration,
+        )
+        for e in events
+    ]
+
+
+def _coerce_dt(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(value)
+
+
+def _scan_events_without_indexes(
+    where_sql: str, params: dict[str, object], order_direction: str
+) -> list[MotionEvent]:
+    sql = text(
+        "SELECT id, start_time, end_time, duration "
+        "FROM motion_events_new NOT INDEXED "
+        f"WHERE {where_sql} "
+        f"ORDER BY start_time {order_direction}"
+    )
+
+    with engine.connect() as conn:
+        rows = conn.execute(sql, params).mappings().all()
+
+    return [
+        MotionEvent(
+            id=row["id"],
+            start_time=_coerce_dt(row["start_time"]),
+            end_time=_coerce_dt(row["end_time"]),
+            duration=float(row["duration"]),
+        )
+        for row in rows
+    ]
+
+
+def _read_events_with_fallback(
+    session: Session,
+    *,
+    filters: tuple,
+    where_sql: str,
+    params: dict[str, object],
+    ascending: bool,
+) -> list[MotionEvent]:
+    order_by = (
+        MotionEvent.start_time.asc() if ascending else MotionEvent.start_time.desc()
+    )
+    try:
+        events = session.query(MotionEvent).filter(*filters).order_by(order_by).all()
+        return _clone_events(events)
+    except DatabaseError as exc:
+        if "database disk image is malformed" not in str(exc).lower():
+            raise
+        return _scan_events_without_indexes(
+            where_sql=where_sql,
+            params=params,
+            order_direction="ASC" if ascending else "DESC",
+        )
+
+
 def get_motion_events_by_hours(hours: int) -> list[MotionEvent]:
     """Get motion events from the last N hours.
 
@@ -137,23 +217,13 @@ def get_motion_events_by_hours(hours: int) -> list[MotionEvent]:
     start_time = datetime.now() - timedelta(hours=hours)
 
     with get_db_session() as session:
-        events = (
-            session.query(MotionEvent)
-            .filter(MotionEvent.start_time >= start_time)
-            .order_by(MotionEvent.start_time.desc())
-            .all()
+        return _read_events_with_fallback(
+            session,
+            filters=(MotionEvent.start_time >= start_time,),
+            where_sql="start_time >= :start_time",
+            params={"start_time": start_time},
+            ascending=False,
         )
-
-        # Detach from session
-        return [
-            MotionEvent(
-                id=e.id,
-                start_time=e.start_time,
-                end_time=e.end_time,
-                duration=e.duration,
-            )
-            for e in events
-        ]
 
 
 def get_motion_events_daytime(date: datetime) -> list[MotionEvent]:
@@ -163,25 +233,16 @@ def get_motion_events_daytime(date: datetime) -> list[MotionEvent]:
     end_time = datetime.combine(date.date(), time(23, 0))
 
     with get_db_session() as session:
-        events = (
-            session.query(MotionEvent)
-            .filter(
+        return _read_events_with_fallback(
+            session,
+            filters=(
                 MotionEvent.start_time >= start_time,
                 MotionEvent.start_time <= end_time,
-            )
-            .order_by(MotionEvent.start_time.asc())
-            .all()
+            ),
+            where_sql="start_time >= :start_time AND start_time <= :end_time",
+            params={"start_time": start_time, "end_time": end_time},
+            ascending=True,
         )
-
-        return [
-            MotionEvent(
-                id=e.id,
-                start_time=e.start_time,
-                end_time=e.end_time,
-                duration=e.duration,
-            )
-            for e in events
-        ]
 
 
 def get_motion_events_by_date(date: datetime) -> list[MotionEvent]:
@@ -199,26 +260,16 @@ def get_motion_events_by_date(date: datetime) -> list[MotionEvent]:
     end_time = start_time + timedelta(days=1)
 
     with get_db_session() as session:
-        events = (
-            session.query(MotionEvent)
-            .filter(
+        return _read_events_with_fallback(
+            session,
+            filters=(
                 MotionEvent.start_time >= start_time,
                 MotionEvent.start_time < end_time,
-            )
-            .order_by(MotionEvent.start_time.asc())
-            .all()
+            ),
+            where_sql="start_time >= :start_time AND start_time < :end_time",
+            params={"start_time": start_time, "end_time": end_time},
+            ascending=True,
         )
-
-        # Detach from session
-        return [
-            MotionEvent(
-                id=e.id,
-                start_time=e.start_time,
-                end_time=e.end_time,
-                duration=e.duration,
-            )
-            for e in events
-        ]
 
 
 def get_motion_events_by_range(start: datetime, end: datetime) -> list[MotionEvent]:
@@ -232,23 +283,13 @@ def get_motion_events_by_range(start: datetime, end: datetime) -> list[MotionEve
         List of MotionEvent instances
     """
     with get_db_session() as session:
-        events = (
-            session.query(MotionEvent)
-            .filter(MotionEvent.start_time >= start, MotionEvent.start_time <= end)
-            .order_by(MotionEvent.start_time.asc())
-            .all()
+        return _read_events_with_fallback(
+            session,
+            filters=(MotionEvent.start_time >= start, MotionEvent.start_time <= end),
+            where_sql="start_time >= :start_time AND start_time <= :end_time",
+            params={"start_time": start, "end_time": end},
+            ascending=True,
         )
-
-        # Detach from session
-        return [
-            MotionEvent(
-                id=e.id,
-                start_time=e.start_time,
-                end_time=e.end_time,
-                duration=e.duration,
-            )
-            for e in events
-        ]
 
 
 def get_total_motion_count() -> int:
