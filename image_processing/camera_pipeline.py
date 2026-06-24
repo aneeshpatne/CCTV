@@ -1537,10 +1537,6 @@ def main() -> None:
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
     attempt = 0
     cap = None
-    stream_failure_count = 0
-    first_stream_failure_at = 0.0
-    consecutive_good_frames = 0
-    GOOD_FRAMES_TO_RESET = 30  # require N consecutive good frames before clearing failure state
     last_blinker_trigger = 0.0
 
     # Initialize motion detection components
@@ -1574,31 +1570,6 @@ def main() -> None:
         start_temperature_monitor()
     show_placeholder(get_device_state_message("STARTUP"))
     cv2.waitKey(1)
-
-    def maybe_restart_camera(reason: str) -> bool:
-        nonlocal stream_failure_count, first_stream_failure_at
-        now = time.monotonic()
-        if first_stream_failure_at == 0.0:
-            first_stream_failure_at = now
-        failure_window = now - first_stream_failure_at
-        if (
-            stream_failure_count < STREAM_STARTUP_FAILURE_THRESHOLD
-            and failure_window < CAMERA_STARTUP_COOLDOWN
-        ):
-            print(
-                f"{reason}; reconnecting stream only "
-                f"(failure {stream_failure_count}/{STREAM_STARTUP_FAILURE_THRESHOLD})."
-            )
-            return False
-
-        print(
-            f"{reason}; running camera startup "
-            f"(failures={stream_failure_count}, window={failure_window:.1f}s)."
-        )
-        start_startup(force=True)
-        stream_failure_count = 0
-        first_stream_failure_at = 0.0
-        return True
 
     try:
         while True:
@@ -1637,11 +1608,9 @@ def main() -> None:
                         cap.release()
                     cap = None
                     attempt += 1
-                    stream_failure_count += 1
-                    restarted = maybe_restart_camera("Stream open failed")
                     time.sleep(backoff(attempt))
-                    if restarted:
-                        record_no_signal_frame("CRASH: Reconfiguring camera...")
+                    if not is_device_ota_only():
+                        start_startup(force=True)
                     continue
                 print("Connection established.")
                 set_device_state("camera-online", "MJPEG stream connected")
@@ -1653,24 +1622,16 @@ def main() -> None:
                 print("Frame read failed - signal lost.")
                 cap.release()
                 cap = None
-                consecutive_good_frames = 0
-                stream_failure_count += 1
-                restarted = maybe_restart_camera("Frame read failed")
+                start_startup(force=True)
 
                 # Show and record "no signal" frame
-                if restarted:
-                    record_no_signal_frame("CRASH: Reconfiguring camera...")
-                else:
-                    record_no_signal_frame("STREAM: Reconnecting...")
+                # Camera crashed during operation - restarting everything
+                record_no_signal_frame("CRASH: Restarting camera...")
 
-                time.sleep(FRAME_RETRY_DELAY)
+                time.sleep(FRAME_FAILURE_RECONNECT_DELAY)
                 continue
 
             # Apply camera adjustments after first successful frame (only once per startup)
-            consecutive_good_frames += 1
-            if consecutive_good_frames >= GOOD_FRAMES_TO_RESET:
-                stream_failure_count = 0
-                first_stream_failure_at = 0.0
             with camera_adjustments_lock:
                 if not camera_adjustments_done:
                     camera_adjustments_done = True
