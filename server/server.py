@@ -39,30 +39,27 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 ESP32CAM_RECOVERY_REDIS_KEY = "esp32cam:recovery"
 
 
-def resolve_path(env_keys: list[str], fallback_paths: list[Path]) -> Path:
+def resolve_path(env_keys: list[str], default_path: Path) -> Path:
     for key in env_keys:
         value = os.getenv(key)
         if value:
-            return Path(value).expanduser()
-    for path in fallback_paths:
-        if path.exists():
-            return path
-    return fallback_paths[0]
+            path = Path(value).expanduser()
+            if path.exists():
+                return path
+            raise RuntimeError(f"Required path from {key} does not exist: {path}")
+
+    if default_path.exists():
+        return default_path
+    raise RuntimeError(f"Required path does not exist: {default_path}")
 
 
 CCTV_FOLDER = resolve_path(
     ["CCTV_RECORDINGS_DIR", "RECORDINGS_DIR"],
-    [
-        Path("/Volumes/drive/CCTV/recordings/esp_cam1"),
-        BASE_DIR / "recordings" / "esp_cam1",
-    ],
+    Path("/Volumes/drive/CCTV/recordings/esp_cam1"),
 )
 NIGHT_EVENTS_FOLDER = resolve_path(
     ["MOTION_DATA_DIR", "DATA_DIR"],
-    [
-        Path("/Volumes/drive/CCTV/motion/data"),
-        BASE_DIR / "motion" / "data",
-    ],
+    Path("/Volumes/drive/CCTV/motion/data"),
 )
 
 # Create temp folder if it doesn't exist
@@ -1164,9 +1161,12 @@ async def get_night_event_by_index(index: int):
 if __name__ == "__main__":
     import uvicorn
 
-    # Get local IP address
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    # Get local IP address (best-effort; hostname may not resolve on macOS)
+    try:
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+    except (socket.gaierror, OSError):
+        local_ip = "127.0.0.1"
 
     print("\n" + "=" * 60)
     print("🎥 CCTV Video Server Starting...")
