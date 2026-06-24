@@ -12,20 +12,33 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from contextlib import contextmanager
 
-# Database path
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DB_DIR = REPO_ROOT / "motion" / "data"
-PRIMARY_DB_DIR = Path(
-    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
-).expanduser()
-try:
-    DB_DIR = PRIMARY_DB_DIR
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-except (PermissionError, FileNotFoundError, OSError):
-    # Fallback to local data directory
-    DB_DIR = DEFAULT_DB_DIR
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"Warning: primary DB path unavailable, using: {DB_DIR}")
+def _resolve_db_dir() -> Path:
+    candidates = [
+        os.getenv("MOTION_DB_DIR"),
+        os.getenv("CCTV_RECORDINGS_DIR"),
+        os.getenv("MOTION_DATA_DIR"),
+        os.getenv("DATA_DIR"),
+        "/Volumes/drive/CCTV/recordings/esp_cam1",
+        "/Volumes/drive/CCTV/motion/data",
+    ]
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate).expanduser()
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+
+    raise RuntimeError(
+        "No valid SSD-backed motion DB directory found. "
+        "Set MOTION_DB_DIR or CCTV_RECORDINGS_DIR to a mounted /Volumes/drive path."
+    )
+
+
+DB_DIR = _resolve_db_dir()
 
 DB_PATH = DB_DIR / "motion_logs.db"
 
