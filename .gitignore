@@ -6,4 +6,5 @@ venv
 /image
 /motion/data
 /motion/*.log
+/motion/plots
 /recordings
