@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -65,6 +66,26 @@ def _ffprobe_duration_seconds(path: Path) -> float:
     return 0.0
 
 
+def _ffprobe_video_codec(path: Path) -> tuple[str | None, str | None]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,pix_fmt",
+                "-of", "default=noprint_wrappers=1", str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        values = {}
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                key, _, value = line.partition("=")
+                values[key] = value
+        return values.get("codec_name"), values.get("pix_fmt")
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None, None
+
+
 def _build_vt_cmd(src: Path, dst: Path, bps: int) -> list[str]:
     return [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
@@ -94,6 +115,14 @@ def compress_clip_videotoolbox(
     under `hard_limit_bytes` (Discord's 25 MB cap). Falls back to a 640px-wide
     downscale if bitrate reduction alone is not enough.
     """
+    codec, pixel_format = _ffprobe_video_codec(src)
+    if src.stat().st_size <= hard_limit_bytes and codec == "h264" and pixel_format in {
+        "yuv420p", "nv12"
+    }:
+        shutil.copyfile(src, dst)
+        logger.info("[COMPRESS] Reused compliant H.264 clip without re-encoding: %s", dst.name)
+        return dst
+
     duration = _ffprobe_duration_seconds(src) or 1.0
     payload_budget = target_bytes * 0.97  # headroom for muxer overhead
     bps = max(int((payload_budget / duration) * 8), 80_000)
@@ -288,15 +317,19 @@ def _download_compress_send(motion_events: list[dict], directory: Path) -> tuple
                 f"{API_BASE_URL}/video/v2/by-event?"
                 f"start={event_start.isoformat()}&end={event_end.isoformat()}"
             )
-            res = requests.get(video_url, timeout=120)
-            res.raise_for_status()
-
             raw_path = directory / f"{idx}_raw.mp4"
-            with open(raw_path, "wb") as fh:
-                fh.write(res.content)
+            downloaded = 0
+            with requests.get(video_url, timeout=120, stream=True) as res:
+                res.raise_for_status()
+                with open(raw_path, "wb") as fh:
+                    for chunk in res.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        downloaded += len(chunk)
             logger.info(
                 "[DOWNLOAD] ✓ Saved: %s (%.2f MB)",
-                raw_path.name, len(res.content) / 1024 / 1024,
+                raw_path.name, downloaded / 1024 / 1024,
             )
             successful += 1
 
