@@ -22,3 +22,14 @@ verified continuous no-signal recording/RTSP, automatic MJPEG reconnection, and
 the complete startup sequence. The resulting segment contained exactly 540
 frames over 59.998 seconds. Do not run a second MJPEG consumer while the
 LaunchAgent is active because the camera stream is single-consumer.
+
+## Camera-timed follow-up
+
+The original native loop performed all frame work and then slept for 1/9 second,
+limiting fresh processing to 4–6 fps and hiding mailbox overwrites. The corrected
+camera-timed rollout on 2026-07-10 measured 12.3–12.5 camera/processed/output fps,
+about 12 ms processing latency, zero sustained queue or encoder drops, 22.35%
+median aggregate CPU, and 24.4% p95 CPU. The first validated VFR archive contained
+738 HEVC frames over 60.08 seconds. RTSP packet timestamps followed variable
+wall-clock arrival intervals, and a controlled camera reset preserved recording,
+RTSP, full startup recovery, and post-connect tuning.
