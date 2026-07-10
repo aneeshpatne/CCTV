@@ -9,12 +9,15 @@ benchmark harness are complete. A live pre-cadence canary successfully recorded
 HEVC, published RTSP, indexed segments, and persisted motion; see
 `benchmarks/canary-results.md`.
 
-One operational step remains: restart `com.aneesh.cctv.orchestrator` to load the
-final fixed-9-fps binary, wait for a complete segment, then capture
-`benchmarks/native.json`. The development environment's elevated-command quota
-blocked that restart. The MJPEG stream is single-consumer, so do not start a
-second capture process; use the LaunchAgent restart described in the canary
-report.
+Disconnect recovery was subsequently implemented and live-tested with a
+controlled ESP reboot. Recording and RTSP retained the HUD on a no-signal frame,
+the complete startup loop ran once, MJPEG reconnected automatically, and the
+resulting segment remained exactly 540 frames over 59.998 seconds.
+
+The final fixed-9-fps binary is deployed through
+`com.aneesh.cctv.orchestrator`, and `benchmarks/native.json` contains the final
+process-tree `top` sample. The MJPEG stream is single-consumer, so do not start a
+second capture process while the LaunchAgent is active.
 
 ## Objectives
 
@@ -36,7 +39,7 @@ report.
 ## Python and storage integration
 
 - Keep Python responsible for ESP startup/recovery, process supervision, disk cleanup, SQLite persistence, and fallback.
-- Receive versioned `motion.finalized`, `segment.finalized`, and `health` events from the native worker over a dedicated file descriptor.
+- Receive versioned motion, segment, health, and stream-state events from the native worker over a dedicated file descriptor.
 - Keep `motion_events_new` unchanged; add an annotation table and a recording catalog.
 - Replace repeated recording-directory scans with indexed catalog queries and startup reconciliation.
 - Trigger cleanup at 90% but delete in one batch toward 85%, excluding active partial files and recent recordings.

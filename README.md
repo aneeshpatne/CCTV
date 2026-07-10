@@ -12,6 +12,24 @@ A self-hosted CCTV automation stack for ESP32-CAM devices. It captures the camer
 - Discord webhook gRPC client (`discord_grpc/`) generated from `proto/discord_webhook.proto`; sends text, images, and videos to a channel by name (default: `cctv`) through an external gRPC server at `127.0.0.1:50051`.
 - Operator tooling for camera controls, LED brightness, stream health, and RSSI checks under `tools/`.
 
+## Measured Apple Silicon Improvements
+
+Live measurements on Apple M4, comparing the legacy Python/OpenCV capture path
+with the native worker's complete process tree:
+
+| Metric | Legacy path | Native path | Change |
+| --- | ---: | ---: | ---: |
+| Median CPU (`top`) | 58.6% | 20.15% | 65.6% lower |
+| p95 CPU (`top`) | 61.2% | 21.0% | 65.7% lower |
+| Representative 60-second archive | 5.46 MB H.264 | 1.68 MB HEVC | 69.3% smaller |
+| Output cadence | 9 fps | 9 fps | Preserved |
+
+The ESP32-CAM supplies approximately 4–6 fresh frames per second in the tested
+indoor conditions, chiefly due to its exposure and stream cadence. Native frame
+pacing preserves a valid 9-fps archive and RTSP timeline without inventing a
+higher camera FPS in the HUD. A controlled reboot also produced a valid 540-frame,
+59.998-second no-signal/recovery segment. Raw reports are in `benchmarks/`.
+
 ## Repository Layout
 
 ```
@@ -29,6 +47,20 @@ run_motion.sh       Apple Silicon launcher for the nightly motion digest
 
 ## Architecture Overview
 
+```mermaid
+flowchart LR
+    Camera[ESP32-CAM\nMJPEG + control endpoints] --> Native[Swift native worker\nURLSession • Vision • Metal • VideoToolbox]
+    Native --> Archive[HEVC MP4 archive\n60-second segments]
+    Native --> Mux[FFmpeg copy muxer]
+    Mux --> RTSP[RTSP overlay stream]
+    Native --> Events[Versioned event pipe]
+    Events --> Orchestrator[Python orchestrator\nstartup • recovery • cleanup • catalog]
+    Orchestrator --> Database[(SQLite motion + catalog)]
+    Database --> API[FastAPI video and motion API]
+    API --> Digest[Nightly digest]
+    Digest --> Discord[Discord gRPC]
+```
+
 ```
 ESP32-CAM MJPEG → Swift native worker ─┬─ VideoToolbox HEVC → segmented MP4 archive
                                       ├─ VideoToolbox H.264 → FFmpeg copy mux → RTSP
@@ -40,6 +72,26 @@ ESP32-CAM MJPEG → Swift native worker ─┬─ VideoToolbox HEVC → segmente
                                      │                               └─ Nightly job (motion/motion.py) → Discord gRPC (#cctv)
                                      │
                 Discord webhook gRPC server (127.0.0.1:50051) ←── send_text / send_image / send_video
+```
+
+### Camera Signal Recovery
+
+```mermaid
+flowchart TD
+    Frames[Fresh JPEG arrives] --> Analyze[Native motion + HUD processing]
+    Analyze --> Output[9-fps HEVC archive and H.264 RTSP]
+    Frames --> Watchdog{No JPEG for\n3 seconds?}
+    Watchdog -- No --> Frames
+    Watchdog -- Yes --> NoSignal[Render NO SIGNAL · RECONNECTING\nwith timestamp, RSSI, FPS, temperature]
+    NoSignal --> KeepAlive[Continue 9-fps archive + RTSP]
+    NoSignal --> Event[Emit stream.disconnected]
+    Event --> Startup[Python runs one complete\nESP startup/recovery loop]
+    KeepAlive --> Retry[Retry MJPEG every 2 seconds]
+    Startup --> Retry
+    Retry --> Restored{JPEG restored?}
+    Restored -- No --> NoSignal
+    Restored -- Yes --> Connected[Emit stream.connected]
+    Connected --> Frames
 ```
 
 ## Requirements
@@ -170,6 +222,7 @@ launchctl kickstart -k gui/$(id -u)/com.aneesh.cctv.server
 
 - **Disk pruning** – The orchestrator starts pruning at 90% and deletes finalized segments in one batch toward 85%, avoiding the old 89–90% cleanup loop.
 - **Motion logging** – The native detector sends finalized events to the Python orchestrator, which preserves `motion_events_new` and stores optional person/animal labels in an additive annotation table.
+- **Signal recovery** – After three seconds without a JPEG, native recording and RTSP continue with the full HUD over a `NO SIGNAL · RECONNECTING` screen. Reconnect attempts run every two seconds while the orchestrator coalesces disconnect events into one complete ESP startup sequence.
 - **Performance measurement** – `tools/benchmark_pipeline.py <orchestrator-pid> --output benchmarks/run.json` records raw `top` data and process-tree median/p95 CPU.
 - **Health overlays** – Wi-Fi RSSI (`tools/get_rssi.py`) and ESP SoC temperature (`/syshealth`) power on-screen badges. These requests fail gracefully if endpoints are unreachable.
 
