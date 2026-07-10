@@ -19,10 +19,13 @@ stable connection, AWB is disabled, exposure level 2 is applied outside the
 12pm–6pm IST exclusion window, and AGC is disabled. Live status verification
 reported `framesize=12`, `xclk=20`, `awb=0`, `ae_level=2`, and `agc=0`.
 
-The final fixed-9-fps binary is deployed through
-`com.aneesh.cctv.orchestrator`, and `benchmarks/native.json` contains the final
-process-tree `top` sample. The MJPEG stream is single-consumer, so do not start a
-second capture process while the LaunchAgent is active.
+The deployed worker now uses camera-arrival timestamps end to end instead of
+sleeping after each processed frame. Its rollout canary processed and published
+12.3–12.5 fps at about 12 ms latency, with 22.35% median and 24.4% p95 aggregate
+CPU. A representative 60.08-second HEVC segment contained 738 fresh frames.
+`CCTV_TARGET_FPS=9` remains the no-signal keepalive cadence. The MJPEG stream is
+single-consumer, so do not start a second capture process while the LaunchAgent
+is active.
 
 ## Objectives
 
