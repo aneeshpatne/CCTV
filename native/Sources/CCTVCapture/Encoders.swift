@@ -33,7 +33,8 @@ final class SegmentRecorder: @unchecked Sendable {
 
     var isRecording: Bool { writer?.status == .writing }
 
-    func append(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime, wallClock: Date) {
+    @discardableResult
+    func append(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime, wallClock: Date) -> Bool {
         if let start = segmentStartPTS,
            presentationTime.seconds - start.seconds >= segmentSeconds {
             finishCurrent(at: wallClock)
@@ -43,13 +44,30 @@ final class SegmentRecorder: @unchecked Sendable {
                 try startSegment(pixelBuffer: pixelBuffer, presentationTime: presentationTime, wallClock: wallClock)
             } catch {
                 FileHandle.standardError.write(Data("segment start failed: \(error)\n".utf8))
-                return
+                return false
             }
         }
-        guard let writer, writer.status == .writing, let input, input.isReadyForMoreMediaData else { return }
+        guard let writer, writer.status == .writing, let input else { return false }
+        if !input.isReadyForMoreMediaData {
+            // AVAssetWriter can briefly report backpressure while flushing a fragment.
+            // The camera interval is much larger than this bounded wait, so preserving
+            // the fresh frame here does not create an unbounded queue or visible latency.
+            let deadline = ProcessInfo.processInfo.systemUptime + 0.025
+            repeat {
+                Thread.sleep(forTimeInterval: 0.001)
+            } while !input.isReadyForMoreMediaData
+                && writer.status == .writing
+                && ProcessInfo.processInfo.systemUptime < deadline
+        }
+        guard writer.status == .writing, input.isReadyForMoreMediaData else {
+            FileHandle.standardError.write(Data("segment append skipped after writer backpressure timeout\n".utf8))
+            return false
+        }
         if adaptor?.append(pixelBuffer, withPresentationTime: presentationTime) != true {
             FileHandle.standardError.write(Data("segment append failed: \(writer.error?.localizedDescription ?? "unknown")\n".utf8))
+            return false
         }
+        return true
     }
 
     func finish(at wallClock: Date = Date()) {
@@ -162,15 +180,13 @@ final class SegmentRecorder: @unchecked Sendable {
 
 final class RTSPPublisher: @unchecked Sendable {
     private let rtspURL: String
-    private let targetFPS: Double
     private let lock = NSLock()
     private var process: Process?
     private var pipe: Pipe?
     private var lastStartAttempt = Date.distantPast
 
-    init(rtspURL: String, targetFPS: Double) {
+    init(rtspURL: String) {
         self.rtspURL = rtspURL
-        self.targetFPS = targetFPS
     }
 
     var isRunning: Bool {
@@ -209,11 +225,7 @@ final class RTSPPublisher: @unchecked Sendable {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = [
-            "-nostdin", "-hide_banner", "-loglevel", "warning", "-fflags", "+genpts", "-f", "h264",
-            "-r", String(format: "%.2f", targetFPS), "-i", "-", "-c:v", "copy",
-            "-rtsp_transport", "tcp", "-f", "rtsp", rtspURL,
-        ]
+        process.arguments = Self.ffmpegArguments(rtspURL: rtspURL)
         process.standardInput = pipe
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.standardError
@@ -224,6 +236,15 @@ final class RTSPPublisher: @unchecked Sendable {
         } catch {
             FileHandle.standardError.write(Data("RTSP muxer start failed: \(error)\n".utf8))
         }
+    }
+
+    static func ffmpegArguments(rtspURL: String) -> [String] {
+        [
+            "-nostdin", "-hide_banner", "-loglevel", "warning",
+            "-use_wallclock_as_timestamps", "1", "-fflags", "+genpts", "-f", "h264",
+            "-i", "-", "-c:v", "copy", "-fps_mode", "passthrough",
+            "-rtsp_transport", "tcp", "-f", "rtsp", rtspURL,
+        ]
     }
 }
 
@@ -257,22 +278,24 @@ final class H264HardwareEncoder: @unchecked Sendable {
         }
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) {
-        guard let session else { return }
-        let duration = CMTime(value: 1, timescale: CMTimeScale(targetFPS.rounded()))
+    @discardableResult
+    func encode(_ pixelBuffer: CVPixelBuffer, presentationTime: CMTime) -> Bool {
+        guard let session else { return false }
         var flags = VTEncodeInfoFlags()
         let status = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTime,
-            duration: duration,
+            duration: .invalid,
             frameProperties: nil,
             sourceFrameRefcon: nil,
             infoFlagsOut: &flags
         )
         if status != noErr {
             FileHandle.standardError.write(Data("H.264 encode failed: \(status)\n".utf8))
+            return false
         }
+        return true
     }
 
     fileprivate func handle(_ sampleBuffer: CMSampleBuffer) {
@@ -349,6 +372,7 @@ final class H264HardwareEncoder: @unchecked Sendable {
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: Int(targetFPS.rounded()) as CFNumber)
+        VTSessionSetProperty(created, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 1 as CFNumber)
         VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: Int(targetFPS.rounded()) as CFNumber)
         guard VTCompressionSessionPrepareToEncodeFrames(created) == noErr else { throw EncoderError.prepare }
     }
