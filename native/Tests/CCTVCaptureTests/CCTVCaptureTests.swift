@@ -50,4 +50,105 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(payload["connected"] as? Bool, false)
         XCTAssertEqual(payload["reason"] as? String, "stalled")
     }
+
+    func testMultipartParserHandlesFragmentedHeadersAndMultipleFrames() {
+        let first = Data([0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9])
+        let second = Data([0xFF, 0xD8, 4, 5, 0xFF, 0xD9])
+        func part(_ jpeg: Data) -> Data {
+            var data = Data("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: \(jpeg.count)\r\n\r\n".utf8)
+            data.append(jpeg)
+            data.append(Data("\r\n".utf8))
+            return data
+        }
+        let stream = part(first) + part(second)
+        let chunkSizes = [1, 2, 5, 3, 11, 7, 19, 4, 64]
+        var parser = MultipartJPEGParser()
+        var parsed: [Data] = []
+        var offset = 0
+        for size in chunkSizes where offset < stream.count {
+            let end = min(stream.count, offset + size)
+            parsed.append(contentsOf: parser.append(Data(stream[offset..<end])))
+            offset = end
+        }
+        if offset < stream.count {
+            parsed.append(contentsOf: parser.append(Data(stream[offset...])))
+        }
+        XCTAssertEqual(parsed, [first, second])
+    }
+
+    func testMultipartParserRetainsMarkerFallback() {
+        let jpeg = Data([0xFF, 0xD8, 9, 8, 7, 0xFF, 0xD9])
+        var stream = Data("--frame\r\nContent-Type: image/jpeg\r\n\r\n".utf8)
+        stream.append(jpeg)
+        var parser = MultipartJPEGParser()
+        XCTAssertTrue(parser.append(Data(stream.prefix(13))).isEmpty)
+        XCTAssertEqual(parser.append(Data(stream.dropFirst(13))), [jpeg])
+        parser.reset()
+        XCTAssertEqual(parser.append(Data("noise".utf8) + jpeg), [jpeg])
+    }
+
+    func testCameraTimelinePreservesVariableArrivalTimes() {
+        var timeline = CameraPresentationTimeline(originUptime: 100)
+        let times = [100.0, 100.11, 100.43, 100.52].map {
+            timeline.presentationTime(for: $0).seconds
+        }
+        XCTAssertEqual(times[0], 0, accuracy: 0.000_01)
+        XCTAssertEqual(times[1], 0.11, accuracy: 0.000_02)
+        XCTAssertEqual(times[2], 0.43, accuracy: 0.000_02)
+        XCTAssertEqual(times[3], 0.52, accuracy: 0.000_02)
+    }
+
+    func testRTSPPublisherUsesWallClockVFRInput() {
+        let arguments = RTSPPublisher.ffmpegArguments(rtspURL: "rtsp://127.0.0.1/test")
+        XCTAssertTrue(arguments.contains("-use_wallclock_as_timestamps"))
+        XCTAssertTrue(arguments.contains("passthrough"))
+        XCTAssertFalse(arguments.contains("-r"))
+    }
+
+    func testLateSemanticLabelsMergeIntoActiveMotionEvent() async throws {
+        let accumulator = MotionEventAccumulator(cooldown: 1)
+        let start = Date(timeIntervalSince1970: 2_000)
+        _ = await accumulator.update(candidate: true, confidence: 0.5, semanticLabels: [], at: start)
+        _ = await accumulator.update(candidate: true, confidence: 0.6, semanticLabels: [], at: start.addingTimeInterval(0.1))
+        await accumulator.merge(semanticLabels: [SemanticLabel(name: "animal", confidence: 0.8)])
+        _ = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(0.2))
+        let finalized = await accumulator.update(
+            candidate: false,
+            confidence: 0,
+            semanticLabels: [],
+            at: start.addingTimeInterval(1.2)
+        )
+        let event = try XCTUnwrap(finalized)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        let labels = try XCTUnwrap(payload["labels"] as? [[String: Any]])
+        XCTAssertEqual(labels.first?["name"] as? String, "animal")
+    }
+
+    func testHealthEventAddsVFRMetricsWithoutChangingVersion() throws {
+        let event = WorkerEvent(
+            type: "health",
+            payload: .health(
+                fps: 10,
+                cameraFPS: 11,
+                outputFPS: 10,
+                droppedFrames: 1,
+                encoderDroppedFrames: 2,
+                processingLatencyMS: 12.5,
+                motionScore: 0.1,
+                recording: true,
+                rtsp: true
+            )
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["camera_fps"] as? Double, 11)
+        XCTAssertEqual(payload["output_fps"] as? Double, 10)
+        XCTAssertEqual(payload["encoder_dropped_frames"] as? Int, 2)
+    }
 }
