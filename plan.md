@@ -14,6 +14,11 @@ controlled ESP reboot. Recording and RTSP retained the HUD on a no-signal frame,
 the complete startup loop ran once, MJPEG reconnected automatically, and the
 resulting segment remained exactly 540 frames over 59.998 seconds.
 
+The legacy post-connect tuning policy is also restored: 20 seconds after each
+stable connection, AWB is disabled, exposure level 2 is applied outside the
+12pm–6pm IST exclusion window, and AGC is disabled. Live status verification
+reported `framesize=12`, `xclk=20`, `awb=0`, `ae_level=2`, and `agc=0`.
+
 The final fixed-9-fps binary is deployed through
 `com.aneesh.cctv.orchestrator`, and `benchmarks/native.json` contains the final
 process-tree `top` sample. The MJPEG stream is single-consumer, so do not start a

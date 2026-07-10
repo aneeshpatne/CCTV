@@ -17,10 +17,13 @@ import subprocess
 import sys
 import threading
 import time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
+
+import requests
 
 from utilities.motion_db_new import annotate_motion_event, log_motion_event
 from utilities.recording_catalog import RecordingCatalog
@@ -42,6 +45,11 @@ CHECK_INTERVAL_SECONDS = 5 * 60
 STOP_TIMEOUT_SECONDS = 5.0
 NATIVE_FAILURE_LIMIT = 3
 NATIVE_FAILURE_WINDOW_SECONDS = 5 * 60
+POST_CONNECT_ADJUSTMENT_DELAY_SECONDS = float(
+    os.getenv("CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS", "20")
+)
+CAMERA_BASE_URL = os.getenv("ESP32CAM_BASE_URL", "http://192.168.0.13").rstrip("/")
+IST = ZoneInfo("Asia/Kolkata")
 
 _camera_process_lock = threading.Lock()
 _camera_process: Optional[subprocess.Popen] = None
@@ -58,6 +66,79 @@ _active_backend = "python"
 _recording_catalog = RecordingCatalog(RECORDINGS_DIR)
 _camera_recovery_lock = threading.Lock()
 _camera_recovery_thread: Optional[threading.Thread] = None
+_camera_adjustment_lock = threading.Lock()
+_camera_adjustment_generation = 0
+
+
+def _cancel_post_connect_adjustments() -> None:
+    """Invalidate delayed adjustments belonging to an obsolete connection."""
+    global _camera_adjustment_generation
+    with _camera_adjustment_lock:
+        _camera_adjustment_generation += 1
+
+
+def _adjustment_is_current(generation: int) -> bool:
+    with _camera_adjustment_lock:
+        return not _shutdown_event.is_set() and generation == _camera_adjustment_generation
+
+
+def _wait_for_adjustment(generation: int, seconds: float) -> bool:
+    if _shutdown_event.wait(seconds):
+        return False
+    return _adjustment_is_current(generation)
+
+
+def _set_camera_control(name: str, value: int) -> bool:
+    try:
+        response = requests.get(
+            f"{CAMERA_BASE_URL}/control",
+            params={"var": name, "val": value},
+            timeout=2,
+        )
+        response.raise_for_status()
+        logging.info("[adjustments] Set %s=%s.", name, value)
+        return True
+    except requests.RequestException:
+        logging.exception("[adjustments] Failed to set %s=%s.", name, value)
+        return False
+
+
+def _schedule_post_connect_adjustments() -> None:
+    """Apply the legacy AWB/exposure/AGC policy after MJPEG stabilizes."""
+    global _camera_adjustment_generation
+
+    with _camera_adjustment_lock:
+        _camera_adjustment_generation += 1
+        generation = _camera_adjustment_generation
+
+    def adjust() -> None:
+        logging.info(
+            "[adjustments] Signal restored; waiting %.0fs before camera tuning.",
+            POST_CONNECT_ADJUSTMENT_DELAY_SECONDS,
+        )
+        if not _wait_for_adjustment(generation, POST_CONNECT_ADJUSTMENT_DELAY_SECONDS):
+            return
+
+        _set_camera_control("awb", 0)
+        if not _wait_for_adjustment(generation, 2):
+            return
+
+        current_hour_ist = datetime.now(IST).hour
+        if 12 <= current_hour_ist < 18:
+            logging.info("[adjustments] Skipping ae_level during 12pm-6pm IST window.")
+        else:
+            _set_camera_control("ae_level", 2)
+
+        if not _wait_for_adjustment(generation, 2):
+            return
+        _set_camera_control("agc", 0)
+        logging.info("[adjustments] Post-connect camera tuning complete.")
+
+    threading.Thread(
+        target=adjust,
+        daemon=True,
+        name="cctv-camera-adjustments",
+    ).start()
 
 
 def _schedule_camera_recovery(reason: str) -> None:
@@ -213,9 +294,11 @@ class NativeEventReader(threading.Thread):
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)
+            _cancel_post_connect_adjustments()
             _schedule_camera_recovery(reason)
         elif event_type == "stream.connected":
             logging.info("[native-stream] MJPEG signal restored.")
+            _schedule_post_connect_adjustments()
 
 
 def start_camera_pipeline() -> Optional[subprocess.Popen]:

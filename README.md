@@ -92,6 +92,8 @@ flowchart TD
     Restored -- No --> NoSignal
     Restored -- Yes --> Connected[Emit stream.connected]
     Connected --> Frames
+    Connected --> Stabilize[Wait 20 seconds]
+    Stabilize --> Tune[AWB off • conditional exposure level 2 • AGC off]
 ```
 
 ## Requirements
@@ -127,7 +129,7 @@ pip install -r requirements.txt
 
 2. **Recording paths** – By default recordings are written to `/Volumes/drive/CCTV/recordings/esp_cam1` on the external drive. Override with `CCTV_RECORDINGS_DIR` if you use a different mount.
 
-   Native controls include `CCTV_PIPELINE_BACKEND=native|python`, `CCTV_NATIVE_BINARY`, `CCTV_TARGET_FPS` (default `9`), `CCTV_HEVC_BITRATE` (default `500000`), and `CCTV_RTSP_BITRATE` (default `1500000`). Three native failures within five minutes latch the orchestrator to the Python fallback until restart.
+   Native controls include `CCTV_PIPELINE_BACKEND=native|python`, `CCTV_NATIVE_BINARY`, `CCTV_TARGET_FPS` (default `9`), `CCTV_HEVC_BITRATE` (default `500000`), `CCTV_RTSP_BITRATE` (default `1500000`), and `CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS` (default `20`). Three native failures within five minutes latch the orchestrator to the Python fallback until restart.
 
 3. **Environment variables** – A `.env` file is optional. Set `OPENAI_API_KEY` if you run the AI daily digest (`motion/night_message.py`).
 
@@ -223,6 +225,7 @@ launchctl kickstart -k gui/$(id -u)/com.aneesh.cctv.server
 - **Disk pruning** – The orchestrator starts pruning at 90% and deletes finalized segments in one batch toward 85%, avoiding the old 89–90% cleanup loop.
 - **Motion logging** – The native detector sends finalized events to the Python orchestrator, which preserves `motion_events_new` and stores optional person/animal labels in an additive annotation table.
 - **Signal recovery** – After three seconds without a JPEG, native recording and RTSP continue with the full HUD over a `NO SIGNAL · RECONNECTING` screen. Reconnect attempts run every two seconds while the orchestrator coalesces disconnect events into one complete ESP startup sequence.
+- **Post-connect camera tuning** – After a stable MJPEG connection, the orchestrator waits 20 seconds, disables automatic white balance, applies exposure level 2 outside the 12pm–6pm IST exclusion window, and disables automatic gain. A disconnect cancels stale tuning work and the sequence runs again after recovery.
 - **Performance measurement** – `tools/benchmark_pipeline.py <orchestrator-pid> --output benchmarks/run.json` records raw `top` data and process-tree median/p95 CPU.
 - **Health overlays** – Wi-Fi RSSI (`tools/get_rssi.py`) and ESP SoC temperature (`/syshealth`) power on-screen badges. These requests fail gracefully if endpoints are unreachable.
 
