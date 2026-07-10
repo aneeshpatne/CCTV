@@ -66,6 +66,29 @@ class NativeEventProtocolTests(unittest.TestCase):
                 {"version": 2, "type": "health", "payload": {}}
             )
 
+    def test_health_event_accepts_additive_vfr_metrics(self):
+        with self.assertLogs(level="INFO") as captured:
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "health",
+                    "payload": {
+                        "fps": 9.5,
+                        "camera_fps": 10.2,
+                        "output_fps": 9.5,
+                        "dropped_frames": 1,
+                        "encoder_dropped_frames": 0,
+                        "processing_latency_ms": 14.2,
+                        "motion_score": 0.1,
+                        "recording": True,
+                        "rtsp": True,
+                    },
+                }
+            )
+        message = "\n".join(captured.output)
+        self.assertIn("camera=10.20", message)
+        self.assertIn("latency_ms=14.2", message)
+
 
 if __name__ == "__main__":
     unittest.main()
