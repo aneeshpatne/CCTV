@@ -11,8 +11,15 @@ final class SemanticClassifier: @unchecked Sendable {
     private var lastRun = Date.distantPast
     private var cached: [SemanticLabel] = []
 
-    func labels(for image: CIImage, candidate: Bool, now: Date = Date()) async -> [SemanticLabel] {
-        guard candidate else { return cached }
+    /// Return the latest labels immediately and schedule at most one candidate inference.
+    /// Completion runs off the capture path so Vision cannot reduce camera throughput.
+    func labels(
+        for image: CIImage,
+        candidate: Bool,
+        now: Date = Date(),
+        completion: @escaping @Sendable ([SemanticLabel]) -> Void
+    ) -> [SemanticLabel] {
+        guard candidate else { return lock.withLock { cached } }
         let (shouldRun, existing) = lock.withLock {
             let shouldRun = !busy && now.timeIntervalSince(lastRun) >= 0.5
             if shouldRun {
@@ -23,17 +30,16 @@ final class SemanticClassifier: @unchecked Sendable {
         }
         guard shouldRun else { return existing }
 
-        return await withCheckedContinuation { continuation in
-            queue.async { [weak self] in
-                guard let self else { continuation.resume(returning: []); return }
-                let labels = self.perform(image)
-                self.lock.withLock {
-                    self.cached = labels
-                    self.busy = false
-                }
-                continuation.resume(returning: labels)
+        queue.async { [weak self] in
+            guard let self else { return }
+            let labels = self.perform(image)
+            self.lock.withLock {
+                self.cached = labels
+                self.busy = false
             }
+            completion(labels)
         }
+        return existing
     }
 
     private func perform(_ image: CIImage) -> [SemanticLabel] {
