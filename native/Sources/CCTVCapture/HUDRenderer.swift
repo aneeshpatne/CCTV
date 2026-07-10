@@ -53,6 +53,8 @@ final class HUDRenderer: @unchecked Sendable {
     private var pool: CVPixelBufferPool?
     private var poolSize = CGSize.zero
     private var textCache: [String: CIImage] = [:]
+    private var textCacheUse: [String: UInt64] = [:]
+    private var textCacheClock: UInt64 = 0
     private var hideUntil: [String: Date] = [:]
     private let lock = NSLock()
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -156,7 +158,11 @@ final class HUDRenderer: @unchecked Sendable {
 
     private func textImage(_ text: String, size: CGFloat, color: NSColor) -> CIImage {
         let cacheKey = "\(Int(size))|\(text)"
-        if let cached = textCache[cacheKey] { return cached }
+        textCacheClock &+= 1
+        if let cached = textCache[cacheKey] {
+            textCacheUse[cacheKey] = textCacheClock
+            return cached
+        }
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: size, weight: .medium),
             .foregroundColor: color,
@@ -167,8 +173,13 @@ final class HUDRenderer: @unchecked Sendable {
         filter.setValue(1.0, forKey: "inputScaleFactor")
         let image = filter.outputImage ?? CIImage.empty()
         textCache[cacheKey] = image
+        textCacheUse[cacheKey] = textCacheClock
         if textCache.count > 160 {
-            textCache = textCache.filter { $0.key.contains(text) }
+            let oldest = textCacheUse.min { $0.value < $1.value }?.key
+            if let oldest, oldest != cacheKey {
+                textCache.removeValue(forKey: oldest)
+                textCacheUse.removeValue(forKey: oldest)
+            }
         }
         return image
     }
