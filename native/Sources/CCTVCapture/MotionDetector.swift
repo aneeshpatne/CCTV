@@ -10,10 +10,26 @@ struct MotionResult: Sendable {
     let boundingBox: NormalizedRect?
 }
 
+private struct MotionPixelBuffer: @unchecked Sendable {
+    let value: CVPixelBuffer
+}
+
 private final class MotionRequestBox: @unchecked Sendable {
-    let semaphore = DispatchSemaphore(value: 0)
-    let lock = NSLock()
-    var result = MotionResult(candidate: false, score: 0, confidence: 0, boundingBox: nil)
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<MotionResult, Never>?
+
+    init(_ continuation: CheckedContinuation<MotionResult, Never>) {
+        self.continuation = continuation
+    }
+
+    func finish(_ result: MotionResult) {
+        let pending = lock.withLock { () -> CheckedContinuation<MotionResult, Never>? in
+            let value = continuation
+            continuation = nil
+            return value
+        }
+        pending?.resume(returning: result)
+    }
 }
 
 actor MotionDetector {
@@ -21,7 +37,10 @@ actor MotionDetector {
     private let height = 384
     private let context: CIContext
     private let session: __VTMotionEstimationSession
-    private var pool: CVPixelBufferPool?
+    private let colorSpace = CGColorSpaceCreateDeviceRGB()
+    private let roiMask: [Bool]
+    private let analysisBuffers: [CVPixelBuffer]
+    private var nextBufferIndex = 0
     private var previous: CVPixelBuffer?
 
     // Existing 1024x768 ROI normalized once. It intentionally retains the current
@@ -52,6 +71,7 @@ actor MotionDetector {
             throw MotionError.session(motionStatus)
         }
         self.session = motionSession
+        self.roiMask = Self.makeROIMask(width: width / 16, height: height / 16, roi: roi)
         let attributes: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey: width,
@@ -59,12 +79,23 @@ actor MotionDetector {
             kCVPixelBufferMetalCompatibilityKey: true,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
         ]
-        var created: CVPixelBufferPool?
-        let status = CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &created)
-        guard status == kCVReturnSuccess, let created else {
-            throw MotionError.pixelBufferPool(status)
+        var buffers: [CVPixelBuffer] = []
+        for _ in 0..<2 {
+            var created: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                nil,
+                width,
+                height,
+                kCVPixelFormatType_32BGRA,
+                attributes as CFDictionary,
+                &created
+            )
+            guard status == kCVReturnSuccess, let created else {
+                throw MotionError.pixelBufferPool(status)
+            }
+            buffers.append(created)
         }
-        self.pool = created
+        self.analysisBuffers = buffers
     }
 
     deinit {
@@ -80,14 +111,18 @@ actor MotionDetector {
             return MotionResult(candidate: false, score: 0, confidence: 0, boundingBox: nil)
         }
         self.previous = buffer
-        return Self.estimate(session: session, previous: previous, current: buffer, roi: roi)
+        return await Self.estimate(
+            session: session,
+            previous: MotionPixelBuffer(value: previous),
+            current: MotionPixelBuffer(value: buffer),
+            roi: roi,
+            roiMask: roiMask
+        )
     }
 
     private func makeAnalysisBuffer(_ image: CIImage) -> CVPixelBuffer? {
-        guard let pool else { return nil }
-        var output: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &output) == kCVReturnSuccess,
-              let output else { return nil }
+        let output = analysisBuffers[nextBufferIndex]
+        nextBufferIndex = (nextBufferIndex + 1) % analysisBuffers.count
 
         let extent = image.extent
         let scaleX = CGFloat(width) / max(extent.width, 1)
@@ -99,12 +134,16 @@ actor MotionDetector {
             normalized,
             to: output,
             bounds: CGRect(x: 0, y: 0, width: width, height: height),
-            colorSpace: CGColorSpaceCreateDeviceRGB()
+            colorSpace: colorSpace
         )
         return output
     }
 
-    nonisolated private static func summarize(_ vectors: CVPixelBuffer, roi: [CGPoint]) -> MotionResult {
+    nonisolated private static func summarize(
+        _ vectors: CVPixelBuffer,
+        roi: [CGPoint],
+        roiMask: [Bool]
+    ) -> MotionResult {
         let gridWidth = max(CVPixelBufferGetWidth(vectors), 1)
         let gridHeight = max(CVPixelBufferGetHeight(vectors), 1)
         var active = 0
@@ -125,7 +164,11 @@ actor MotionDetector {
                 for x in 0..<gridWidth {
                     let nx = (Double(x) + 0.5) / Double(gridWidth)
                     let ny = (Double(y) + 0.5) / Double(gridHeight)
-                    guard pointInROI(x: nx, y: ny, roi: roi) else { continue }
+                    let maskIndex = y * gridWidth + x
+                    let inROI = roiMask.count == gridWidth * gridHeight
+                        ? roiMask[maskIndex]
+                        : pointInROI(x: nx, y: ny, roi: roi)
+                    guard inROI else { continue }
                     eligible += 1
                     let offset = y * rowBytes + x * 4
                     let dx = Int16(bitPattern: UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8)
@@ -159,25 +202,45 @@ actor MotionDetector {
 
     nonisolated private static func estimate(
         session: __VTMotionEstimationSession,
-        previous: CVPixelBuffer,
-        current: CVPixelBuffer,
-        roi: [CGPoint]
-    ) -> MotionResult {
-        let box = MotionRequestBox()
-        let flags = __VTMotionEstimationFrameFlags(rawValue: 1)
-        let status = __VTMotionEstimationSessionEstimateMotionVectors(
-            session, previous, current, flags, nil
-        ) { status, _, _, vectorBuffer in
-            if status == noErr, let vectorBuffer {
-                box.lock.withLock {
-                    box.result = summarize(vectorBuffer, roi: roi)
+        previous: MotionPixelBuffer,
+        current: MotionPixelBuffer,
+        roi: [CGPoint],
+        roiMask: [Bool]
+    ) async -> MotionResult {
+        let empty = MotionResult(candidate: false, score: 0, confidence: 0, boundingBox: nil)
+        return await withCheckedContinuation { continuation in
+            let box = MotionRequestBox(continuation)
+            // Keep ownership explicit with our two persistent buffers. The reuse hint lets
+            // VideoToolbox cache a caller-owned buffer and has caused intermittent CVBufferRetain
+            // traps on macOS 26 under sustained load.
+            let flags = __VTMotionEstimationFrameFlags(rawValue: 0)
+            let status = __VTMotionEstimationSessionEstimateMotionVectors(
+                session, previous.value, current.value, flags, nil
+            ) { status, _, _, vectorBuffer in
+                if status == noErr, let vectorBuffer {
+                    box.finish(summarize(vectorBuffer, roi: roi, roiMask: roiMask))
+                } else {
+                    box.finish(empty)
                 }
             }
-            box.semaphore.signal()
+            guard status == noErr else {
+                box.finish(empty)
+                return
+            }
         }
-        guard status == noErr else { return box.result }
-        guard box.semaphore.wait(timeout: .now() + 1) == .success else { return box.result }
-        return box.lock.withLock { box.result }
+    }
+
+    nonisolated private static func makeROIMask(width: Int, height: Int, roi: [CGPoint]) -> [Bool] {
+        guard width > 0, height > 0 else { return [] }
+        return (0..<(width * height)).map { index in
+            let x = index % width
+            let y = index / width
+            return pointInROI(
+                x: (Double(x) + 0.5) / Double(width),
+                y: (Double(y) + 0.5) / Double(height),
+                roi: roi
+            )
+        }
     }
 
     nonisolated private static func pointInROI(x: Double, y: Double, roi: [CGPoint]) -> Bool {
