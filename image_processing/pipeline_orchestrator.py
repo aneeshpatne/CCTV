@@ -284,9 +284,14 @@ class NativeEventReader(threading.Thread):
             logging.info("[native-event] Indexed segment %s.", path.name)
         elif event_type == "health":
             logging.info(
-                "[native-health] fps=%.2f dropped=%s motion=%.4f recording=%s rtsp=%s",
+                "[native-health] fps=%.2f camera=%.2f output=%.2f dropped=%s "
+                "encoder_dropped=%s latency_ms=%.1f motion=%.4f recording=%s rtsp=%s",
                 float(payload.get("fps", 0)),
+                float(payload.get("camera_fps", payload.get("fps", 0))),
+                float(payload.get("output_fps", payload.get("fps", 0))),
                 payload.get("dropped_frames", 0),
+                payload.get("encoder_dropped_frames", 0),
+                float(payload.get("processing_latency_ms", 0)),
                 float(payload.get("motion_score", 0)),
                 payload.get("recording"),
                 payload.get("rtsp"),
