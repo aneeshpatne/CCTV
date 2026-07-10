@@ -21,14 +21,26 @@ struct WorkerEvent: Encodable, Sendable {
     enum Payload: Encodable, Sendable {
         case motion(start: Double, end: Double, duration: Double, confidence: Double, labels: [SemanticLabel])
         case segment(path: String, start: Double, end: Double, duration: Double, codec: String, size: Int64)
-        case health(fps: Double, droppedFrames: Int, motionScore: Double, recording: Bool, rtsp: Bool)
+        case health(
+            fps: Double,
+            cameraFPS: Double,
+            outputFPS: Double,
+            droppedFrames: Int,
+            encoderDroppedFrames: Int,
+            processingLatencyMS: Double,
+            motionScore: Double,
+            recording: Bool,
+            rtsp: Bool
+        )
         case stream(connected: Bool, reason: String?)
 
         private enum CodingKeys: String, CodingKey {
             case startTime = "start_time"
             case endTime = "end_time"
             case duration, confidence, labels, detectorVersion = "detector_version"
-            case path, codec, size, fps, droppedFrames = "dropped_frames", motionScore = "motion_score"
+            case path, codec, size, fps, cameraFPS = "camera_fps", outputFPS = "output_fps"
+            case droppedFrames = "dropped_frames", encoderDroppedFrames = "encoder_dropped_frames"
+            case processingLatencyMS = "processing_latency_ms", motionScore = "motion_score"
             case recording, rtsp
             case connected, reason
         }
@@ -50,9 +62,23 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encode(duration, forKey: .duration)
                 try container.encode(codec, forKey: .codec)
                 try container.encode(size, forKey: .size)
-            case let .health(fps, dropped, score, recording, rtsp):
+            case let .health(
+                fps,
+                cameraFPS,
+                outputFPS,
+                dropped,
+                encoderDropped,
+                processingLatencyMS,
+                score,
+                recording,
+                rtsp
+            ):
                 try container.encode(fps, forKey: .fps)
+                try container.encode(cameraFPS, forKey: .cameraFPS)
+                try container.encode(outputFPS, forKey: .outputFPS)
                 try container.encode(dropped, forKey: .droppedFrames)
+                try container.encode(encoderDropped, forKey: .encoderDroppedFrames)
+                try container.encode(processingLatencyMS, forKey: .processingLatencyMS)
                 try container.encode(score, forKey: .motionScore)
                 try container.encode(recording, forKey: .recording)
                 try container.encode(rtsp, forKey: .rtsp)
@@ -111,6 +137,13 @@ actor MotionEventAccumulator {
 
     init(cooldown: TimeInterval = 15) {
         self.cooldown = cooldown
+    }
+
+    func merge(semanticLabels: [SemanticLabel]) {
+        guard eventStart != nil else { return }
+        for label in semanticLabels {
+            labels[label.name] = max(labels[label.name] ?? 0, label.confidence)
+        }
     }
 
     func update(candidate: Bool, confidence: Double, semanticLabels: [SemanticLabel], at now: Date) -> WorkerEvent? {
