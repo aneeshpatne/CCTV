@@ -56,6 +56,38 @@ _native_failures: deque[float] = deque()
 _native_fallback_latched = False
 _active_backend = "python"
 _recording_catalog = RecordingCatalog(RECORDINGS_DIR)
+_camera_recovery_lock = threading.Lock()
+_camera_recovery_thread: Optional[threading.Thread] = None
+
+
+def _schedule_camera_recovery(reason: str) -> None:
+    """Run the full ESP startup loop once while native output shows no signal."""
+    global _camera_recovery_thread
+
+    with _camera_recovery_lock:
+        if _shutdown_event.is_set():
+            return
+        if _camera_recovery_thread and _camera_recovery_thread.is_alive():
+            logging.info("[recovery] Camera startup already running; coalescing disconnect (%s).", reason)
+            return
+
+        def recover() -> None:
+            logging.warning("[recovery] MJPEG disconnected (%s); running full camera startup.", reason)
+            try:
+                startup()
+            except CameraRecoveryMode:
+                logging.exception("[recovery] Camera entered OTA/recovery mode during startup.")
+            except Exception:
+                logging.exception("[recovery] Camera startup failed; native reconnect will retry.")
+            else:
+                logging.info("[recovery] Full camera startup sequence completed after disconnect.")
+
+        _camera_recovery_thread = threading.Thread(
+            target=recover,
+            daemon=True,
+            name="cctv-camera-recovery",
+        )
+        _camera_recovery_thread.start()
 
 
 def _resolve_python_command() -> str:
@@ -178,6 +210,12 @@ class NativeEventReader(threading.Thread):
                 payload.get("recording"),
                 payload.get("rtsp"),
             )
+        elif event_type == "stream.disconnected":
+            reason = str(payload.get("reason") or "stream closed")
+            logging.warning("[native-stream] Disconnected: %s", reason)
+            _schedule_camera_recovery(reason)
+        elif event_type == "stream.connected":
+            logging.info("[native-stream] MJPEG signal restored.")
 
 
 def start_camera_pipeline() -> Optional[subprocess.Popen]:
