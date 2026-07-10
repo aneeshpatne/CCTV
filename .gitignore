@@ -8,3 +8,5 @@ venv
 /motion/*.log
 /motion/plots
 /recordings
+/native/.build
+/native/.swiftpm
