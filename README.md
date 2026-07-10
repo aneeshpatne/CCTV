@@ -22,13 +22,14 @@ with the native worker's complete process tree:
 | Median CPU (`top`) | 58.6% | 20.15% | 65.6% lower |
 | p95 CPU (`top`) | 61.2% | 21.0% | 65.7% lower |
 | Representative 60-second archive | 5.46 MB H.264 | 1.68 MB HEVC | 69.3% smaller |
-| Output cadence | 9 fps | 9 fps | Preserved |
+| Output cadence | 9 fps | Camera-timed VFR | Follows fresh JPEG arrival |
 
-The ESP32-CAM supplies approximately 4–6 fresh frames per second in the tested
-indoor conditions, chiefly due to its exposure and stream cadence. Native frame
-pacing preserves a valid 9-fps archive and RTSP timeline without inventing a
-higher camera FPS in the HUD. A controlled reboot also produced a valid 540-frame,
-59.998-second no-signal/recovery segment. Raw reports are in `benchmarks/`.
+The first native scheduler processed a frame and then slept for another 1/9 second,
+which limited fresh-frame handling to roughly 4–6 fps while silently overwriting
+queued JPEGs. The camera-timed worker now processes and publishes the stream at its
+measured arrival rate (12.3–12.5 fps in the rollout canary), while retaining a
+9-fps no-signal keepalive. A representative VFR segment contained 738 fresh frames
+over 60.08 seconds. Raw historical reports are in `benchmarks/`.
 
 ## Repository Layout
 
@@ -129,7 +130,7 @@ pip install -r requirements.txt
 
 2. **Recording paths** – By default recordings are written to `/Volumes/drive/CCTV/recordings/esp_cam1` on the external drive. Override with `CCTV_RECORDINGS_DIR` if you use a different mount.
 
-   Native controls include `CCTV_PIPELINE_BACKEND=native|python`, `CCTV_NATIVE_BINARY`, `CCTV_TARGET_FPS` (default `9`), `CCTV_HEVC_BITRATE` (default `500000`), `CCTV_RTSP_BITRATE` (default `1500000`), and `CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS` (default `20`). Three native failures within five minutes latch the orchestrator to the Python fallback until restart.
+   Native controls include `CCTV_PIPELINE_BACKEND=native|python`, `CCTV_NATIVE_BINARY`, `CCTV_TARGET_FPS` (default `9`, used for no-signal keepalive and encoder hints), `CCTV_HEVC_BITRATE` (default `500000`), `CCTV_RTSP_BITRATE` (default `1500000`), and `CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS` (default `20`). Normal recording and RTSP timing follows fresh camera arrivals. Three native failures within five minutes latch the orchestrator to the Python fallback until restart.
 
 3. **Environment variables** – A `.env` file is optional. Set `OPENAI_API_KEY` if you run the AI daily digest (`motion/night_message.py`).
 
@@ -226,7 +227,7 @@ launchctl kickstart -k gui/$(id -u)/com.aneesh.cctv.server
 - **Motion logging** – The native detector sends finalized events to the Python orchestrator, which preserves `motion_events_new` and stores optional person/animal labels in an additive annotation table.
 - **Signal recovery** – After three seconds without a JPEG, native recording and RTSP continue with the full HUD over a `NO SIGNAL · RECONNECTING` screen. Reconnect attempts run every two seconds while the orchestrator coalesces disconnect events into one complete ESP startup sequence.
 - **Post-connect camera tuning** – After a stable MJPEG connection, the orchestrator waits 20 seconds, disables automatic white balance, applies exposure level 2 outside the 12pm–6pm IST exclusion window, and disables automatic gain. A disconnect cancels stale tuning work and the sequence runs again after recovery.
-- **Performance measurement** – `tools/benchmark_pipeline.py <orchestrator-pid> --output benchmarks/run.json` records raw `top` data and process-tree median/p95 CPU.
+- **Performance measurement** – `tools/benchmark_pipeline.py <orchestrator-pid> --output benchmarks/run.json` records raw `top` data and process-tree median/p95 CPU. Native health logs distinguish parsed camera FPS, processed/output FPS, queue drops, encoder drops, and processing latency.
 - **Health overlays** – Wi-Fi RSSI (`tools/get_rssi.py`) and ESP SoC temperature (`/syshealth`) power on-screen badges. These requests fail gracefully if endpoints are unreachable.
 
 ## Development Tips
