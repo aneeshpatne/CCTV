@@ -3,6 +3,163 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
+private struct SendablePixelBuffer: @unchecked Sendable {
+    let value: CVPixelBuffer
+}
+
+struct CameraPresentationTimeline: Sendable {
+    let originUptime: TimeInterval
+    private(set) var lastPresentationTime = CMTime.invalid
+
+    init(originUptime: TimeInterval) {
+        self.originUptime = originUptime
+    }
+
+    mutating func presentationTime(for monotonicTime: TimeInterval) -> CMTime {
+        var pts = CMTime(seconds: max(0, monotonicTime - originUptime), preferredTimescale: 90_000)
+        if lastPresentationTime.isValid, pts <= lastPresentationTime {
+            pts = lastPresentationTime + CMTime(value: 1, timescale: 90_000)
+        }
+        lastPresentationTime = pts
+        return pts
+    }
+}
+
+private struct RuntimeSnapshot: Sendable {
+    let lastFrameAge: TimeInterval
+    let processedFPS: Double
+    let processingLatencyMS: Double
+    let motionScore: Double
+}
+
+private actor PipelineRuntimeState {
+    private let startedAt = ProcessInfo.processInfo.systemUptime
+    private var lastFrameAt: TimeInterval?
+    private var processedFrameTimes: [TimeInterval] = []
+    private var latencySamplesMS: [Double] = []
+    private var motionScore = 0.0
+    private var reconnectRequested = false
+
+    func recordReceived(at monotonicTime: TimeInterval) {
+        lastFrameAt = monotonicTime
+        reconnectRequested = false
+    }
+
+    @discardableResult
+    func recordProcessed(at monotonicTime: TimeInterval, motionScore: Double) -> Double {
+        processedFrameTimes.append(monotonicTime)
+        processedFrameTimes.removeAll { monotonicTime - $0 > 5 }
+        if processedFrameTimes.count > 120 {
+            processedFrameTimes.removeFirst(processedFrameTimes.count - 120)
+        }
+        self.motionScore = motionScore
+        return Self.rate(for: processedFrameTimes)
+    }
+
+    func recordLatency(_ milliseconds: Double) {
+        latencySamplesMS.append(milliseconds)
+        if latencySamplesMS.count > 60 {
+            latencySamplesMS.removeFirst(latencySamplesMS.count - 60)
+        }
+    }
+
+    func shouldReconnect(at now: TimeInterval) -> Bool {
+        let reference = lastFrameAt ?? startedAt
+        guard now - reference >= 3, !reconnectRequested else { return false }
+        reconnectRequested = true
+        return true
+    }
+
+    func snapshot(at now: TimeInterval) -> RuntimeSnapshot {
+        processedFrameTimes.removeAll { now - $0 > 5 }
+        let reference = lastFrameAt ?? startedAt
+        let latency = latencySamplesMS.isEmpty
+            ? 0
+            : latencySamplesMS.reduce(0, +) / Double(latencySamplesMS.count)
+        return RuntimeSnapshot(
+            lastFrameAge: now - reference,
+            processedFPS: Self.rate(for: processedFrameTimes),
+            processingLatencyMS: latency,
+            motionScore: motionScore
+        )
+    }
+
+    private static func rate(for times: [TimeInterval]) -> Double {
+        guard let first = times.first, let last = times.last, last > first else { return 0 }
+        return Double(times.count - 1) / (last - first)
+    }
+}
+
+private struct OutputMetrics: Sendable {
+    let outputFPS: Double
+    let encoderDroppedFrames: Int
+    let recording: Bool
+    let rtsp: Bool
+}
+
+private actor FrameOutput {
+    private let configuration: PipelineConfiguration
+    private let recorder: SegmentRecorder
+    private let publisher: RTSPPublisher
+    private var timeline: CameraPresentationTimeline
+    private var h264Encoder: H264HardwareEncoder?
+    private var outputFrameTimes: [TimeInterval] = []
+    private var encoderDroppedFrames = 0
+
+    init(configuration: PipelineConfiguration, emitter: EventEmitter) throws {
+        self.configuration = configuration
+        self.recorder = try SegmentRecorder(configuration: configuration, emitter: emitter)
+        self.publisher = RTSPPublisher(rtspURL: configuration.rtspURL)
+        self.timeline = CameraPresentationTimeline(originUptime: ProcessInfo.processInfo.systemUptime)
+    }
+
+    func append(_ boxedBuffer: SendablePixelBuffer, monotonicTime: TimeInterval, wallClock: Date) throws {
+        let buffer = boxedBuffer.value
+        if h264Encoder == nil {
+            h264Encoder = try H264HardwareEncoder(
+                width: CVPixelBufferGetWidth(buffer),
+                height: CVPixelBufferGetHeight(buffer),
+                targetFPS: configuration.targetFPS,
+                bitrate: configuration.rtspBitrate,
+                publisher: publisher
+            )
+        }
+
+        let pts = timeline.presentationTime(for: monotonicTime)
+
+        let archiveAccepted = recorder.append(buffer, presentationTime: pts, wallClock: wallClock)
+        let rtspAccepted = h264Encoder?.encode(buffer, presentationTime: pts) == true
+        if !archiveAccepted || !rtspAccepted { encoderDroppedFrames += 1 }
+
+        outputFrameTimes.append(monotonicTime)
+        outputFrameTimes.removeAll { monotonicTime - $0 > 5 }
+        if outputFrameTimes.count > 120 {
+            outputFrameTimes.removeFirst(outputFrameTimes.count - 120)
+        }
+    }
+
+    func metrics(at now: TimeInterval) -> OutputMetrics {
+        outputFrameTimes.removeAll { now - $0 > 5 }
+        let fps: Double
+        if let first = outputFrameTimes.first, let last = outputFrameTimes.last, last > first {
+            fps = Double(outputFrameTimes.count - 1) / (last - first)
+        } else {
+            fps = 0
+        }
+        return OutputMetrics(
+            outputFPS: fps,
+            encoderDroppedFrames: encoderDroppedFrames,
+            recording: recorder.isRecording,
+            rtsp: publisher.isRunning
+        )
+    }
+
+    func finish() {
+        recorder.finish()
+        publisher.stop()
+    }
+}
+
 final class FramePipeline: @unchecked Sendable {
     private let configuration: PipelineConfiguration
     private let emitter: EventEmitter
@@ -11,19 +168,9 @@ final class FramePipeline: @unchecked Sendable {
     private let semanticClassifier = SemanticClassifier()
     private let accumulator = MotionEventAccumulator(cooldown: 15)
     private let telemetry: CameraTelemetry
-    private let recorder: SegmentRecorder
-    private let publisher: RTSPPublisher
-    private var h264Encoder: H264HardwareEncoder?
-    private var firstMonotonic: ContinuousClock.Instant?
-    private var firstWallClock: Date?
-    private var nextOutputFrame = 0
-    private var lastOutputBuffer: CVPixelBuffer?
-    private var lastHealth = Date.distantPast
-    private var fpsWindowStart = Date()
-    private var fpsWindowFrames = 0
-    private var measuredFPS = 0.0
+    private let output: FrameOutput
+    private let runtime = PipelineRuntimeState()
     private var wasMotionActive = false
-    private var lastMotionScore = 0.0
 
     init(configuration: PipelineConfiguration) throws {
         self.configuration = configuration
@@ -31,12 +178,10 @@ final class FramePipeline: @unchecked Sendable {
         self.renderer = HUDRenderer()
         self.motionDetector = try MotionDetector(context: renderer.context)
         self.telemetry = CameraTelemetry(baseURL: configuration.cameraBaseURL)
-        self.recorder = try SegmentRecorder(configuration: configuration, emitter: emitter)
-        self.publisher = RTSPPublisher(rtspURL: configuration.rtspURL, targetFPS: configuration.targetFPS)
+        self.output = try FrameOutput(configuration: configuration, emitter: emitter)
     }
 
     func run() async throws {
-        let mailbox = LatestJPEGMailbox()
         let client = MJPEGClient(url: configuration.streamURL) { [emitter] connected, reason in
             emitter.emit(WorkerEvent(
                 type: connected ? "stream.connected" : "stream.disconnected",
@@ -44,147 +189,133 @@ final class FramePipeline: @unchecked Sendable {
             ))
         }
         client.start()
-        let frameTask = Task {
-            for await jpeg in client.frames { mailbox.put(jpeg) }
+        let frameTask = Task { [weak self] in
+            guard let self else { return }
+            for await frame in client.frames {
+                if Task.isCancelled { break }
+                await self.process(frame)
+            }
         }
         let telemetryTask = Task { await telemetry.pollForever() }
-        defer {
-            frameTask.cancel()
-            telemetryTask.cancel()
-            client.stop()
-            recorder.finish()
-            publisher.stop()
-        }
 
-        let clock = ContinuousClock()
-        let interval = Duration.seconds(1 / configuration.targetFPS)
-        firstMonotonic = clock.now
-        firstWallClock = Date()
-        var sequence = -1
-        var lastFrameAt = Date()
-        var staleReconnectRequested = false
         var noSignalFrame: CVPixelBuffer?
         var noSignalRenderedAt = Date.distantPast
+        var nextKeepaliveAt = ProcessInfo.processInfo.systemUptime
+        var lastHealth = Date.distantPast
+        let keepaliveInterval = 1 / configuration.targetFPS
 
         while !Task.isCancelled {
-            let nowMonotonic = clock.now
+            let monotonicNow = ProcessInfo.processInfo.systemUptime
             let wallClock = Date()
-            if let packet = mailbox.take(after: sequence) {
-                sequence = packet.sequence
-                lastFrameAt = packet.receivedAt
-                staleReconnectRequested = false
-                noSignalFrame = nil
-                if let source = renderer.decodeJPEG(packet.data) {
-                    let motion = await motionDetector.analyze(source)
-                    lastMotionScore = motion.score
-                    let labels = await semanticClassifier.labels(for: source, candidate: motion.candidate, now: wallClock)
-                    if let event = await accumulator.update(
-                        candidate: motion.candidate,
-                        confidence: motion.confidence,
-                        semanticLabels: labels,
-                        at: wallClock
-                    ) {
-                        emitter.emit(event)
-                    }
-                    if motion.candidate && !wasMotionActive { blinkCameraLED() }
-                    wasMotionActive = motion.candidate
-                    updateFPS(at: wallClock)
-                    let (rssi, temperature) = await telemetry.snapshot()
-                    let status = HUDStatus(
-                        fps: measuredFPS,
-                        rssi: rssi,
-                        temperature: temperature,
-                        motion: motion.candidate,
-                        labels: labels,
-                        motionBox: motion.boundingBox,
-                        message: nil
-                    )
-                    if let output = renderer.render(source, status: status, now: wallClock) {
-                        lastOutputBuffer = output
-                    }
-                }
-            }
+            let snapshot = await runtime.snapshot(at: monotonicNow)
 
-            let frameAge = wallClock.timeIntervalSince(lastFrameAt)
-            if sequence < 0 || frameAge >= 3 {
-                if frameAge >= 3 && !staleReconnectRequested {
-                    staleReconnectRequested = true
+            if snapshot.lastFrameAge >= 3 {
+                if await runtime.shouldReconnect(at: monotonicNow) {
                     client.reconnectStalledStream(reason: "no JPEG received for 3 seconds")
                 }
                 if noSignalFrame == nil || wallClock.timeIntervalSince(noSignalRenderedAt) >= 1 {
                     let (rssi, temperature) = await telemetry.snapshot()
                     noSignalFrame = renderer.renderNoSignal(
-                        status: HUDStatus(fps: 0, rssi: rssi, temperature: temperature, message: "NO SIGNAL · RECONNECTING"),
+                        status: HUDStatus(
+                            fps: 0,
+                            rssi: rssi,
+                            temperature: temperature,
+                            message: "NO SIGNAL · RECONNECTING"
+                        ),
                         now: wallClock
                     )
                     noSignalRenderedAt = wallClock
                 }
-                if let noSignalFrame { lastOutputBuffer = noSignalFrame }
+                if monotonicNow >= nextKeepaliveAt, let noSignalFrame {
+                    try? await output.append(
+                        SendablePixelBuffer(value: noSignalFrame),
+                        monotonicTime: monotonicNow,
+                        wallClock: wallClock
+                    )
+                    repeat {
+                        nextKeepaliveAt += keepaliveInterval
+                    } while nextKeepaliveAt <= monotonicNow
+                }
+            } else {
+                noSignalFrame = nil
+                nextKeepaliveAt = monotonicNow
             }
-
-            guard let output = lastOutputBuffer, let firstMonotonic else {
-                try? await Task.sleep(for: interval)
-                continue
-            }
-            let elapsed = firstMonotonic.duration(to: nowMonotonic).seconds
-            if h264Encoder == nil {
-                h264Encoder = try H264HardwareEncoder(
-                    width: CVPixelBufferGetWidth(output),
-                    height: CVPixelBufferGetHeight(output),
-                    targetFPS: configuration.targetFPS,
-                    bitrate: configuration.rtspBitrate,
-                    publisher: publisher
-                )
-            }
-            writeAtFixedCadence(output, through: elapsed)
 
             if wallClock.timeIntervalSince(lastHealth) >= 10 {
                 lastHealth = wallClock
+                let streamMetrics = client.metrics()
+                let outputMetrics = await output.metrics(at: monotonicNow)
+                let signalAvailable = snapshot.lastFrameAge < 3
                 emitter.emit(WorkerEvent(
                     type: "health",
                     payload: .health(
-                        fps: frameAge >= 3 ? 0 : measuredFPS,
-                        droppedFrames: client.droppedFrameCount(),
-                        motionScore: lastMotionScore,
-                        recording: recorder.isRecording,
-                        rtsp: publisher.isRunning
+                        fps: signalAvailable ? snapshot.processedFPS : 0,
+                        cameraFPS: signalAvailable ? streamMetrics.cameraFPS : 0,
+                        outputFPS: outputMetrics.outputFPS,
+                        droppedFrames: streamMetrics.droppedFrames,
+                        encoderDroppedFrames: outputMetrics.encoderDroppedFrames,
+                        processingLatencyMS: snapshot.processingLatencyMS,
+                        motionScore: snapshot.motionScore,
+                        recording: outputMetrics.recording,
+                        rtsp: outputMetrics.rtsp
                     )
                 ))
             }
-            try? await Task.sleep(for: interval)
+            try? await Task.sleep(for: .milliseconds(20))
         }
+
+        frameTask.cancel()
+        telemetryTask.cancel()
+        client.stop()
+        await output.finish()
     }
 
-    private func writeAtFixedCadence(_ newest: CVPixelBuffer, through elapsed: Double) {
-        guard let firstWallClock else { return }
-        let fps = configuration.targetFPS
-        let targetFrame = Int(floor(elapsed * fps))
-        guard targetFrame >= nextOutputFrame else {
-            lastOutputBuffer = newest
-            return
-        }
-        let earliestFrame = max(nextOutputFrame, targetFrame - 30)
-        if earliestFrame > nextOutputFrame { nextOutputFrame = earliestFrame }
-        while nextOutputFrame <= targetFrame {
-            let isNewestSlot = nextOutputFrame == targetFrame
-            let buffer = isNewestSlot ? newest : (lastOutputBuffer ?? newest)
-            let pts = CMTime(value: CMTimeValue(nextOutputFrame), timescale: CMTimeScale(fps.rounded()))
-            let wallClock = firstWallClock.addingTimeInterval(Double(nextOutputFrame) / fps)
-            recorder.append(buffer, presentationTime: pts, wallClock: wallClock)
-            h264Encoder?.encode(buffer, presentationTime: pts)
-            nextOutputFrame += 1
-        }
-        lastOutputBuffer = newest
-    }
+    private func process(_ frame: JPEGFrame) async {
+        await runtime.recordReceived(at: frame.monotonicTime)
+        guard let source = renderer.decodeJPEG(frame.data) else { return }
 
-    private func updateFPS(at now: Date) {
-        fpsWindowFrames += 1
-        let elapsed = now.timeIntervalSince(fpsWindowStart)
-        if elapsed >= 1 {
-            measuredFPS = Double(fpsWindowFrames) / elapsed
-            fpsWindowFrames = 0
-            fpsWindowStart = now
+        let motion = await motionDetector.analyze(source)
+        let labels = semanticClassifier.labels(
+            for: source,
+            candidate: motion.candidate,
+            now: frame.receivedAt
+        ) { [accumulator] labels in
+            Task { await accumulator.merge(semanticLabels: labels) }
         }
+        if let event = await accumulator.update(
+            candidate: motion.candidate,
+            confidence: motion.confidence,
+            semanticLabels: labels,
+            at: frame.receivedAt
+        ) {
+            emitter.emit(event)
+        }
+        if motion.candidate && !wasMotionActive { blinkCameraLED() }
+        wasMotionActive = motion.candidate
+
+        let measuredFPS = await runtime.recordProcessed(
+            at: ProcessInfo.processInfo.systemUptime,
+            motionScore: motion.score
+        )
+        let (rssi, temperature) = await telemetry.snapshot()
+        let status = HUDStatus(
+            fps: measuredFPS,
+            rssi: rssi,
+            temperature: temperature,
+            motion: motion.candidate,
+            labels: labels,
+            motionBox: motion.boundingBox,
+            message: nil
+        )
+        if let rendered = renderer.render(source, status: status, now: frame.receivedAt) {
+            try? await output.append(
+                SendablePixelBuffer(value: rendered),
+                monotonicTime: frame.monotonicTime,
+                wallClock: frame.receivedAt
+            )
+        }
+        let latency = max(0, ProcessInfo.processInfo.systemUptime - frame.monotonicTime) * 1_000
+        await runtime.recordLatency(latency)
     }
 
     private func blinkCameraLED() {
@@ -195,39 +326,6 @@ final class FramePipeline: @unchecked Sendable {
                 _ = try? await URLSession.shared.data(from: url)
                 try? await Task.sleep(for: .milliseconds(500))
             }
-        }
-    }
-}
-
-private extension Duration {
-    var seconds: Double {
-        let components = self.components
-        return Double(components.seconds) + Double(components.attoseconds) / 1e18
-    }
-}
-
-private struct JPEGPacket: Sendable {
-    let sequence: Int
-    let receivedAt: Date
-    let data: Data
-}
-
-private final class LatestJPEGMailbox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var sequence = 0
-    private var latest: JPEGPacket?
-
-    func put(_ data: Data) {
-        lock.withLock {
-            sequence += 1
-            latest = JPEGPacket(sequence: sequence, receivedAt: Date(), data: data)
-        }
-    }
-
-    func take(after previousSequence: Int) -> JPEGPacket? {
-        lock.withLock {
-            guard let latest, latest.sequence > previousSequence else { return nil }
-            return latest
         }
     }
 }
