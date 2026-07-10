@@ -9,6 +9,7 @@ thread so video capture remains non-blocking.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import shutil
 import signal
@@ -17,7 +18,13 @@ import sys
 import threading
 import time
 from pathlib import Path
+from collections import deque
+from datetime import datetime, timedelta
 from typing import Optional
+
+from utilities.motion_db_new import annotate_motion_event, log_motion_event
+from utilities.recording_catalog import RecordingCatalog
+from utilities.startup import CameraRecoveryMode, startup
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
@@ -30,8 +37,11 @@ RECORDINGS_DIR = Path(
 if not RECORDINGS_DIR.exists():
     RECORDINGS_DIR = REPO_ROOT / "recordings" / "esp_cam1"
 DISK_USAGE_THRESHOLD = 90  # percent
+DISK_USAGE_TARGET = 85  # cleanup hysteresis target
 CHECK_INTERVAL_SECONDS = 5 * 60
 STOP_TIMEOUT_SECONDS = 5.0
+NATIVE_FAILURE_LIMIT = 3
+NATIVE_FAILURE_WINDOW_SECONDS = 5 * 60
 
 _camera_process_lock = threading.Lock()
 _camera_process: Optional[subprocess.Popen] = None
@@ -40,6 +50,12 @@ _camera_monitor: Optional["CameraProcessMonitor"] = None
 _storage_monitor_lock = threading.Lock()
 _storage_monitor: Optional["StorageMonitor"] = None
 _shutdown_event = threading.Event()
+_event_reader: Optional["NativeEventReader"] = None
+_event_reader_lock = threading.Lock()
+_native_failures: deque[float] = deque()
+_native_fallback_latched = False
+_active_backend = "python"
+_recording_catalog = RecordingCatalog(RECORDINGS_DIR)
 
 
 def _resolve_python_command() -> str:
@@ -74,9 +90,99 @@ def _is_camera_running() -> bool:
         return _camera_process is not None and _camera_process.poll() is None
 
 
+def _resolve_native_binary() -> Path | None:
+    configured = os.getenv("CCTV_NATIVE_BINARY")
+    candidates = [
+        Path(configured).expanduser() if configured else None,
+        REPO_ROOT / "native" / ".build" / "release" / "cctv-capture",
+        REPO_ROOT / "native" / ".build" / "arm64-apple-macosx" / "release" / "cctv-capture",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _requested_backend() -> str:
+    requested = os.getenv("CCTV_PIPELINE_BACKEND", "native").strip().lower()
+    if requested not in {"native", "python", "auto"}:
+        logging.warning("[orchestrator] Unknown CCTV_PIPELINE_BACKEND=%s; using native.", requested)
+        requested = "native"
+    if requested == "python" or _native_fallback_latched:
+        return "python"
+    if _resolve_native_binary() is None:
+        logging.warning("[orchestrator] Native binary unavailable; using Python fallback.")
+        return "python"
+    return "native"
+
+
+class NativeEventReader(threading.Thread):
+    """Consume the native worker's low-volume JSON event stream."""
+
+    def __init__(self, read_fd: int):
+        super().__init__(daemon=True, name="cctv-native-events")
+        self.read_fd = read_fd
+
+    def run(self) -> None:
+        try:
+            with os.fdopen(self.read_fd, "r", encoding="utf-8") as stream:
+                for line in stream:
+                    if _shutdown_event.is_set():
+                        break
+                    try:
+                        event = json.loads(line)
+                        self._handle(event)
+                    except Exception:
+                        logging.exception("[native-event] Invalid event: %s", line[:500])
+        except OSError:
+            if not _shutdown_event.is_set():
+                logging.exception("[native-event] Event pipe failed")
+
+    @staticmethod
+    def _handle(event: dict) -> None:
+        if event.get("version") != 1 or not isinstance(event.get("payload"), dict):
+            raise ValueError("unsupported native event envelope")
+        event_type = event.get("type")
+        payload = event["payload"]
+        if event_type == "motion.finalized":
+            start = datetime.fromtimestamp(float(payload["start_time"]))
+            end = datetime.fromtimestamp(float(payload["end_time"]))
+            motion = log_motion_event(
+                start_time=start,
+                end_time=end,
+                duration=float(payload.get("duration", (end - start).total_seconds())),
+            )
+            annotate_motion_event(
+                motion.id,
+                detector_version=str(payload.get("detector_version", "native-unknown")),
+                confidence=float(payload.get("confidence", 0.0)),
+                labels_json=json.dumps(payload.get("labels", []), separators=(",", ":")),
+            )
+            logging.info("[native-event] Motion event %s persisted.", motion.id)
+        elif event_type == "segment.finalized":
+            path = Path(payload["path"])
+            _recording_catalog.register(
+                path,
+                datetime.fromtimestamp(float(payload["start_time"])),
+                datetime.fromtimestamp(float(payload["end_time"])),
+                codec=str(payload.get("codec") or "hevc"),
+                size=int(payload.get("size") or path.stat().st_size),
+            )
+            logging.info("[native-event] Indexed segment %s.", path.name)
+        elif event_type == "health":
+            logging.info(
+                "[native-health] fps=%.2f dropped=%s motion=%.4f recording=%s rtsp=%s",
+                float(payload.get("fps", 0)),
+                payload.get("dropped_frames", 0),
+                float(payload.get("motion_score", 0)),
+                payload.get("recording"),
+                payload.get("rtsp"),
+            )
+
+
 def start_camera_pipeline() -> Optional[subprocess.Popen]:
     """Launch the camera pipeline if it is not already running."""
-    global _camera_process
+    global _camera_process, _event_reader, _active_backend
 
     with _camera_process_lock:
         if _camera_process and _camera_process.poll() is None:
@@ -86,25 +192,62 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
             )
             return _camera_process
 
+        backend = _requested_backend()
         python_cmd = _resolve_python_command()
-        logging.info(
-            "[orchestrator] Starting camera pipeline with %s -m image_processing.camera_pipeline",
-            python_cmd,
-        )
+        command = [python_cmd, "-m", "image_processing.camera_pipeline"]
+        pass_fds: tuple[int, ...] = ()
+        read_fd = write_fd = None
+        child_env = os.environ.copy()
+        if backend == "native":
+            binary = _resolve_native_binary()
+            if binary is None:
+                backend = "python"
+            else:
+                try:
+                    startup()
+                except CameraRecoveryMode:
+                    logging.exception("[orchestrator] Camera is in recovery mode; using Python controller.")
+                    backend = "python"
+                except Exception:
+                    logging.exception("[orchestrator] Camera startup failed; using Python fallback.")
+                    backend = "python"
+                if backend == "native":
+                    read_fd, write_fd = os.pipe()
+                    os.set_inheritable(write_fd, True)
+                    child_env["CCTV_EVENT_FD"] = str(write_fd)
+                    command = [str(binary)]
+                    pass_fds = (write_fd,)
+
+        logging.info("[orchestrator] Starting %s camera pipeline: %s", backend, command)
         try:
             proc = subprocess.Popen(
-                [python_cmd, "-m", "image_processing.camera_pipeline"],
+                command,
                 cwd=str(REPO_ROOT),
                 stdin=None,
                 stdout=None,
                 stderr=None,
+                env=child_env,
+                pass_fds=pass_fds,
             )
         except Exception as exc:
+            if read_fd is not None:
+                os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
             logging.exception("[orchestrator] Failed to start camera pipeline")
             raise RuntimeError("Unable to start camera pipeline") from exc
 
+        if write_fd is not None:
+            os.close(write_fd)
+        if read_fd is not None:
+            reader = NativeEventReader(read_fd)
+            with _event_reader_lock:
+                _event_reader = reader
+            reader.start()
+
         _camera_process = proc
-        logging.info("[orchestrator] Camera pipeline started (pid=%s).", proc.pid)
+        _active_backend = backend
+        logging.info("[orchestrator] %s camera pipeline started (pid=%s).", backend, proc.pid)
         return proc
 
 
@@ -170,16 +313,16 @@ def _delete_oldest_files_until_threshold(directory: Path, target_percent: int) -
         logging.warning("[cleanup] Directory %s does not exist", directory)
         return
 
-    # Get all video files sorted by modification time (oldest first)
-    files = []
-    for entry in directory.rglob("*.mp4"):
-        if entry.is_file():
-            try:
-                mtime = entry.stat().st_mtime
-                size = entry.stat().st_size
-                files.append((mtime, size, entry))
-            except (FileNotFoundError, PermissionError):
-                continue
+    usage = shutil.disk_usage(directory)
+    target_used = int(usage.total * (target_percent / 100.0))
+    bytes_to_free = max(0, usage.used - target_used)
+    protect_after = datetime.now() - timedelta(minutes=10)
+    _recording_catalog.reconcile(force=True)
+    files = [
+        (recording.start_time.timestamp(), recording.size, recording.path)
+        for recording in _recording_catalog.all()
+        if recording.start_time < protect_after and not recording.path.name.endswith(".partial")
+    ]
 
     if not files:
         logging.warning("[cleanup] No video files found to delete in %s", directory)
@@ -191,21 +334,13 @@ def _delete_oldest_files_until_threshold(directory: Path, target_percent: int) -
     deleted_count = 0
     deleted_size = 0
 
+    deleted_paths = []
     for mtime, size, file_path in files:
-        current_usage = _get_usage_percent(directory)
-
-        if current_usage < target_percent:
-            logging.info(
-                "[cleanup] Target usage reached: %s%% < %s%%. Deleted %d files (%d MB).",
-                current_usage,
-                target_percent,
-                deleted_count,
-                deleted_size // (1024 * 1024),
-            )
-            return
-
+        if deleted_size >= bytes_to_free:
+            break
         try:
             file_path.unlink()
+            deleted_paths.append(file_path)
             deleted_count += 1
             deleted_size += size
             logging.info(
@@ -218,6 +353,8 @@ def _delete_oldest_files_until_threshold(directory: Path, target_percent: int) -
         except Exception:
             logging.exception("[cleanup] Failed to delete %s", file_path)
             continue
+
+    _recording_catalog.remove(deleted_paths)
 
     # Final check after deleting all files
     final_usage = _get_usage_percent(directory)
@@ -263,7 +400,7 @@ def check_storage_and_cleanup() -> None:
 
     try:
         # Delete old files without stopping camera - already running in background thread
-        _delete_oldest_files_until_threshold(RECORDINGS_DIR, DISK_USAGE_THRESHOLD)
+        _delete_oldest_files_until_threshold(RECORDINGS_DIR, DISK_USAGE_TARGET)
     except Exception:
         logging.exception("[cleanup] Failed during cleanup operation")
 
@@ -305,7 +442,7 @@ class CameraProcessMonitor(threading.Thread):
         self._stop_event.set()
 
     def run(self) -> None:
-        global _camera_process
+        global _camera_process, _native_fallback_latched
 
         logging.info("[monitor] Camera process monitor thread started.")
         while not self._stop_event.is_set():
@@ -326,6 +463,18 @@ class CameraProcessMonitor(threading.Thread):
                     with _camera_process_lock:
                         if _camera_process is proc:
                             _camera_process = None
+                    if _active_backend == "native":
+                        now = time.monotonic()
+                        _native_failures.append(now)
+                        while _native_failures and now - _native_failures[0] > NATIVE_FAILURE_WINDOW_SECONDS:
+                            _native_failures.popleft()
+                        if len(_native_failures) >= NATIVE_FAILURE_LIMIT:
+                            _native_fallback_latched = True
+                            logging.error(
+                                "[monitor] Native pipeline failed %d times in %ds; latching Python fallback.",
+                                len(_native_failures),
+                                NATIVE_FAILURE_WINDOW_SECONDS,
+                            )
                     start_camera_pipeline()
 
             if self._stop_event.wait(self.interval):

@@ -21,6 +21,14 @@
     <string>/Users/aneeshpatne/Desktop/Code/CCTV</string>
     <key>CCTV_RECORDINGS_DIR</key>
     <string>/Volumes/drive/CCTV/recordings/esp_cam1</string>
+    <key>CCTV_PIPELINE_BACKEND</key>
+    <string>native</string>
+    <key>CCTV_NATIVE_BINARY</key>
+    <string>/Users/aneeshpatne/Desktop/Code/CCTV/native/.build/release/cctv-capture</string>
+    <key>CCTV_TARGET_FPS</key>
+    <string>9</string>
+    <key>CCTV_LOCAL_CODEC</key>
+    <string>hevc</string>
   </dict>
 
   <key>RunAtLoad</key>
