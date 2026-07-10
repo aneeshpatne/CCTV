@@ -9,7 +9,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 import os
 from typing import Generator, Optional
-from sqlalchemy import create_engine, Column, Integer, DateTime, Float, func, text
+from sqlalchemy import create_engine, Column, Integer, DateTime, Float, String, Text, ForeignKey, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import DatabaseError
@@ -52,7 +52,9 @@ engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
 Base = declarative_base()
 
 # Session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False, autoflush=False, expire_on_commit=False, bind=engine
+)
 
 
 class MotionEvent(Base):
@@ -79,6 +81,21 @@ class MotionEvent(Base):
             "end_time": self.end_time.isoformat(),
             "duration": self.duration,
         }
+
+
+class MotionEventAnnotation(Base):
+    """Additive native-detector metadata; the existing event table stays unchanged."""
+
+    __tablename__ = "motion_event_annotations"
+
+    event_id = Column(
+        Integer,
+        ForeignKey("motion_events_new.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    detector_version = Column(String(64), nullable=False)
+    confidence = Column(Float, nullable=False, default=0.0)
+    labels_json = Column(Text, nullable=False, default="[]")
 
 
 # Create tables
@@ -135,6 +152,49 @@ def log_motion_event(
         session.flush()
         session.refresh(event)
         return event
+
+
+def annotate_motion_event(
+    event_id: int,
+    *,
+    detector_version: str,
+    confidence: float,
+    labels_json: str,
+) -> None:
+    """Insert or update optional metadata for an existing motion event."""
+    with get_db_session() as session:
+        annotation = session.get(MotionEventAnnotation, int(event_id))
+        if annotation is None:
+            annotation = MotionEventAnnotation(event_id=int(event_id))
+            session.add(annotation)
+        annotation.detector_version = detector_version
+        annotation.confidence = float(confidence)
+        annotation.labels_json = labels_json
+
+
+def get_motion_annotations(event_ids: list[int]) -> dict[int, dict]:
+    if not event_ids:
+        return {}
+    import json
+
+    with get_db_session() as session:
+        annotations = (
+            session.query(MotionEventAnnotation)
+            .filter(MotionEventAnnotation.event_id.in_(event_ids))
+            .all()
+        )
+        result = {}
+        for annotation in annotations:
+            try:
+                labels = json.loads(annotation.labels_json)
+            except (TypeError, ValueError):
+                labels = []
+            result[int(annotation.event_id)] = {
+                "labels": labels,
+                "confidence": float(annotation.confidence),
+                "detector_version": annotation.detector_version,
+            }
+        return result
 
 
 def _clone_events(events: list[MotionEvent]) -> list[MotionEvent]:
