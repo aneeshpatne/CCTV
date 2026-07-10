@@ -69,6 +69,13 @@ final class HUDRenderer: @unchecked Sendable {
         CIImage(data: data, options: [.applyOrientationProperty: true])
     }
 
+    func renderNoSignal(status: HUDStatus, now: Date = Date()) -> CVPixelBuffer? {
+        let extent = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        let background = CIImage(color: CIColor(red: 0.025, green: 0.03, blue: 0.04))
+            .cropped(to: extent)
+        return render(background, status: status, now: now)
+    }
+
     func render(_ source: CIImage, status: HUDStatus, now: Date = Date()) -> CVPixelBuffer? {
         lock.lock()
         defer { lock.unlock() }

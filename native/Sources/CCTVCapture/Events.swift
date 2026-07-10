@@ -22,6 +22,7 @@ struct WorkerEvent: Encodable, Sendable {
         case motion(start: Double, end: Double, duration: Double, confidence: Double, labels: [SemanticLabel])
         case segment(path: String, start: Double, end: Double, duration: Double, codec: String, size: Int64)
         case health(fps: Double, droppedFrames: Int, motionScore: Double, recording: Bool, rtsp: Bool)
+        case stream(connected: Bool, reason: String?)
 
         private enum CodingKeys: String, CodingKey {
             case startTime = "start_time"
@@ -29,6 +30,7 @@ struct WorkerEvent: Encodable, Sendable {
             case duration, confidence, labels, detectorVersion = "detector_version"
             case path, codec, size, fps, droppedFrames = "dropped_frames", motionScore = "motion_score"
             case recording, rtsp
+            case connected, reason
         }
 
         func encode(to encoder: any Encoder) throws {
@@ -54,6 +56,9 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encode(score, forKey: .motionScore)
                 try container.encode(recording, forKey: .recording)
                 try container.encode(rtsp, forKey: .rtsp)
+            case let .stream(connected, reason):
+                try container.encode(connected, forKey: .connected)
+                try container.encodeIfPresent(reason, forKey: .reason)
             }
         }
     }

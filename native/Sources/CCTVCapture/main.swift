@@ -16,7 +16,6 @@ final class FramePipeline: @unchecked Sendable {
     private var h264Encoder: H264HardwareEncoder?
     private var firstMonotonic: ContinuousClock.Instant?
     private var firstWallClock: Date?
-    private var lastAccepted: ContinuousClock.Instant?
     private var nextOutputFrame = 0
     private var lastOutputBuffer: CVPixelBuffer?
     private var lastHealth = Date.distantPast
@@ -24,6 +23,7 @@ final class FramePipeline: @unchecked Sendable {
     private var fpsWindowFrames = 0
     private var measuredFPS = 0.0
     private var wasMotionActive = false
+    private var lastMotionScore = 0.0
 
     init(configuration: PipelineConfiguration) throws {
         self.configuration = configuration
@@ -36,10 +36,20 @@ final class FramePipeline: @unchecked Sendable {
     }
 
     func run() async throws {
-        let client = MJPEGClient(url: configuration.streamURL)
+        let mailbox = LatestJPEGMailbox()
+        let client = MJPEGClient(url: configuration.streamURL) { [emitter] connected, reason in
+            emitter.emit(WorkerEvent(
+                type: connected ? "stream.connected" : "stream.disconnected",
+                payload: .stream(connected: connected, reason: reason)
+            ))
+        }
         client.start()
+        let frameTask = Task {
+            for await jpeg in client.frames { mailbox.put(jpeg) }
+        }
         let telemetryTask = Task { await telemetry.pollForever() }
         defer {
+            frameTask.cancel()
             telemetryTask.cancel()
             client.stop()
             recorder.finish()
@@ -48,43 +58,74 @@ final class FramePipeline: @unchecked Sendable {
 
         let clock = ContinuousClock()
         let interval = Duration.seconds(1 / configuration.targetFPS)
-        for await jpeg in client.frames {
+        firstMonotonic = clock.now
+        firstWallClock = Date()
+        var sequence = -1
+        var lastFrameAt = Date()
+        var staleReconnectRequested = false
+        var noSignalFrame: CVPixelBuffer?
+        var noSignalRenderedAt = Date.distantPast
+
+        while !Task.isCancelled {
             let nowMonotonic = clock.now
-            if let lastAccepted, nowMonotonic - lastAccepted < interval { continue }
-            lastAccepted = nowMonotonic
-            if firstMonotonic == nil { firstMonotonic = nowMonotonic }
-            guard let source = renderer.decodeJPEG(jpeg) else { continue }
-
             let wallClock = Date()
-            if firstWallClock == nil { firstWallClock = wallClock }
-            let motion = await motionDetector.analyze(source)
-            let labels = await semanticClassifier.labels(for: source, candidate: motion.candidate, now: wallClock)
-            if let event = await accumulator.update(
-                candidate: motion.candidate,
-                confidence: motion.confidence,
-                semanticLabels: labels,
-                at: wallClock
-            ) {
-                emitter.emit(event)
+            if let packet = mailbox.take(after: sequence) {
+                sequence = packet.sequence
+                lastFrameAt = packet.receivedAt
+                staleReconnectRequested = false
+                noSignalFrame = nil
+                if let source = renderer.decodeJPEG(packet.data) {
+                    let motion = await motionDetector.analyze(source)
+                    lastMotionScore = motion.score
+                    let labels = await semanticClassifier.labels(for: source, candidate: motion.candidate, now: wallClock)
+                    if let event = await accumulator.update(
+                        candidate: motion.candidate,
+                        confidence: motion.confidence,
+                        semanticLabels: labels,
+                        at: wallClock
+                    ) {
+                        emitter.emit(event)
+                    }
+                    if motion.candidate && !wasMotionActive { blinkCameraLED() }
+                    wasMotionActive = motion.candidate
+                    updateFPS(at: wallClock)
+                    let (rssi, temperature) = await telemetry.snapshot()
+                    let status = HUDStatus(
+                        fps: measuredFPS,
+                        rssi: rssi,
+                        temperature: temperature,
+                        motion: motion.candidate,
+                        labels: labels,
+                        motionBox: motion.boundingBox,
+                        message: nil
+                    )
+                    if let output = renderer.render(source, status: status, now: wallClock) {
+                        lastOutputBuffer = output
+                    }
+                }
             }
-            if motion.candidate && !wasMotionActive {
-                blinkCameraLED()
-            }
-            wasMotionActive = motion.candidate
 
-            updateFPS(at: wallClock)
-            let (rssi, temperature) = await telemetry.snapshot()
-            let status = HUDStatus(
-                fps: measuredFPS,
-                rssi: rssi,
-                temperature: temperature,
-                motion: motion.candidate,
-                labels: labels,
-                motionBox: motion.boundingBox,
-                message: nil
-            )
-            guard let output = renderer.render(source, status: status, now: wallClock),
-                  let firstMonotonic else { continue }
+            let frameAge = wallClock.timeIntervalSince(lastFrameAt)
+            if sequence < 0 || frameAge >= 3 {
+                if frameAge >= 3 && !staleReconnectRequested {
+                    staleReconnectRequested = true
+                    client.reconnectStalledStream(reason: "no JPEG received for 3 seconds")
+                }
+                if noSignalFrame == nil || wallClock.timeIntervalSince(noSignalRenderedAt) >= 1 {
+                    let (rssi, temperature) = await telemetry.snapshot()
+                    noSignalFrame = renderer.renderNoSignal(
+                        status: HUDStatus(fps: 0, rssi: rssi, temperature: temperature, message: "NO SIGNAL · RECONNECTING"),
+                        now: wallClock
+                    )
+                    noSignalRenderedAt = wallClock
+                }
+                if let noSignalFrame { lastOutputBuffer = noSignalFrame }
+            }
+
+            guard let output = lastOutputBuffer, let firstMonotonic else {
+                try? await Task.sleep(for: interval)
+                continue
+            }
             let elapsed = firstMonotonic.duration(to: nowMonotonic).seconds
             if h264Encoder == nil {
                 h264Encoder = try H264HardwareEncoder(
@@ -102,16 +143,16 @@ final class FramePipeline: @unchecked Sendable {
                 emitter.emit(WorkerEvent(
                     type: "health",
                     payload: .health(
-                        fps: measuredFPS,
+                        fps: frameAge >= 3 ? 0 : measuredFPS,
                         droppedFrames: client.droppedFrameCount(),
-                        motionScore: motion.score,
+                        motionScore: lastMotionScore,
                         recording: recorder.isRecording,
                         rtsp: publisher.isRunning
                     )
                 ))
             }
+            try? await Task.sleep(for: interval)
         }
-        throw PipelineError.streamEnded
     }
 
     private func writeAtFixedCadence(_ newest: CVPixelBuffer, through elapsed: Double) {
@@ -165,8 +206,30 @@ private extension Duration {
     }
 }
 
-enum PipelineError: Error {
-    case streamEnded
+private struct JPEGPacket: Sendable {
+    let sequence: Int
+    let receivedAt: Date
+    let data: Data
+}
+
+private final class LatestJPEGMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sequence = 0
+    private var latest: JPEGPacket?
+
+    func put(_ data: Data) {
+        lock.withLock {
+            sequence += 1
+            latest = JPEGPacket(sequence: sequence, receivedAt: Date(), data: data)
+        }
+    }
+
+    func take(after previousSequence: Int) -> JPEGPacket? {
+        lock.withLock {
+            guard let latest, latest.sequence > previousSequence else { return nil }
+            return latest
+        }
+    }
 }
 
 Task {
