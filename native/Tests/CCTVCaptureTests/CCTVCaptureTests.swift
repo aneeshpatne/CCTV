@@ -35,4 +35,19 @@ final class CCTVCaptureTests: XCTestCase {
         let event = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(1.6))
         XCTAssertNotNil(event)
     }
+
+    func testStreamStateEventProtocol() throws {
+        let event = WorkerEvent(
+            type: "stream.disconnected",
+            payload: .stream(connected: false, reason: "stalled")
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        XCTAssertEqual(object["type"] as? String, "stream.disconnected")
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["connected"] as? Bool, false)
+        XCTAssertEqual(payload["reason"] as? String, "stalled")
+    }
 }
