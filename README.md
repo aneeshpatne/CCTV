@@ -24,8 +24,6 @@ CCTV accepts an MJPEG stream and control telemetry from a single ESP32-CAM. It a
 
 The operator interface is a responsive, video-first HTML, CSS, and JavaScript dashboard served by FastAPI. A Swift worker handles the latency-sensitive path with URLSession, Core Image, Metal, VideoToolbox, and Vision; Python supervises that worker, persists metadata with SQLite and SQLAlchemy, serves media, and runs scheduled jobs. Native events cross a versioned JSON pipe, while an OpenCV implementation remains available as an automatic fallback.
 
-![CCTV live feed with timestamp, temperature, frame-rate, and Wi-Fi overlays](<Screenshot 2026-07-07 140327.png>)
-
 ## Features
 
 | Area | What the project provides |
