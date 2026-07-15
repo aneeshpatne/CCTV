@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#080b0b" />
+    <title>Northstar CCTV</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Northstar CCTV home">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </span>
+        <span>
+          <strong>Northstar</strong>
+          <small>Home surveillance</small>
+        </span>
+      </a>
+
+      <div class="topbar-actions">
+        <div class="system-state" id="systemState">
+          <span class="status-dot"></span>
+          <span id="systemStateText">Connecting</span>
+        </div>
+        <button class="icon-button" id="refreshButton" type="button" aria-label="Refresh dashboard" title="Refresh">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6" /></svg>
+        </button>
+        <a class="icon-button" href="/docs" aria-label="Open API documentation" title="API documentation">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h14v16H5zM9 8h6M9 12h6M9 16h4" /></svg>
+        </a>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="hero-heading">
+        <div>
+          <p class="eyebrow"><span></span> Camera 01 · Front elevation</p>
+          <h1>Good <span id="dayPeriod">evening</span>.</h1>
+          <p class="subheading">Your property at a glance.</p>
+        </div>
+        <div class="hero-time">
+          <strong id="clock">--:--</strong>
+          <span id="today">Loading date</span>
+        </div>
+      </section>
+
+      <section class="dashboard-grid">
+        <article class="panel player-panel">
+          <div class="panel-header player-header">
+            <div>
+              <p class="section-label" id="playerEyebrow">Live view</p>
+              <h2 id="playerTitle">Front camera</h2>
+            </div>
+            <div class="player-actions">
+              <button class="segmented active" id="liveButton" type="button">
+                <span class="live-pip"></span> Live
+              </button>
+              <a class="icon-button subtle" id="popoutButton" href="#" target="_blank" rel="noreferrer" aria-label="Open current video in new tab" title="Open in new tab">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-8 8M19 13v6H5V5h6" /></svg>
+              </a>
+            </div>
+          </div>
+
+          <div class="player-stage" id="playerStage">
+            <iframe
+              id="liveFrame"
+              title="ESP camera live stream"
+              allow="autoplay; fullscreen; picture-in-picture"
+              allowfullscreen
+            ></iframe>
+            <video id="clipPlayer" controls playsinline muted preload="metadata"></video>
+            <div class="player-loading" id="playerLoading" hidden>
+              <span class="loader"></span>
+              <strong>Preparing event clip</strong>
+              <small>This can take a moment for a new clip.</small>
+            </div>
+            <div class="camera-badge"><span></span> CAM 01</div>
+          </div>
+
+          <div class="player-footer">
+            <div class="recording-state">
+              <span class="recording-icon"></span>
+              <span>
+                <strong>Continuous recording</strong>
+                <small id="latestRecording">Checking archive…</small>
+              </span>
+            </div>
+            <div class="stream-meta">
+              <span>Overlay feed</span>
+              <span>LAN</span>
+            </div>
+          </div>
+        </article>
+
+        <aside class="panel event-panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-label">Activity</p>
+              <h2>Motion events</h2>
+            </div>
+            <span class="count-badge" id="eventCount">—</span>
+          </div>
+
+          <div class="filters">
+            <label class="select-wrap">
+              <span class="sr-only">Activity period</span>
+              <select id="hoursFilter">
+                <option value="1">Last hour</option>
+                <option value="12">Last 12 hours</option>
+                <option value="24" selected>Last 24 hours</option>
+                <option value="72">Last 3 days</option>
+                <option value="168">Last 7 days</option>
+              </select>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4" /></svg>
+            </label>
+            <label class="date-wrap" title="Show a specific day">
+              <span class="sr-only">Activity date</span>
+              <input id="dateFilter" type="date" />
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v15H5zM8 3v4M16 3v4M5 10h14" /></svg>
+            </label>
+          </div>
+
+          <div class="event-list" id="eventList" aria-live="polite">
+            <div class="event-skeleton"></div>
+            <div class="event-skeleton"></div>
+            <div class="event-skeleton"></div>
+          </div>
+
+          <button class="text-button" id="showMoreButton" type="button" hidden>
+            Show more activity
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6" /></svg>
+          </button>
+        </aside>
+      </section>
+
+      <section class="insights-grid">
+        <article class="stat-card">
+          <span class="stat-icon amber">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z" /></svg>
+          </span>
+          <div><strong id="motionStat">—</strong><span>Motion events</span></div>
+          <small id="motionPeriod">Past 24 hours</small>
+        </article>
+        <article class="stat-card">
+          <span class="stat-icon green">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v11H4zM8 4h8v3M8 12h8M8 15h5" /></svg>
+          </span>
+          <div><strong id="recordingStat">—</strong><span>Archive segments</span></div>
+          <small>Indexed &amp; ready</small>
+        </article>
+        <article class="stat-card wide">
+          <div class="activity-summary">
+            <span class="stat-icon blue">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 17V9M9 17V5M14 17v-4M19 17V7M3 20h18" /></svg>
+            </span>
+            <div><strong>Activity rhythm</strong><span id="activitySummary">Waiting for event data</span></div>
+          </div>
+          <div class="spark-bars" id="sparkBars" aria-label="Motion activity by time"></div>
+        </article>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
