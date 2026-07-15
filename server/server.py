@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 from pathlib import Path
 import os
@@ -34,7 +35,12 @@ app.add_middleware(
 
 # Configure your CCTV footage directory
 BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_FOLDER = BASE_DIR / "server" / "static"
 TEMP_FOLDER = Path(os.getenv("CCTV_TEMP_DIR", "/tmp/cctv_merged"))
+LIVE_STREAM_URL = os.getenv(
+    "CCTV_LIVE_STREAM_URL",
+    "http://192.168.0.112:8889/esp_cam1_overlay/",
+)
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
@@ -69,6 +75,8 @@ RECORDING_CATALOG.reconcile(force=True)
 
 # Create temp folder if it doesn't exist
 TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
+
+app.mount("/static", StaticFiles(directory=STATIC_FOLDER), name="static")
 
 
 def redis_command(*parts: str) -> str | None:
@@ -116,11 +124,12 @@ def parse_bool(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-@app.get("/")
-async def root():
-    """Root endpoint with server info"""
+def get_server_info() -> dict:
     hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
+    try:
+        local_ip = socket.gethostbyname(hostname)
+    except (socket.gaierror, OSError):
+        local_ip = "127.0.0.1"
     return {
         "message": "CCTV Video Server",
         "hostname": hostname,
@@ -145,6 +154,62 @@ async def root():
             "esp32cam_recovery": "/esp32cam/recovery",
             "docs": "/docs",
         },
+    }
+
+
+@app.get("/", include_in_schema=False)
+async def dashboard():
+    return FileResponse(STATIC_FOLDER / "index.html", media_type="text/html")
+
+
+@app.get("/api")
+async def root():
+    """Server information and available endpoints."""
+    return get_server_info()
+
+
+@app.get("/api/dashboard")
+async def dashboard_data(hours: int = 24):
+    if hours <= 0 or hours > 168:
+        raise HTTPException(status_code=400, detail="hours must be between 1 and 168")
+
+    try:
+        events = get_motion_events_by_hours(hours)
+        recordings = RECORDING_CATALOG.all(descending=True)
+        return {
+            "live_stream_url": LIVE_STREAM_URL,
+            "generated_at": datetime.now().isoformat(),
+            "hours": hours,
+            "motion_count": len(events),
+            "events": serialize_motion_events(events),
+            "recordings_count": len(recordings),
+            "latest_recording": (
+                {
+                    "filename": recordings[0].path.name,
+                    "timestamp": recordings[0].start_time.isoformat(),
+                    "duration": recordings[0].duration,
+                }
+                if recordings
+                else None
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/health")
+async def health():
+    recordings = RECORDING_CATALOG.all(descending=True)
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "recordings_available": len(recordings),
+        "latest_recording_at": (
+            recordings[0].start_time.isoformat() if recordings else None
+        ),
+        "live_stream_url": LIVE_STREAM_URL,
     }
 
 
@@ -246,6 +311,16 @@ def run_ffmpeg(cmd: list[str], detail: str) -> None:
     if result.returncode != 0:
         message = result.stderr.strip() or detail
         raise HTTPException(status_code=500, detail=message[-500:])
+
+
+def inline_video_response(path: Path, filename: str | None = None) -> FileResponse:
+    """Serve MP4 media for browser playback instead of triggering a download."""
+    return FileResponse(
+        path=str(path),
+        media_type="video/mp4",
+        filename=filename or path.name,
+        content_disposition_type="inline",
+    )
 
 
 def trim_video_accurate(
@@ -472,9 +547,7 @@ async def get_video_by_duration(
         # Schedule cleanup of old merged videos
         background_tasks.add_task(cleanup_old_merged_videos)
 
-        return FileResponse(
-            path=str(merged_path), media_type="video/mp4", filename=merged_filename
-        )
+        return inline_video_response(merged_path, merged_filename)
 
     except ValueError:
         raise HTTPException(
@@ -529,9 +602,7 @@ async def get_video_by_event(
 
         background_tasks.add_task(cleanup_old_merged_videos)
 
-        return FileResponse(
-            path=str(merged_path), media_type="video/mp4", filename=merged_filename
-        )
+        return inline_video_response(merged_path, merged_filename)
 
     except HTTPException:
         raise
@@ -840,7 +911,7 @@ async def stream_video(filename: str):
     if not filename.endswith(".mp4"):
         raise HTTPException(status_code=400, detail="Only MP4 files are supported")
 
-    return FileResponse(path=str(filepath), media_type="video/mp4", filename=filename)
+    return inline_video_response(filepath, filename)
 
 
 @app.get("/video/list")
@@ -1107,9 +1178,7 @@ async def get_night_event_by_index(index: int):
         if not video_file.exists():
             raise HTTPException(status_code=404, detail=f"Video {index} not found")
 
-        return FileResponse(
-            path=str(video_file), media_type="video/mp4", filename=video_file.name
-        )
+        return inline_video_response(video_file)
 
     except HTTPException:
         raise
