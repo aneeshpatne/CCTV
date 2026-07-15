@@ -1,243 +1,315 @@
-# CCTV
+<div align="center">
 
-A self-hosted CCTV automation stack for ESP32-CAM devices. It captures the camera stream, overlays health metrics, records segmented video, restreams RTSP, logs motion events, exposes them over a FastAPI service, and delivers nightly summaries with motion clips to a Discord channel via gRPC.
+<h1>CCTV</h1>
 
-## Highlights
+<strong>Know what moved without scrubbing through hours of footage.</strong>
 
-- Continuous ESP32-CAM management with automatic reboot, quality ramp-up, and clock sync via `utilities/startup.py`.
-- Apple Silicon-native Swift capture worker with VideoToolbox motion estimation, candidate-only indoor person/animal recognition, and a GPU-composited timestamp/RSSI/FPS/temperature HUD. The Python/OpenCV pipeline remains an automatic fallback.
-- Hardware HEVC archive recording plus hardware H.264 RTSP output; FFmpeg is only the RTSP muxer. The orchestrator also maintains an indexed recording catalog and batch disk pruning with hysteresis.
-- Motion-event persistence in SQLite via SQLAlchemy (`utilities/motion_db.py`) powering a FastAPI service at `server/server.py` for searching, merging, and streaming footage.
-- Nightly automation (`motion/motion.py`) that fetches motion windows, downloads footage, compresses clips with Apple Silicon's VideoToolbox (`h264_videotoolbox`) to stay under Discord's webhook file limit, and posts summaries + clips to Discord via gRPC.
-- Discord webhook gRPC client (`discord_grpc/`) generated from `proto/discord_webhook.proto`; sends text, images, and videos to a channel by name (default: `cctv`) through an external gRPC server at `127.0.0.1:50051`.
-- Operator tooling for camera controls, LED brightness, stream health, and RSSI checks under `tools/`.
+<p>A self-hosted ESP32-CAM recorder that produces a live health overlay, searchable motion clips, and scheduled Discord summaries.</p>
 
-## Measured Apple Silicon Improvements
+<p>
+  <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12+">
+  <img src="https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white" alt="Swift 6.2">
+  <img src="https://img.shields.io/badge/macOS-26-000000?logo=apple&logoColor=white" alt="macOS 26">
+  <img src="https://img.shields.io/badge/FastAPI-0.124.4-009688?logo=fastapi&logoColor=white" alt="FastAPI 0.124.4">
+  <img src="https://img.shields.io/badge/License-GPLv3-663399" alt="GNU GPLv3">
+</p>
 
-Live measurements on Apple M4, comparing the legacy Python/OpenCV capture path
-with the native worker's complete process tree:
+</div>
 
-| Metric | Legacy path | Native path | Change |
-| --- | ---: | ---: | ---: |
-| Median CPU (`top`) | 58.6% | 20.15% | 65.6% lower |
-| p95 CPU (`top`) | 61.2% | 21.0% | 65.7% lower |
-| Representative 60-second archive | 5.46 MB H.264 | 1.68 MB HEVC | 69.3% smaller |
-| Output cadence | 9 fps | Camera-timed VFR | Follows fresh JPEG arrival |
+---
 
-The first native scheduler processed a frame and then slept for another 1/9 second,
-which limited fresh-frame handling to roughly 4–6 fps while silently overwriting
-queued JPEGs. The camera-timed worker now processes and publishes the stream at its
-measured arrival rate (12.3–12.5 fps in the rollout canary), while retaining a
-9-fps no-signal keepalive. A representative VFR segment contained 738 fresh frames
-over 60.08 seconds. Raw historical reports are in `benchmarks/`.
+## Overview
 
-## Repository Layout
+CCTV accepts an MJPEG stream and control telemetry from a single ESP32-CAM. It adds an operational HUD, detects sustained motion, records camera-timed video segments, and indexes both recordings and events. A self-hoster receives a live browser view, time-based footage retrieval, motion-specific clips, statistics, and optional Discord digests—useful outputs when the important question is what happened and when.
 
-```
-Image Processing/   Capture + motion pipeline and orchestrator utilities
-native/             Swift/VideoToolbox/Core Image capture worker and tests
-motion/             Nightly downloader, VideoToolbox compressor, and Discord sender
-server/             FastAPI application that exposes recordings and motion APIs
-discord_grpc/       gRPC client for the Discord webhook service (from proto/discord_webhook.proto)
-proto/              Protobuf definitions for the Discord webhook gRPC contract
-tools/              Camera control utilities (quality, reset, LED, RSSI, etc.)
-utilities/          Shared helpers (startup automation, SQLite logging, warnings)
-launchd/            launchd plists for the orchestrator and FastAPI server
-run_motion.sh       Apple Silicon launcher for the nightly motion digest
-```
+The operator interface is a responsive, video-first HTML, CSS, and JavaScript dashboard served by FastAPI. A Swift worker handles the latency-sensitive path with URLSession, Core Image, Metal, VideoToolbox, and Vision; Python supervises that worker, persists metadata with SQLite and SQLAlchemy, serves media, and runs scheduled jobs. Native events cross a versioned JSON pipe, while an OpenCV implementation remains available as an automatic fallback.
 
-## Architecture Overview
+![CCTV live feed with timestamp, temperature, frame-rate, and Wi-Fi overlays](<Screenshot 2026-07-07 140327.png>)
+
+## Features
+
+| Area | What the project provides |
+| --- | --- |
+| **Camera lifecycle** | Polls the ESP32 status endpoints, raises the camera to the configured resolution, synchronizes its clock, reapplies AWB/exposure/AGC policy after reconnects, and exposes OTA recovery state through Redis when available. |
+| **Native capture** | Parses multipart MJPEG with a bounded latest-frame queue, follows camera arrival timestamps, and uses hardware JPEG processing and VideoToolbox encoders. The recorded Apple M4 canary reduced median capture-tree CPU by 65.6% and representative segment size by 69.3% versus the Python path. |
+| **Live observability** | Composites timestamp, measured FPS, Wi-Fi RSSI, SoC temperature, motion state, and person/animal labels into the outgoing frame. Telemetry failures leave the feed running with unavailable values. |
+| **Signal recovery** | Detects a three-second JPEG stall, keeps archive and RTSP outputs alive with a `NO SIGNAL · RECONNECTING` frame, retries the stream, and coalesces disconnects into one camera startup sequence. |
+| **Recording and retention** | Writes atomically finalized, camera-timed HEVC MP4 segments; registers them in a SQLite catalog; reconciles the catalog at startup; and prunes older footage from 90% disk use toward 85% without deleting recent or partial files. |
+| **Motion intelligence** | Uses ROI-aware VideoToolbox motion vectors, temporal persistence, and global-lighting rejection. Vision classification runs only for motion candidates and adds person or animal annotations without changing the base event schema. |
+| **Review and retrieval** | Serves a dashboard plus APIs for recording lists, exact timestamps, arbitrary ranges, hourly/day windows, motion queries, hourly statistics, and accurately trimmed H.264 event clips with configurable pre/post padding. |
+| **Scheduled reporting** | Merges nearby overnight events, downloads their clips from the API, compresses them under the configured Discord transport limit, and sends a summary and videos through a retrying gRPC client. An optional OpenAI job produces a daily text summary and plots. |
+| **Operational resilience** | Restarts a failed capture process, latches to the Python/OpenCV fallback after three native failures in five minutes, publishes health metrics every ten seconds, and includes `launchd` definitions for capture, API, and the nightly job. |
+
+> [!NOTE]
+> Native capture, the Python fallback, indexed recording, motion persistence, the FastAPI API, the browser dashboard, and nightly clip delivery are implemented. The system currently targets one indoor camera; vehicle classification is intentionally disabled. The RTSP server and Discord webhook gRPC server are required external services and are not included here. The AI daily summary is optional and requires an OpenAI API key.
+
+## From camera feed to useful evidence
 
 ```mermaid
 flowchart LR
-    Camera[ESP32-CAM\nMJPEG + control endpoints] --> Native[Swift native worker\nURLSession • Vision • Metal • VideoToolbox]
-    Native --> Archive[HEVC MP4 archive\n60-second segments]
-    Native --> Mux[FFmpeg copy muxer]
-    Mux --> RTSP[RTSP overlay stream]
-    Native --> Events[Versioned event pipe]
-    Events --> Orchestrator[Python orchestrator\nstartup • recovery • cleanup • catalog]
-    Orchestrator --> Database[(SQLite motion + catalog)]
-    Database --> API[FastAPI video and motion API]
-    API --> Digest[Nightly digest]
-    Digest --> Discord[Discord gRPC]
+    A["ESP32-CAM MJPEG"] --> B["Camera startup and capture"]
+    B --> C["Decode, motion analysis, and HUD"]
+    C --> D["HEVC segments"]
+    C --> E["H.264 RTSP stream"]
+    C --> F["Versioned events"]
+    D --> G["Recording catalog"]
+    F --> H["Motion database"]
+    G --> I["FastAPI and dashboard"]
+    H --> I
+    E --> J["Live browser view"]
+    I --> K["Trimmed event clips"]
+    K --> L["Nightly Discord digest"]
+    C --> M{"JPEG stalled?"}
+    M -- "Yes" --> N["No-signal keepalive"]
+    N --> O["Reconnect and retune"]
+    O --> B
 ```
 
-```
-ESP32-CAM MJPEG → Swift native worker ─┬─ VideoToolbox HEVC → segmented MP4 archive
-                                      ├─ VideoToolbox H.264 → FFmpeg copy mux → RTSP
-                                      └─ versioned events → Python orchestrator
-                                                                     │
-                                     ┌───────────────────────────────┼─ Storage monitor trims oldest footage when full
-                                     │                               ├─ SQLite motion log (utilities/motion_db.py)
-                                     │                               ├─ FastAPI server (server/server.py, port 8005) for video & motion APIs
-                                     │                               └─ Nightly job (motion/motion.py) → Discord gRPC (#cctv)
-                                     │
-                Discord webhook gRPC server (127.0.0.1:50051) ←── send_text / send_image / send_video
-```
+Fresh JPEGs are processed at their measured arrival cadence; `CCTV_TARGET_FPS` is an encoder hint and the no-signal keepalive rate rather than a fixed live-frame scheduler. A stalled stream is retried while recording continues. Blocking FFmpeg work is moved off FastAPI's async event loop, generated clips are reused until hourly cleanup, and transient Discord RPC failures receive up to three attempts.
 
-### Camera Signal Recovery
+## Product outputs
 
 ```mermaid
 flowchart TD
-    Frames[Fresh JPEG arrives] --> Analyze[Native motion + HUD processing]
-    Analyze --> Output[9-fps HEVC archive and H.264 RTSP]
-    Frames --> Watchdog{No JPEG for\n3 seconds?}
-    Watchdog -- No --> Frames
-    Watchdog -- Yes --> NoSignal[Render NO SIGNAL · RECONNECTING\nwith timestamp, RSSI, FPS, temperature]
-    NoSignal --> KeepAlive[Continue 9-fps archive + RTSP]
-    NoSignal --> Event[Emit stream.disconnected]
-    Event --> Startup[Python runs one complete\nESP startup/recovery loop]
-    KeepAlive --> Retry[Retry MJPEG every 2 seconds]
-    Startup --> Retry
-    Retry --> Restored{JPEG restored?}
-    Restored -- No --> NoSignal
-    Restored -- Yes --> Connected[Emit stream.connected]
-    Connected --> Frames
-    Connected --> Stabilize[Wait 20 seconds]
-    Stabilize --> Tune[AWB off • conditional exposure level 2 • AGC off]
+    CCTV["CCTV"]
+    CCTV --> Live["Live awareness"]
+    CCTV --> Evidence["Recorded evidence"]
+    CCTV --> Activity["Activity history"]
+    CCTV --> Reports["Scheduled reports"]
+
+    Live --> Overlay["Health-overlay stream"]
+    Live --> Status["Server and camera status"]
+    Evidence --> Segments["HEVC recording segments"]
+    Evidence --> Clips["Padded H.264 event clips"]
+    Activity --> Events["Motion events and labels"]
+    Activity --> Stats["Range and hourly statistics"]
+    Reports --> Night["Overnight summary and clips"]
+    Reports --> Daily["Optional AI summary and plots"]
+```
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Edge["Camera and network edge"]
+        Camera["ESP32-CAM\nMJPEG and control endpoints"]
+        RTSP["External RTSP server"]
+        Discord["External Discord gRPC bridge"]
+        Redis["Optional Redis"]
+    end
+
+    subgraph Capture["Capture and domain services"]
+        Orchestrator["Python orchestrator"]
+        Native["Swift capture worker"]
+        Fallback["Python/OpenCV fallback"]
+        Digest["Nightly and daily jobs"]
+    end
+
+    subgraph Data["Persistence and media"]
+        Recordings[("HEVC MP4 segments")]
+        Catalog[("SQLite recording catalog")]
+        Motion[("SQLite motion events")]
+        Temp[("Temporary H.264 clips")]
+    end
+
+    subgraph Presentation["Presentation"]
+        API["FastAPI service"]
+        Dashboard["Browser dashboard"]
+    end
+
+    Orchestrator --> Native
+    Orchestrator -. "failure fallback" .-> Fallback
+    Camera --> Native
+    Camera --> Fallback
+    Native --> Recordings
+    Native --> RTSP
+    Native -- "JSON events" --> Orchestrator
+    Orchestrator --> Catalog
+    Orchestrator --> Motion
+    Orchestrator --> Redis
+    Catalog --> API
+    Motion --> API
+    Recordings --> API
+    API --> Temp
+    API --> Dashboard
+    RTSP --> Dashboard
+    API --> Digest
+    Digest --> Discord
+```
+
+Python owns process supervision, camera recovery, storage policy, SQLite writes, and API/scheduled work; Swift owns frame acquisition, analysis, composition, and hardware encoding. The native worker emits additive, versioned event envelopes through a dedicated file descriptor so persistence stays outside the frame path. Actor-isolated runtime state and candidate-only Vision work prevent slow classification from backing up capture. The API queries indexed metadata instead of rescanning recordings and offloads video concatenation and transcoding to worker threads.
+
+## Tech stack
+
+| Layer | Technology |
+| --- | --- |
+| **Languages** | Python 3.12+, Swift 6.2, JavaScript, HTML, and CSS |
+| **Native capture** | URLSession, Core Image, Metal, Core Video, AVFoundation, and VideoToolbox |
+| **Detection** | VideoToolbox motion estimation and Apple Vision person/image classification |
+| **Fallback capture** | OpenCV and NumPy |
+| **Backend** | FastAPI 0.124.4 and Uvicorn |
+| **Persistence** | SQLite, SQLAlchemy 2.0.46, and a direct `sqlite3` recording catalog |
+| **Video tooling** | FFmpeg/ffprobe, HEVC archives, H.264 RTSP, and `h264_videotoolbox` clip encoding |
+| **Messaging** | gRPC 1.71, Protocol Buffers, and an external Discord webhook bridge |
+| **Optional insights** | OpenAI Responses API and Matplotlib |
+| **Operations** | macOS `launchd`, shell launchers, health events, and benchmark scripts |
+| **Testing** | XCTest and Python `unittest` |
+
+## Project structure
+
+```text
+.
+├── native/
+│   ├── Sources/CCTVCapture/       # Swift capture, detection, HUD, and encoders
+│   ├── Tests/CCTVCaptureTests/    # Native configuration and pipeline tests
+│   └── Package.swift              # Swift 6.2 package and macOS 26 target
+├── image_processing/
+│   ├── pipeline_orchestrator.py   # Supervision, recovery, catalog, and retention
+│   └── camera_pipeline.py         # Python/OpenCV fallback pipeline
+├── server/
+│   ├── server.py                  # FastAPI dashboard, motion, and video routes
+│   └── static/                    # Video-first browser dashboard
+├── motion/                        # Nightly clips, daily plots, and AI summary jobs
+├── utilities/                     # Camera client, SQLite models, and catalog helpers
+├── discord_grpc/                  # Generated stubs and retrying Discord client
+├── proto/discord_webhook.proto    # Discord bridge contract
+├── tools/                         # Camera controls, diagnostics, and benchmarks
+├── tests/                         # Python event-protocol and catalog tests
+├── launchd/                       # Machine-specific service definitions
+├── benchmarks/                    # Python baseline and native canary evidence
+├── scripts/build-native.sh        # Release build for the Swift worker
+├── requirements.txt               # Pinned Python dependencies
+└── LICENSE                        # GNU GPLv3 text
 ```
 
 ## Requirements
 
-- macOS 26 on Apple Silicon with Python 3.12+ and the full Xcode toolchain.
-- FFmpeg CLI with `h264_videotoolbox` support (`brew install ffmpeg`).
-- OpenCV build with FFMPEG support.
-- ESP32-CAM or compatible device serving MJPEG/HTTP control endpoints (defaults assume `192.168.0.13`).
-- SQLite (bundled with Python) and write access to `/Volumes/drive/CCTV/recordings/esp_cam1` (default) or a custom path via `CCTV_RECORDINGS_DIR`.
-- Discord webhook gRPC server listening at `127.0.0.1:50051` (a separate launchd job, `com.aneesh.discord-webhook-grpc`).
+- An Apple Silicon Mac running macOS 26. The native package declares macOS 26 as its minimum platform.
+- The full Xcode toolchain with Swift 6.2 or later. `scripts/build-native.sh` expects Xcode at `/Applications/Xcode.app` unless `DEVELOPER_DIR` is overridden.
+- Python 3.12 and a virtual environment.
+- FFmpeg and ffprobe with the `h264_videotoolbox` encoder available.
+- One ESP32-CAM reachable over the local network with MJPEG, control, status, RSSI, and system-health endpoints compatible with `utilities/esp32cam_client.py`.
+- A writable recordings directory and a writable motion-data directory. Defaults point to `/Volumes/drive/CCTV/...`; local paths can be supplied through environment variables.
+- An RTSP service that accepts the worker's publisher URL. Browser playback also needs a browser-compatible live URL configured through `CCTV_LIVE_STREAM_URL`.
+- For notifications, the separate Discord webhook gRPC service described by `proto/discord_webhook.proto`. For the optional AI digest, an `OPENAI_API_KEY` is also required.
+- Redis is optional for ordinary capture but required for the ESP32 OTA recovery flag and `/esp32cam/recovery` status route.
 
-### Python Dependencies
+There is no camera simulator. Unit tests run without hardware, but live capture, recovery, RTSP publishing, telemetry, and end-to-end clip delivery require the physical camera and their respective local services. Manual development runs use shell configuration; the supplied `launchd` files are production-style examples with machine-specific absolute paths.
 
-Install into a virtual environment:
+> [!WARNING]
+> The FastAPI app binds to `0.0.0.0`, allows CORS from every origin, and does not implement authentication. Keep it on a trusted LAN or place it behind an authenticated reverse proxy; do not expose port `8005` directly to the internet.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+## Getting started
 
-> Edit `requirements.txt` if you split optional features across environments.
-
-## Configuration
-
-1. **Camera endpoints** – Update IPs in:
-
-   - `Image Processing/camera_pipeline.py`
-   - `utilities/startup.py`
-   - `tools/*.py`
-   - `motion/motion.py`
-
-2. **Recording paths** – By default recordings are written to `/Volumes/drive/CCTV/recordings/esp_cam1` on the external drive. Override with `CCTV_RECORDINGS_DIR` if you use a different mount.
-
-   Native controls include `CCTV_PIPELINE_BACKEND=native|python`, `CCTV_NATIVE_BINARY`, `CCTV_TARGET_FPS` (default `9`, used for no-signal keepalive and encoder hints), `CCTV_HEVC_BITRATE` (default `500000`), `CCTV_RTSP_BITRATE` (default `1500000`), and `CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS` (default `20`). Normal recording and RTSP timing follows fresh camera arrivals. Three native failures within five minutes latch the orchestrator to the Python fallback until restart.
-
-3. **Environment variables** – A `.env` file is optional. Set `OPENAI_API_KEY` if you run the AI daily digest (`motion/night_message.py`).
-
-4. **Discord webhook gRPC** – The nightly digest sends messages and clips to a Discord channel through a gRPC server. Configure with:
-
-   ```
-   DISCORD_GRPC_TARGET=127.0.0.1:50051   # gRPC server address
-   DISCORD_CHANNEL=cctv                   # target Discord channel name
-   DISCORD_USERNAME=                      # optional webhook display name override
-   DISCORD_AVATAR_URL=                    # optional webhook avatar override
-   ```
-
-   Regenerate the client stubs after editing the proto:
+1. Clone the repository and enter it.
 
    ```bash
-   python -m grpc_tools.protoc -Iproto --python_out=discord_grpc --grpc_python_out=discord_grpc proto/discord_webhook.proto
+   git clone https://github.com/aneeshpatne/CCTV.git
+   cd CCTV
    ```
 
-5. **Video compression** – `motion/motion.py` compresses clips with Apple Silicon's `h264_videotoolbox` encoder. The target size is 9.5 MB to fit Discord's standard webhook upload limit; see `discord_grpc.DISCORD_FILE_LIMIT_BYTES` to adjust.
+2. Create the Python environment and install the pinned dependencies.
 
-## Running the Services
+   ```bash
+   python3.12 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
 
-### 1. Camera Capture + Storage Monitor
+3. Install FFmpeg and verify hardware H.264 encoding.
+
+   ```bash
+   brew install ffmpeg
+   ffmpeg -hide_banner -encoders | grep h264_videotoolbox
+   ```
+
+4. Create local data directories and configure the camera, storage, and live endpoints for the current shell.
+
+   ```bash
+   mkdir -p recordings/esp_cam1 motion/data
+
+   export ESP32CAM_BASE_URL="http://192.168.0.13"
+   export ESP32CAM_STREAM_URL="http://192.168.0.13:81/stream"
+   export CCTV_RECORDINGS_DIR="$PWD/recordings/esp_cam1"
+   export MOTION_DB_DIR="$CCTV_RECORDINGS_DIR"
+   export MOTION_DATA_DIR="$PWD/motion/data"
+   export CCTV_RTSP_URL="rtsp://127.0.0.1:8554/esp_cam1_overlay"
+   export CCTV_LIVE_STREAM_URL="http://127.0.0.1:8889/esp_cam1_overlay/"
+   ```
+
+   `CCTV_PIPELINE_BACKEND` accepts `native`, `python`, or `auto`; the default is `native`, with fallback when the binary is missing or repeatedly fails. Native tuning is available through `CCTV_TARGET_FPS`, `CCTV_SEGMENT_SECONDS`, `CCTV_HEVC_BITRATE`, `CCTV_RTSP_BITRATE`, and `CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS`.
+
+5. Build the native capture worker.
+
+   ```bash
+   ./scripts/build-native.sh
+   ```
+
+6. Start a compatible RTSP server, then run the orchestrator.
+
+   ```bash
+   source .venv/bin/activate
+   python -m image_processing.pipeline_orchestrator
+   ```
+
+7. In a second terminal with the same exported paths, start the API and open `http://127.0.0.1:8005/`.
+
+   ```bash
+   source .venv/bin/activate
+   python -m server.server
+   ```
+
+8. Optionally configure the external Discord bridge and run the overnight digest.
+
+   ```bash
+   export DISCORD_GRPC_TARGET="127.0.0.1:50051"
+   export DISCORD_CHANNEL="cctv"
+   python -m motion.motion
+   ```
+
+   The optional AI daily job additionally needs `OPENAI_API_KEY` and runs with `python -m motion.night_message`.
+
+> [!IMPORTANT]
+> The repository contains development defaults for camera IPs, recording volumes, RTSP/live stream URLs, Discord targets, and absolute paths in `launchd/*.plist`. Replace them for the target machine before installing services or distributing a configured copy. The external RTSP and Discord services must be started separately.
+
+Once manual startup is verified, adapt the three property lists in `launchd/`, copy them to `~/Library/LaunchAgents/`, and load only the services you use. Do not start a second capture process while the LaunchAgent is active: the configured ESP32 MJPEG stream is treated as single-consumer.
+
+## Running tests
+
+Run the Python suite from the repository root:
 
 ```bash
-./scripts/build-native.sh
 source .venv/bin/activate
-python -m image_processing.pipeline_orchestrator
+python -m unittest discover -s tests -v
 ```
 
-This launches the native worker, H.264 RTSP muxer, indexed HEVC recorder, and background disk cleanup job. Set `CCTV_PIPELINE_BACKEND=python` to force the legacy fallback.
-
-### 2. FastAPI Video Server
+Run the Swift suite from the native package:
 
 ```bash
-source .venv/bin/activate
-python server/server.py
+cd native
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+CLANG_MODULE_CACHE_PATH=/tmp/cctv-clang-module-cache \
+SWIFT_MODULE_CACHE_PATH=/tmp/cctv-swift-module-cache \
+  xcrun swift test --disable-sandbox
 ```
 
-The server listens on `0.0.0.0:8005` by default and exposes documentation at `/docs`.
+In an IDE, use Python `unittest` discovery for `tests/`, or open `native/Package.swift` in Xcode and choose Product → Test. The current tests cover native configuration, MJPEG parsing, variable-frame-rate timing, RTSP arguments, motion accumulation and event envelopes, plus Python-side event persistence and recording-catalog reconciliation. API, storage-pruning, hardware replay, and Discord integration are not currently covered by the committed automated suite.
 
-Common API routes:
+## Roadmap
 
-- `GET /video/list` – Listing of available recordings with timestamps and sizes.
-- `GET /video/by-duration?timestamp=YYYY-MM-DDTHH:MM:SS&minutes=30` – Merge a custom window and return a single MP4.
-- `GET /video/by-hour`, `GET /video/by-day`, `GET /video/by-timestamp` – Convenience merges.
-- `GET /motion/logs?hours=12`, `/motion/range`, `/motion/day`, `/motion/stats` – Motion event queries backed by SQLite.
-- `GET /nightevents` and `/nightevents/{index}` – Serve previously generated nightly clips.
-
-### 3. Nightly Motion Digest
-
-To run ad hoc:
-
-```bash
-source .venv/bin/activate
-python motion/motion.py
-```
-
-For scheduled execution (e.g., via cron), use `run_motion.sh`, which activates the virtual environment, runs the script, and logs to `motion/motion.log`.
-
-### 4. Daily AI Digest
-
-```bash
-source .venv/bin/activate
-python motion/night_message.py
-```
-
-Generates yesterday's motion-plot images, asks the OpenAI model for a short summary, and posts both to Discord via gRPC (`send_text` + `send_image`).
-
-## launchd Services (macOS)
-
-Two persistent agents live in `launchd/` and are installed into `~/Library/LaunchAgents/`:
-
-- `com.aneesh.cctv.orchestrator` – runs `image_processing.pipeline_orchestrator` with `KeepAlive` so the capture/record/RTSP pipeline restarts on failure.
-- `com.aneesh.cctv.server` – runs `server.server` (FastAPI on `0.0.0.0:8005`) with `KeepAlive`.
-
-Install / reload both:
-
-```bash
-cp launchd/*.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.aneesh.cctv.orchestrator.plist
-launchctl load ~/Library/LaunchAgents/com.aneesh.cctv.server.plist
-```
-
-Logs are written to `~/Library/Logs/CCTV/*.log`. Restart a job with:
-
-```bash
-launchctl kickstart -k gui/$(id -u)/com.aneesh.cctv.server
-```
-
-## Storage & Maintenance
-
-- **Disk pruning** – The orchestrator starts pruning at 90% and deletes finalized segments in one batch toward 85%, avoiding the old 89–90% cleanup loop.
-- **Motion logging** – The native detector sends finalized events to the Python orchestrator, which preserves `motion_events_new` and stores optional person/animal labels in an additive annotation table.
-- **Signal recovery** – After three seconds without a JPEG, native recording and RTSP continue with the full HUD over a `NO SIGNAL · RECONNECTING` screen. Reconnect attempts run every two seconds while the orchestrator coalesces disconnect events into one complete ESP startup sequence.
-- **Post-connect camera tuning** – After a stable MJPEG connection, the orchestrator waits 20 seconds, disables automatic white balance, applies exposure level 2 outside the 12pm–6pm IST exclusion window, and disables automatic gain. A disconnect cancels stale tuning work and the sequence runs again after recovery.
-- **Performance measurement** – `tools/benchmark_pipeline.py <orchestrator-pid> --output benchmarks/run.json` records raw `top` data and process-tree median/p95 CPU. Native health logs distinguish parsed camera FPS, processed/output FPS, queue drops, encoder drops, and processing latency.
-- **Health overlays** – Wi-Fi RSSI (`tools/get_rssi.py`) and ESP SoC temperature (`/syshealth`) power on-screen badges. These requests fail gracefully if endpoints are unreachable.
-
-## Development Tips
-
-- The codebase assumes a single camera. To add more, replicate `camera_pipeline.py` with per-camera constants or abstract them into configuration objects.
-- When making IP or credential changes, update both the startup helpers and the motion digest scripts to keep all services aligned.
-- Enable `SHOW_LOCAL_VIEW` in `camera_pipeline.py` for debugging overlays, but note the added GUI dependency.
-- Use the FastAPI docs UI to exercise the API, especially merge endpoints that rely on sequential file naming.
-- Regenerate the Discord gRPC client (`discord_grpc/`) whenever the proto changes — see the Configuration section.
+- Consolidate camera addresses, storage paths, stream URLs, and service targets into one shared configuration surface instead of per-process environment lookups and development defaults.
+- Generalize the single-camera orchestrator, catalog, and dashboard state into explicit per-camera configuration.
+- Replace the machine-specific `launchd` property lists with an installer or generated templates that resolve the repository and virtual-environment paths.
+- Add authenticated deployment guidance or application-level access control for installations that must be reachable beyond a trusted LAN.
+- Extend automated coverage to API clip generation, storage cleanup, camera replay/golden HUD output, and a stub Discord gRPC integration.
 
 ## License
 
-Released under the [GNU General Public License v3.0](LICENSE).
+CCTV is released under the [GNU General Public License v3.0](LICENSE). In practical terms, redistributed covered versions must remain under GPLv3 and include the corresponding source and license notices; consult the license text for the complete terms.
+
+---
+
+<div align="center">
+  Built with Swift, VideoToolbox, FastAPI, and a preference for footage that explains itself.
+</div>
