@@ -8,6 +8,7 @@ struct MotionResult: Sendable {
     let score: Double
     let confidence: Double
     let boundingBox: NormalizedRect?
+    let sceneBrightness: Double?
 }
 
 private struct MotionPixelBuffer: @unchecked Sendable {
@@ -104,19 +105,39 @@ actor MotionDetector {
 
     func analyze(_ image: CIImage) async -> MotionResult {
         guard let buffer = makeAnalysisBuffer(image) else {
-            return MotionResult(candidate: false, score: 0, confidence: 0, boundingBox: nil)
+            return MotionResult(
+                candidate: false,
+                score: 0,
+                confidence: 0,
+                boundingBox: nil,
+                sceneBrightness: nil
+            )
         }
+        let sceneBrightness = Self.averageBrightness(buffer)
         guard let previous else {
             self.previous = buffer
-            return MotionResult(candidate: false, score: 0, confidence: 0, boundingBox: nil)
+            return MotionResult(
+                candidate: false,
+                score: 0,
+                confidence: 0,
+                boundingBox: nil,
+                sceneBrightness: sceneBrightness
+            )
         }
         self.previous = buffer
-        return await Self.estimate(
+        let motion = await Self.estimate(
             session: session,
             previous: MotionPixelBuffer(value: previous),
             current: MotionPixelBuffer(value: buffer),
             roi: roi,
             roiMask: roiMask
+        )
+        return MotionResult(
+            candidate: motion.candidate,
+            score: motion.score,
+            confidence: motion.confidence,
+            boundingBox: motion.boundingBox,
+            sceneBrightness: sceneBrightness
         )
     }
 
@@ -197,7 +218,43 @@ actor MotionDetector {
                 height: Double(maxY - minY + 1) / Double(gridHeight)
             )
             : nil
-        return MotionResult(candidate: candidate, score: score, confidence: confidence, boundingBox: box)
+        return MotionResult(
+            candidate: candidate,
+            score: score,
+            confidence: confidence,
+            boundingBox: box,
+            sceneBrightness: nil
+        )
+    }
+
+    /// Estimate full-frame BT.709 luma before the HUD is drawn. Sampling the existing
+    /// analysis buffer avoids another Core Image render while remaining stable enough
+    /// for the long resolution-control window.
+    nonisolated private static func averageBrightness(_ buffer: CVPixelBuffer) -> Double? {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        let sampleStep = 4
+        var luminance = 0.0
+        var sampleCount = 0
+
+        for y in stride(from: 0, to: height, by: sampleStep) {
+            for x in stride(from: 0, to: width, by: sampleStep) {
+                let offset = y * rowBytes + x * 4
+                let blue = Double(bytes[offset])
+                let green = Double(bytes[offset + 1])
+                let red = Double(bytes[offset + 2])
+                luminance += 0.2126 * red + 0.7152 * green + 0.0722 * blue
+                sampleCount += 1
+            }
+        }
+        guard sampleCount > 0 else { return nil }
+        return luminance / (Double(sampleCount) * 255)
     }
 
     nonisolated private static func estimate(
@@ -207,7 +264,13 @@ actor MotionDetector {
         roi: [CGPoint],
         roiMask: [Bool]
     ) async -> MotionResult {
-        let empty = MotionResult(candidate: false, score: 0, confidence: 0, boundingBox: nil)
+        let empty = MotionResult(
+            candidate: false,
+            score: 0,
+            confidence: 0,
+            boundingBox: nil,
+            sceneBrightness: nil
+        )
         return await withCheckedContinuation { continuation in
             let box = MotionRequestBox(continuation)
             // Keep ownership explicit with our two persistent buffers. The reuse hint lets
