@@ -1102,6 +1102,7 @@ def get_status_color(value, thresholds, colors):
 
 
 HUD_FONT_CACHE: dict[int, Optional[object]] = {}
+NO_SIGNAL_FRAME_CACHE: dict[tuple, np.ndarray] = {}
 
 
 def get_hud_font(size: int) -> Optional[object]:
@@ -1519,6 +1520,31 @@ def show_placeholder(message: str) -> None:
 
 def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     """Create and optionally display a no-signal frame. Always returns the frame for recording."""
+    with rssi_lock:
+        current_rssi = rssi_value
+    with fps_lock:
+        current_fps = fps_value
+    with temperature_lock:
+        current_temperature = soc_temperature_c
+    base_height, base_width = (
+        no_signal_img.shape[:2] if no_signal_img is not None else (480, 640)
+    )
+    cache_key = (
+        "display",
+        base_width,
+        base_height,
+        message,
+        current_rssi,
+        round(current_fps, 1),
+        current_temperature,
+        int(time.time()),
+    )
+    cached = NO_SIGNAL_FRAME_CACHE.get(cache_key)
+    if cached is not None:
+        if SHOW_LOCAL_VIEW:
+            cv2.imshow("frame", cached)
+        return cached
+
     # Initialize frame from no_signal_img
     if no_signal_img is not None:
         frame = no_signal_img.copy()
@@ -1537,16 +1563,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
 
     draw_status_message(frame, message)
 
-    # Get current status values
-    with rssi_lock:
-        current_rssi = rssi_value
-    with fps_lock:
-        current_fps = fps_value
-    with temperature_lock:
-        current_temperature = soc_temperature_c
-
     # Draw HUD
     draw_hud(frame, current_fps, current_rssi, current_temperature)
+    if len(NO_SIGNAL_FRAME_CACHE) >= 8:
+        NO_SIGNAL_FRAME_CACHE.clear()
+    NO_SIGNAL_FRAME_CACHE[cache_key] = frame
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -1557,6 +1578,26 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
 
 def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.ndarray:
     """Create a no-signal frame matching the specified dimensions for FFmpeg."""
+    with rssi_lock:
+        current_rssi = rssi_value
+    with fps_lock:
+        current_fps = fps_value
+    with temperature_lock:
+        current_temperature = soc_temperature_c
+    cache_key = (
+        "record",
+        width,
+        height,
+        message,
+        current_rssi,
+        round(current_fps, 1),
+        current_temperature,
+        int(time.time()),
+    )
+    cached = NO_SIGNAL_FRAME_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     # Create or resize no_signal base to match camera dimensions
     if no_signal_img is not None:
         base = cv2.resize(no_signal_img, (width, height))
@@ -1577,16 +1618,12 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
 
     draw_status_message(frame, message)
 
-    # Get current status values
-    with rssi_lock:
-        current_rssi = rssi_value
-    with fps_lock:
-        current_fps = fps_value
-    with temperature_lock:
-        current_temperature = soc_temperature_c
-
     # Draw HUD
     draw_hud(frame, current_fps, current_rssi, current_temperature)
+
+    if len(NO_SIGNAL_FRAME_CACHE) >= 8:
+        NO_SIGNAL_FRAME_CACHE.clear()
+    NO_SIGNAL_FRAME_CACHE[cache_key] = frame
 
     return frame
 
@@ -1676,6 +1713,17 @@ def main() -> None:
     attempt = 0
     cap = None
     last_blinker_trigger = 0.0
+    last_no_signal_frame = 0.0
+    no_signal_interval = 1.0 / max(1.0, FIXED_OUTPUT_FPS)
+    roi_mask: Optional[np.ndarray] = None
+
+    def pace_no_signal() -> None:
+        nonlocal last_no_signal_frame
+        now = time.monotonic()
+        remaining = last_no_signal_frame + no_signal_interval - now
+        if remaining > 0:
+            time.sleep(remaining)
+        last_no_signal_frame = time.monotonic()
 
     # Initialize motion detection components
     mog2 = cv2.createBackgroundSubtractorMOG2(
@@ -1715,18 +1763,13 @@ def main() -> None:
             if SHOW_LOCAL_VIEW:
                 if cv2.waitKey(1) == ord("q"):
                     break
-            else:
-                # Small sleep to prevent tight loop when not showing view
-                time.sleep(0.01)
-
             if not startup_complete.is_set():
                 if cap is not None:
                     cap.release()
                     cap = None
 
+                pace_no_signal()
                 record_no_signal_frame(get_device_state_message("STARTUP"))
-
-                time.sleep(0.05)
                 continue
 
             if cap is None or not cap.isOpened():
@@ -1799,16 +1842,18 @@ def main() -> None:
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.dilate(mask, kernel, iterations=2)
 
-            # Build ROI mask and apply
-            roi_mask = np.zeros_like(mask, dtype=np.uint8)
-            cv2.fillPoly(roi_mask, [ROI_PTS], 255)
+            # The ROI geometry is fixed; rebuild only after a resolution change.
+            if roi_mask is None or roi_mask.shape != mask.shape:
+                roi_mask = np.zeros_like(mask, dtype=np.uint8)
+                cv2.fillPoly(roi_mask, [ROI_PTS], 255)
             filtered_motion = cv2.bitwise_and(mask, roi_mask)
 
             # Find contours in filtered motion
             contours, _ = cv2.findContours(
                 filtered_motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            disp = frame.copy()
+            # Motion analysis is complete, so the source frame can become the output.
+            disp = frame
             motion_detected = False
             time_overlap = False
             coordinates = [0, 0]
@@ -1907,6 +1952,7 @@ def main() -> None:
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             expected_frame_size = None
+        acc.close()
         cv2.destroyAllWindows()
         print("Cleanup complete.")
 
