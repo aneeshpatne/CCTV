@@ -9,6 +9,7 @@ and posts a summary + clip to the configured Discord channel via gRPC.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import shutil
 import subprocess
@@ -30,10 +31,10 @@ from discord_grpc import (
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8005")
 
-# Compression targets. Discord's free webhook upload limit is 25 MB; we aim a
-# little below to leave headroom for the multipart envelope.
-TARGET_FILE_SIZE_BYTES = 24 * 1024 * 1024
 HARD_LIMIT_BYTES = DISCORD_FILE_LIMIT_BYTES
+# Always size the first encode against the actual transport limit. The gRPC
+# service may enforce a lower cap than Discord's headline upload allowance.
+TARGET_FILE_SIZE_BYTES = min(24 * 1024 * 1024, int(HARD_LIMIT_BYTES * 0.95))
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -47,43 +48,36 @@ ist = pytz.timezone("Asia/Kolkata")
 # ---------------------------------------------------------------------------
 
 
-def _ffprobe_duration_seconds(path: Path) -> float:
-    """Best-effort duration probe using ffprobe (falls back to 0)."""
+def _ffprobe_video(path: Path) -> tuple[float, str | None, str | None]:
+    """Read duration, codec and pixel format with one ffprobe subprocess."""
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "default=noprint_wrappers=1:nokey=1",
+                "-select_streams", "v:0",
+                "-show_entries", "format=duration:stream=codec_name,pix_fmt",
+                "-of", "json",
                 str(path),
             ],
             capture_output=True, text=True, timeout=30,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return max(float(result.stdout.strip().splitlines()[0]), 0.0)
-    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        if result.returncode == 0:
+            payload = json.loads(result.stdout)
+            stream = next(iter(payload.get("streams", [])), {})
+            duration = max(float(payload.get("format", {}).get("duration", 0)), 0.0)
+            return duration, stream.get("codec_name"), stream.get("pix_fmt")
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
         pass
-    return 0.0
+    return 0.0, None, None
+
+
+def _ffprobe_duration_seconds(path: Path) -> float:
+    return _ffprobe_video(path)[0]
 
 
 def _ffprobe_video_codec(path: Path) -> tuple[str | None, str | None]:
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe", "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,pix_fmt",
-                "-of", "default=noprint_wrappers=1", str(path),
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        values = {}
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                key, _, value = line.partition("=")
-                values[key] = value
-        return values.get("codec_name"), values.get("pix_fmt")
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return None, None
+    _, codec, pixel_format = _ffprobe_video(path)
+    return codec, pixel_format
 
 
 def _build_vt_cmd(src: Path, dst: Path, bps: int) -> list[str]:
@@ -107,6 +101,7 @@ def compress_clip_videotoolbox(
     target_bytes: int = TARGET_FILE_SIZE_BYTES,
     hard_limit_bytes: int = HARD_LIMIT_BYTES,
     max_attempts: int = 6,
+    move_compliant: bool = False,
 ) -> Path:
     """Compress `src` to `dst` with Apple Silicon's h264_videotoolbox encoder.
 
@@ -115,15 +110,18 @@ def compress_clip_videotoolbox(
     under `hard_limit_bytes` (Discord's 25 MB cap). Falls back to a 640px-wide
     downscale if bitrate reduction alone is not enough.
     """
-    codec, pixel_format = _ffprobe_video_codec(src)
+    duration, codec, pixel_format = _ffprobe_video(src)
     if src.stat().st_size <= hard_limit_bytes and codec == "h264" and pixel_format in {
         "yuv420p", "nv12"
     }:
-        shutil.copyfile(src, dst)
+        if move_compliant:
+            shutil.move(src, dst)
+        else:
+            shutil.copyfile(src, dst)
         logger.info("[COMPRESS] Reused compliant H.264 clip without re-encoding: %s", dst.name)
         return dst
 
-    duration = _ffprobe_duration_seconds(src) or 1.0
+    duration = duration or 1.0
     payload_budget = target_bytes * 0.97  # headroom for muxer overhead
     bps = max(int((payload_budget / duration) * 8), 80_000)
 
@@ -316,6 +314,7 @@ def _download_compress_send(motion_events: list[dict], directory: Path) -> tuple
             video_url = (
                 f"{API_BASE_URL}/video/v2/by-event?"
                 f"start={event_start.isoformat()}&end={event_end.isoformat()}"
+                f"&max_bytes={TARGET_FILE_SIZE_BYTES}"
             )
             raw_path = directory / f"{idx}_raw.mp4"
             downloaded = 0
@@ -334,7 +333,7 @@ def _download_compress_send(motion_events: list[dict], directory: Path) -> tuple
             successful += 1
 
             clip_path = directory / f"{idx}.mp4"
-            compress_clip_videotoolbox(raw_path, clip_path)
+            compress_clip_videotoolbox(raw_path, clip_path, move_compliant=True)
             raw_path.unlink(missing_ok=True)
 
             clip_mb = clip_path.stat().st_size / 1024 / 1024
