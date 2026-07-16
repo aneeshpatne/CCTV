@@ -138,6 +138,7 @@ final class CCTVCaptureTests: XCTestCase {
                 encoderDroppedFrames: 2,
                 processingLatencyMS: 12.5,
                 motionScore: 0.1,
+                sceneBrightness: 0.42,
                 recording: true,
                 rtsp: true
             )
@@ -150,5 +151,6 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(payload["camera_fps"] as? Double, 11)
         XCTAssertEqual(payload["output_fps"] as? Double, 10)
         XCTAssertEqual(payload["encoder_dropped_frames"] as? Int, 2)
+        XCTAssertEqual(payload["scene_brightness"] as? Double, 0.42)
     }
 }

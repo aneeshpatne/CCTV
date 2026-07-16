@@ -80,6 +80,7 @@ class NativeEventProtocolTests(unittest.TestCase):
                         "encoder_dropped_frames": 0,
                         "processing_latency_ms": 14.2,
                         "motion_score": 0.1,
+                        "scene_brightness": 0.42,
                         "recording": True,
                         "rtsp": True,
                     },
@@ -88,6 +89,7 @@ class NativeEventProtocolTests(unittest.TestCase):
         message = "\n".join(captured.output)
         self.assertIn("camera=10.20", message)
         self.assertIn("latency_ms=14.2", message)
+        self.assertIn("brightness=42.0%", message)
 
 
 if __name__ == "__main__":
