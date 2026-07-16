@@ -27,6 +27,8 @@ import requests
 
 from utilities.motion_db_new import annotate_motion_event, log_motion_event
 from utilities.recording_catalog import RecordingCatalog
+from utilities.dynamic_resolution import DynamicResolutionController, ResolutionDecision
+from utilities.esp32cam_client import get_camera_status_with_retry
 from utilities.startup import CameraRecoveryMode, startup
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
@@ -68,6 +70,10 @@ _camera_recovery_lock = threading.Lock()
 _camera_recovery_thread: Optional[threading.Thread] = None
 _camera_adjustment_lock = threading.Lock()
 _camera_adjustment_generation = 0
+_camera_configuration_lock = threading.Lock()
+_resolution_change_lock = threading.Lock()
+_resolution_change_thread: Optional[threading.Thread] = None
+_resolution_controller = DynamicResolutionController.from_environment(initial_framesize=12)
 
 
 def _cancel_post_connect_adjustments() -> None:
@@ -155,7 +161,8 @@ def _schedule_camera_recovery(reason: str) -> None:
         def recover() -> None:
             logging.warning("[recovery] MJPEG disconnected (%s); running full camera startup.", reason)
             try:
-                startup()
+                with _camera_configuration_lock:
+                    startup(target_framesize=_resolution_controller.selected_framesize)
             except CameraRecoveryMode:
                 logging.exception("[recovery] Camera entered OTA/recovery mode during startup.")
             except Exception:
@@ -169,6 +176,60 @@ def _schedule_camera_recovery(reason: str) -> None:
             name="cctv-camera-recovery",
         )
         _camera_recovery_thread.start()
+
+
+def _schedule_resolution_change(decision: ResolutionDecision) -> None:
+    """Apply one verified framesize change without blocking native event reads."""
+    global _resolution_change_thread
+
+    with _resolution_change_lock:
+        if _shutdown_event.is_set():
+            _resolution_controller.complete_change(decision.framesize, success=False)
+            return
+        if _resolution_change_thread and _resolution_change_thread.is_alive():
+            return
+
+        def adjust() -> None:
+            target = decision.framesize
+            logging.info(
+                "[resolution] Sustained brightness %.1f%%; switching framesize to %d.",
+                decision.average_brightness * 100,
+                target,
+            )
+            success = False
+            try:
+                with _camera_configuration_lock:
+                    if not _set_camera_control("framesize", target):
+                        return
+                    if _shutdown_event.wait(3):
+                        return
+                    status = get_camera_status_with_retry(attempts=3, timeout=2)
+                    success = (
+                        status.camera_online
+                        and status.framesize is not None
+                        and int(status.framesize) == target
+                    )
+            except Exception:
+                logging.exception("[resolution] Failed while verifying framesize %d.", target)
+            finally:
+                _resolution_controller.complete_change(target, success=success)
+                if success:
+                    logging.info(
+                        "[resolution] Framesize %d verified; 15-minute cooldown started.",
+                        target,
+                    )
+                elif not _shutdown_event.is_set():
+                    logging.warning(
+                        "[resolution] Framesize %d was not verified; a later brightness sample may retry.",
+                        target,
+                    )
+
+        _resolution_change_thread = threading.Thread(
+            target=adjust,
+            daemon=True,
+            name="cctv-dynamic-resolution",
+        )
+        _resolution_change_thread.start()
 
 
 def _resolve_python_command() -> str:
@@ -283,9 +344,16 @@ class NativeEventReader(threading.Thread):
             )
             logging.info("[native-event] Indexed segment %s.", path.name)
         elif event_type == "health":
+            brightness_value = payload.get("scene_brightness")
+            brightness = (
+                float(brightness_value)
+                if isinstance(brightness_value, (int, float))
+                else None
+            )
             logging.info(
                 "[native-health] fps=%.2f camera=%.2f output=%.2f dropped=%s "
-                "encoder_dropped=%s latency_ms=%.1f motion=%.4f recording=%s rtsp=%s",
+                "encoder_dropped=%s latency_ms=%.1f motion=%.4f brightness=%s "
+                "recording=%s rtsp=%s",
                 float(payload.get("fps", 0)),
                 float(payload.get("camera_fps", payload.get("fps", 0))),
                 float(payload.get("output_fps", payload.get("fps", 0))),
@@ -293,12 +361,18 @@ class NativeEventReader(threading.Thread):
                 payload.get("encoder_dropped_frames", 0),
                 float(payload.get("processing_latency_ms", 0)),
                 float(payload.get("motion_score", 0)),
+                f"{brightness * 100:.1f}%" if brightness is not None else "unavailable",
                 payload.get("recording"),
                 payload.get("rtsp"),
             )
+            if brightness is not None:
+                decision = _resolution_controller.observe(brightness)
+                if decision is not None:
+                    _schedule_resolution_change(decision)
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)
+            _resolution_controller.reset_observations()
             _cancel_post_connect_adjustments()
             _schedule_camera_recovery(reason)
         elif event_type == "stream.connected":
@@ -330,7 +404,8 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
                 backend = "python"
             else:
                 try:
-                    startup()
+                    with _camera_configuration_lock:
+                        startup(target_framesize=_resolution_controller.selected_framesize)
                 except CameraRecoveryMode:
                     logging.exception("[orchestrator] Camera is in recovery mode; using Python controller.")
                     backend = "python"
