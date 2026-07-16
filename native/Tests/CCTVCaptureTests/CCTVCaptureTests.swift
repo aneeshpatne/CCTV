@@ -87,6 +87,20 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(parser.append(Data("noise".utf8) + jpeg), [jpeg])
     }
 
+    func testMultipartParserHandlesLargeJPEGOneByteAtATime() {
+        var jpeg = Data([0xFF, 0xD8])
+        jpeg.append(Data(repeating: 0x55, count: 512 * 1024))
+        jpeg.append(contentsOf: [0xFF, 0xD9])
+
+        var parser = MultipartJPEGParser()
+        var parsed: [Data] = []
+        for byte in jpeg {
+            parsed.append(contentsOf: parser.append(Data([byte])))
+        }
+
+        XCTAssertEqual(parsed, [jpeg])
+    }
+
     func testCameraTimelinePreservesVariableArrivalTimes() {
         var timeline = CameraPresentationTimeline(originUptime: 100)
         let times = [100.0, 100.11, 100.43, 100.52].map {
