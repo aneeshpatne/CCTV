@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 
 # CRITICAL: Set FFMPEG options BEFORE importing cv2
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -33,14 +34,21 @@ try:
 except ImportError:
     Image = ImageDraw = ImageFont = None
 from utilities.startup import CameraRecoveryMode, startup
-from utilities.esp32cam_client import get_camera_status_with_retry
+from utilities.esp32cam_client import CAMERA_BASE_URL, get_camera_status_with_retry
 from utilities.warn import NonBlockingBlinker
+from utilities.motion_activity import MotionActivityGuard
 from tools.get_rssi import get_rssi
 from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 from tools.reset import reset
 from utilities.EventAccumulator import EventAccumulator
 from utilities.motion_db_new import log_motion_event
-from utilities.dynamic_resolution import DynamicResolutionController
+from utilities.brightness_mode import (
+    ManualExposureController,
+    ManualExposureDecision,
+    clipping_resistant_brightness,
+)
+from utilities.color_profile import CameraColorProfile
+from utilities.image_control import ImageControlAPIError, ImageControlClient
 
 IST = pytz.timezone("Asia/Kolkata")
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), "examples", "no_signal.png")
@@ -50,7 +58,6 @@ FRAME_FAILURE_RECONNECT_DELAY = 2.0  # seconds to let the ESP32 close the old st
 CAPTURE_OPEN_TIMEOUT = 10.0  # seconds to wait for HTTP stream open
 STREAM_STARTUP_FAILURE_THRESHOLD = 3
 CAMERA_STARTUP_COOLDOWN = 60.0
-BLINKER_COOLDOWN = 3.0  # seconds between blinker activations (debounce)
 
 # Recording configuration
 ENABLE_RECORDING = True
@@ -203,11 +210,22 @@ device_state = "offline"
 device_state_detail = "waiting for first status check"
 device_state_lock = threading.Lock()
 startup_lock = threading.Lock()
-resolution_controller = DynamicResolutionController.from_environment(initial_framesize=12)
+exposure_controller = ManualExposureController.from_environment()
+image_control = ImageControlClient(CAMERA_BASE_URL)
+try:
+    color_profile = CameraColorProfile.load()
+    color_profile_error = None
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    color_profile = None
+    color_profile_error = str(error)
+camera_configuration_lock = threading.Lock()
+exposure_adjustment_lock = threading.Lock()
+exposure_adjustment_thread = None
+xclk_setting = "--"
 
-# Camera adjustment state (run after stream starts)
-camera_adjustments_done = False
-camera_adjustments_lock = threading.Lock()
+
+def camera_settings_summary() -> str:
+    return f"XCLK {xclk_setting} · {exposure_controller.status_summary()}"
 
 # RSSI monitoring state
 rssi_value = None
@@ -809,7 +827,7 @@ def exit_ota_recovery_and_check() -> bool:
 
 
 def start_startup(force: bool = False) -> None:
-    global startup_thread, camera_adjustments_done
+    global startup_thread, xclk_setting
     with startup_lock:
         if force:
             startup_complete.clear()
@@ -817,10 +835,6 @@ def start_startup(force: bool = False) -> None:
                 "wifi-online-camera-starting",
                 "running quality/clock startup checks before opening MJPEG",
             )
-            # Reset camera adjustments flag so they run again after this startup
-            with camera_adjustments_lock:
-                camera_adjustments_done = False
-
             # Note: We don't stop monitoring threads here because they should continue
             # running and showing connection status even during restarts.
             # The key is that startup_complete controls the main loop behavior.
@@ -828,24 +842,20 @@ def start_startup(force: bool = False) -> None:
         if startup_complete.is_set():
             return
         if startup_thread is None or not startup_thread.is_alive():
-            # Reset camera adjustments flag for new startup
-            with camera_adjustments_lock:
-                camera_adjustments_done = False
-
             def _runner() -> None:
+                global xclk_setting
                 attempt = 1
                 while not startup_complete.is_set():
-                    target_framesize = resolution_controller.selected_framesize
                     try:
                         print(f"Running startup attempt {attempt}...")
                         set_device_state(
                             "wifi-online-camera-starting",
                             f"startup attempt {attempt}: polling status and applying camera settings",
                         )
-                        startup(target_framesize=target_framesize)
-                        resolution_controller.complete_change(
-                            target_framesize, success=True
-                        )
+                        with camera_configuration_lock:
+                            startup()
+                            initialize_manual_exposure()
+                        xclk_setting = "20"
                         set_device_state(
                             "camera-online",
                             "startup complete; opening MJPEG stream next",
@@ -861,9 +871,6 @@ def start_startup(force: bool = False) -> None:
                             attempt += 1
                             continue
                         print("Startup paused because device is still in OTA-only recovery mode.")
-                        resolution_controller.complete_change(
-                            target_framesize, success=False
-                        )
                         break
                     except Exception as exc:
                         set_device_state(
@@ -879,67 +886,69 @@ def start_startup(force: bool = False) -> None:
             startup_thread.start()
 
 
-def apply_camera_adjustments() -> None:
-    """Apply camera adjustments after stream has started (runs in background thread)."""
+def _disable_for_image_error(error: ImageControlAPIError) -> bool:
+    return error.status in {400, 413, 500, 501} or error.code == "invalid_response"
 
-    def _adjust() -> None:
+
+def initialize_manual_exposure() -> None:
+    """Freeze exposure explicitly, then apply isolated manual color groups."""
+    try:
+        profile = image_control.freeze_exposure(image_control.get_profile())
+        normalization = exposure_controller.initialize(profile)
+        if normalization is not None:
+            profile = image_control.update_exposure(
+                normalization["shutterLines"], normalization["gainX16"]
+            )
+            exposure_controller.complete(profile, success=True)
+    except (ImageControlAPIError, ValueError) as error:
+        exposure_controller.disable(str(error))
+        print(f"Freezing manual exposure failed: {error}")
+        return
+
+    if color_profile is None:
+        print(f"COLOR UNAPPLIED: {color_profile_error}")
+    else:
         try:
-            # Wait 20 seconds after stream starts
-            print("Waiting 20 seconds for stream to stabilize...")
-            time.sleep(20)
+            profile = image_control.update_profile(color_profile.white_balance_patch())
+            profile = image_control.update_profile(color_profile.saturation_patch())
+            exposure_controller.complete(profile, success=True)
+        except (ImageControlAPIError, ValueError) as error:
+            print(f"COLOR UNAPPLIED: {error}")
+    if not profile.get("cachedForRecovery", False):
+        print("Warning: manual image profile is not cached for recovery")
+    print(f"Image control initialized: {exposure_controller.status_summary()}")
 
-            # Disable auto white balance
+
+def schedule_exposure_adjustment(decision: ManualExposureDecision) -> None:
+    """Apply one correction in a background thread without interrupting capture."""
+    global exposure_adjustment_thread
+    with exposure_adjustment_lock:
+        if exposure_adjustment_thread and exposure_adjustment_thread.is_alive():
+            return
+
+        def _adjust() -> None:
+            print(
+                f"Manual {decision.direction} correction at "
+                f"{decision.average_brightness * 100:.1f}%: "
+                f"{decision.shutter_lines}L, gain {decision.gain_x16}/16"
+            )
             try:
-                print("Disabling auto white balance (awb=0)")
-                resp = requests.get(
-                    "http://192.168.0.13/control?var=awb&val=0", timeout=2
-                )
-                if resp.status_code == 200:
-                    print("AWB disabled successfully")
-            except Exception as e:
-                print(f"Setting AWB failed: {e}")
-
-            time.sleep(2)
-
-            current_hour_ist = datetime.now(IST).hour
-            if not (12 <= current_hour_ist < 18):
-                # Set auto exposure level only outside the afternoon window in IST
-                try:
-                    print("Setting auto exposure level (ae_level=2)")
-                    resp = requests.get(
-                        "http://192.168.0.13/control?var=ae_level&val=2", timeout=2
+                with camera_configuration_lock:
+                    profile = image_control.update_exposure(
+                        decision.shutter_lines, decision.gain_x16
                     )
-                    if resp.status_code == 200:
-                        print("AE level set successfully")
-                except Exception as e:
-                    print(f"Setting AE level failed: {e}")
-            else:
-                print("Skipping AE level change during 12pm-6pm IST window")
+                exposure_controller.complete(profile, success=True)
+                print(f"Applied {exposure_controller.status_summary()}")
+            except (ImageControlAPIError, ValueError) as error:
+                exposure_controller.complete(None, success=False)
+                if isinstance(error, ValueError) or _disable_for_image_error(error):
+                    exposure_controller.disable(str(error))
+                print(f"Manual exposure correction failed: {error}")
 
-            time.sleep(2)
-
-            # Disable auto gain control
-            try:
-                print("Disabling auto gain control (agc=0)")
-                resp = requests.get(
-                    "http://192.168.0.13/control?var=agc&val=0", timeout=2
-                )
-                if resp.status_code == 200:
-                    print("AGC disabled successfully")
-            except Exception as e:
-                print(f"Setting AGC failed: {e}")
-
-            time.sleep(2)
-            print("Camera adjustments completed")
-
-        except Exception as e:
-            print(f"Camera adjustments error: {e}")
-
-    adj_thread = threading.Thread(target=_adjust, daemon=True)
-    adj_thread.start()
-    print(
-        "Camera adjustment thread started (will apply settings after stream stabilizes)"
-    )
+        exposure_adjustment_thread = threading.Thread(
+            target=_adjust, daemon=True, name="cctv-manual-exposure"
+        )
+        exposure_adjustment_thread.start()
 
 
 def start_rssi_monitor() -> None:
@@ -1183,6 +1192,8 @@ def draw_hud(
     show_time: bool = True,
     coordinates: list = [0, 0],
     scene_brightness: float | None = None,
+    quality_level: int | None = None,
+    startup_changes: str | None = None,
 ):
     """Draws a square Material dark HUD."""
     x, y = coordinates
@@ -1481,6 +1492,65 @@ def draw_hud(
             thickness,
         )
 
+    settings_y = top_margin + box_h + gap
+    quality_text = f"QUALITY {quality_level}" if quality_level is not None else "QUALITY --"
+    quality_w, _ = get_hud_text_size(
+        quality_text, font_size, font, font_scale, thickness
+    )
+    quality_box_w = quality_w + (pad_x * 2)
+    if should_draw("quality", gap, settings_y, quality_box_w, box_h):
+        draw_box(
+            frame,
+            gap,
+            settings_y,
+            quality_box_w,
+            box_h,
+            bg_color=surface_variant,
+            border_color=panel_border,
+        )
+        put_hud_text(
+            frame,
+            quality_text,
+            gap + pad_x,
+            settings_y + box_h // 2,
+            font_color if quality_level is not None else muted_color,
+            font_size,
+            font,
+            font_scale,
+            thickness,
+        )
+
+    if startup_changes:
+        startup_text = f"IMAGE · {startup_changes}"
+        startup_w, _ = get_hud_text_size(
+            startup_text, font_size, font, font_scale, thickness
+        )
+        startup_x = gap + quality_box_w + gap
+        startup_box_w = min(startup_w + (pad_x * 2), max(0, w - startup_x - gap))
+        if startup_box_w > 0 and should_draw(
+            "startup_changes", startup_x, settings_y, startup_box_w, box_h
+        ):
+            draw_box(
+                frame,
+                startup_x,
+                settings_y,
+                startup_box_w,
+                box_h,
+                bg_color=surface_variant,
+                border_color=panel_border,
+            )
+            put_hud_text(
+                frame,
+                startup_text,
+                startup_x + pad_x,
+                settings_y + box_h // 2,
+                font_color,
+                font_size,
+                font,
+                font_scale,
+                thickness,
+            )
+
 
 def backoff(attempt: int) -> float:
     return min(5.0, 2 ** max(0, attempt - 1))
@@ -1709,10 +1779,9 @@ def read_frame_with_timeout(cap: MjpegStreamCapture):
 
 
 def main() -> None:
-    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, camera_adjustments_done
+    global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps
     attempt = 0
     cap = None
-    last_blinker_trigger = 0.0
     last_no_signal_frame = 0.0
     no_signal_interval = 1.0 / max(1.0, FIXED_OUTPUT_FPS)
     roi_mask: Optional[np.ndarray] = None
@@ -1731,6 +1800,7 @@ def main() -> None:
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     blinker = NonBlockingBlinker(blink_interval=0.5)
+    motion_activity = MotionActivityGuard(hold_seconds=10)
 
     # Ensure SIGALRM interrupts blocking frame reads after FRAME_READ_TIMEOUT seconds.
     signal.signal(signal.SIGALRM, _timeout_handler)
@@ -1803,7 +1873,7 @@ def main() -> None:
                 print("Frame read failed - signal lost.")
                 cap.release()
                 cap = None
-                resolution_controller.reset_observations()
+                exposure_controller.reset_observations()
                 start_startup(force=True)
 
                 # Show and record "no signal" frame
@@ -1813,25 +1883,10 @@ def main() -> None:
                 time.sleep(FRAME_FAILURE_RECONNECT_DELAY)
                 continue
 
-            blue, green, red, _ = cv2.mean(frame)
-            scene_brightness = (
-                0.2126 * red + 0.7152 * green + 0.0722 * blue
-            ) / 255.0
-            resolution_decision = resolution_controller.observe(scene_brightness)
-            if resolution_decision is not None:
-                print(
-                    "Sustained scene brightness "
-                    f"{resolution_decision.average_brightness * 100:.1f}%: "
-                    f"switching framesize to {resolution_decision.framesize}."
-                )
-                start_startup(force=True)
-                continue
-
-            # Apply camera adjustments after first successful frame (only once per startup)
-            with camera_adjustments_lock:
-                if not camera_adjustments_done:
-                    camera_adjustments_done = True
-                    apply_camera_adjustments()
+            scene_brightness = clipping_resistant_brightness(frame)
+            exposure_decision = exposure_controller.observe(scene_brightness)
+            if exposure_decision is not None:
+                schedule_exposure_adjustment(exposure_decision)
 
             # Update FPS calculation
             update_fps()
@@ -1883,21 +1938,19 @@ def main() -> None:
                         cv2.LINE_AA,
                     )
 
-            # Drive non-blocking blinker on motion (debounced to avoid
-            # hammering the ESP32 with LED HTTP requests)
-            if motion_detected:
-                now_mono = time.monotonic()
-                if not blinker.is_active and (now_mono - last_blinker_trigger) >= BLINKER_COOLDOWN:
-                    blinker.start(duration=1)
-                    last_blinker_trigger = now_mono
-                # Trigger accumulated motion event tracking
-                acc.trigger()
-
-            # Update blinker, but catch errors if camera is not responding
+            # Hold the presentation state through brief detector gaps. Only a new
+            # episode starts the fixed, serialized ten-second LED sequence.
+            now_mono = time.monotonic()
+            motion_state = motion_activity.update(motion_detected, now_mono)
             try:
-                blinker.update()
+                blinker.update(now=now_mono)
             except Exception as e:
                 print(f"Warning: Blinker update failed: {e}")
+            if motion_state.started:
+                blinker.start(duration=10, now=now_mono)
+            if motion_detected:
+                # Trigger accumulated motion event tracking
+                acc.trigger()
 
             # Draw HUD (Timestamp, Status Badges, Motion Warning)
             with rssi_lock:
@@ -1912,10 +1965,12 @@ def main() -> None:
                 current_fps,
                 current_rssi,
                 current_temperature,
-                motion_detected,
+                motion_state.active,
                 time_overlap,
                 coordinates,
                 scene_brightness=scene_brightness,
+                quality_level=12,
+                startup_changes=camera_settings_summary(),
             )
 
             # Draw ROI polygon on display only if flag is enabled
@@ -1953,6 +2008,7 @@ def main() -> None:
                 ffmpeg_rtsp_proc = None
             expected_frame_size = None
         acc.close()
+        blinker.close()
         cv2.destroyAllWindows()
         print("Cleanup complete.")
 

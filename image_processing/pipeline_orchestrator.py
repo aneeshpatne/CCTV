@@ -17,18 +17,16 @@ import subprocess
 import sys
 import threading
 import time
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
 
-import requests
-
 from utilities.motion_db_new import annotate_motion_event, log_motion_event
 from utilities.recording_catalog import RecordingCatalog
-from utilities.dynamic_resolution import DynamicResolutionController, ResolutionDecision
-from utilities.esp32cam_client import get_camera_status_with_retry
+from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
+from utilities.color_profile import CameraColorProfile
+from utilities.image_control import ImageControlAPIError, ImageControlClient
 from utilities.startup import CameraRecoveryMode, startup
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
@@ -47,11 +45,7 @@ CHECK_INTERVAL_SECONDS = 5 * 60
 STOP_TIMEOUT_SECONDS = 5.0
 NATIVE_FAILURE_LIMIT = 3
 NATIVE_FAILURE_WINDOW_SECONDS = 5 * 60
-POST_CONNECT_ADJUSTMENT_DELAY_SECONDS = float(
-    os.getenv("CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS", "20")
-)
 CAMERA_BASE_URL = os.getenv("ESP32CAM_BASE_URL", "http://192.168.0.13").rstrip("/")
-IST = ZoneInfo("Asia/Kolkata")
 
 _camera_process_lock = threading.Lock()
 _camera_process: Optional[subprocess.Popen] = None
@@ -68,83 +62,52 @@ _active_backend = "python"
 _recording_catalog = RecordingCatalog(RECORDINGS_DIR)
 _camera_recovery_lock = threading.Lock()
 _camera_recovery_thread: Optional[threading.Thread] = None
-_camera_adjustment_lock = threading.Lock()
-_camera_adjustment_generation = 0
 _camera_configuration_lock = threading.Lock()
-_resolution_change_lock = threading.Lock()
-_resolution_change_thread: Optional[threading.Thread] = None
-_resolution_controller = DynamicResolutionController.from_environment(initial_framesize=12)
+_exposure_adjustment_lock = threading.Lock()
+_exposure_adjustment_thread: Optional[threading.Thread] = None
+_image_control = ImageControlClient(CAMERA_BASE_URL)
+_exposure_controller = ManualExposureController.from_environment()
+try:
+    _color_profile = CameraColorProfile.load()
+    _color_profile_error: str | None = None
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    _color_profile = None
+    _color_profile_error = str(error)
 
 
-def _cancel_post_connect_adjustments() -> None:
-    """Invalidate delayed adjustments belonging to an obsolete connection."""
-    global _camera_adjustment_generation
-    with _camera_adjustment_lock:
-        _camera_adjustment_generation += 1
+def _disable_for_image_error(error: ImageControlAPIError) -> bool:
+    return error.status in {400, 413, 500, 501} or error.code == "invalid_response"
 
 
-def _adjustment_is_current(generation: int) -> bool:
-    with _camera_adjustment_lock:
-        return not _shutdown_event.is_set() and generation == _camera_adjustment_generation
-
-
-def _wait_for_adjustment(generation: int, seconds: float) -> bool:
-    if _shutdown_event.wait(seconds):
-        return False
-    return _adjustment_is_current(generation)
-
-
-def _set_camera_control(name: str, value: int) -> bool:
+def _initialize_manual_exposure() -> None:
+    """Freeze exposure explicitly, then apply isolated manual color groups."""
     try:
-        response = requests.get(
-            f"{CAMERA_BASE_URL}/control",
-            params={"var": name, "val": value},
-            timeout=2,
-        )
-        response.raise_for_status()
-        logging.info("[adjustments] Set %s=%s.", name, value)
-        return True
-    except requests.RequestException:
-        logging.exception("[adjustments] Failed to set %s=%s.", name, value)
-        return False
+        profile = _image_control.freeze_exposure(_image_control.get_profile())
+        normalization = _exposure_controller.initialize(profile)
+        if normalization is not None:
+            profile = _image_control.update_exposure(
+                normalization["shutterLines"], normalization["gainX16"]
+            )
+            _exposure_controller.complete(profile, success=True)
+    except (ImageControlAPIError, ValueError) as error:
+        # Startup/recovery may have rebooted the sensor, so a previously cached
+        # in-process profile is no longer safe to use after any freeze failure.
+        _exposure_controller.disable(str(error))
+        logging.exception("[image-control] Failed to freeze manual exposure")
+        return
 
-
-def _schedule_post_connect_adjustments() -> None:
-    """Apply the legacy AWB/exposure/AGC policy after MJPEG stabilizes."""
-    global _camera_adjustment_generation
-
-    with _camera_adjustment_lock:
-        _camera_adjustment_generation += 1
-        generation = _camera_adjustment_generation
-
-    def adjust() -> None:
-        logging.info(
-            "[adjustments] Signal restored; waiting %.0fs before camera tuning.",
-            POST_CONNECT_ADJUSTMENT_DELAY_SECONDS,
-        )
-        if not _wait_for_adjustment(generation, POST_CONNECT_ADJUSTMENT_DELAY_SECONDS):
-            return
-
-        _set_camera_control("awb", 0)
-        if not _wait_for_adjustment(generation, 2):
-            return
-
-        current_hour_ist = datetime.now(IST).hour
-        if 12 <= current_hour_ist < 18:
-            logging.info("[adjustments] Skipping ae_level during 12pm-6pm IST window.")
-        else:
-            _set_camera_control("ae_level", 2)
-
-        if not _wait_for_adjustment(generation, 2):
-            return
-        _set_camera_control("agc", 0)
-        logging.info("[adjustments] Post-connect camera tuning complete.")
-
-    threading.Thread(
-        target=adjust,
-        daemon=True,
-        name="cctv-camera-adjustments",
-    ).start()
+    if _color_profile is None:
+        logging.error("[image-control] COLOR UNAPPLIED: %s", _color_profile_error)
+    else:
+        try:
+            profile = _image_control.update_profile(_color_profile.white_balance_patch())
+            profile = _image_control.update_profile(_color_profile.saturation_patch())
+            _exposure_controller.complete(profile, success=True)
+        except (ImageControlAPIError, ValueError):
+            logging.exception("[image-control] COLOR UNAPPLIED")
+    if not profile.get("cachedForRecovery", False):
+        logging.warning("[image-control] Manual image profile is not cached for recovery.")
+    logging.info("[image-control] %s", _exposure_controller.status_summary())
 
 
 def _schedule_camera_recovery(reason: str) -> None:
@@ -162,7 +125,8 @@ def _schedule_camera_recovery(reason: str) -> None:
             logging.warning("[recovery] MJPEG disconnected (%s); running full camera startup.", reason)
             try:
                 with _camera_configuration_lock:
-                    startup(target_framesize=_resolution_controller.selected_framesize)
+                    startup()
+                    _initialize_manual_exposure()
             except CameraRecoveryMode:
                 logging.exception("[recovery] Camera entered OTA/recovery mode during startup.")
             except Exception:
@@ -178,58 +142,44 @@ def _schedule_camera_recovery(reason: str) -> None:
         _camera_recovery_thread.start()
 
 
-def _schedule_resolution_change(decision: ResolutionDecision) -> None:
-    """Apply one verified framesize change without blocking native event reads."""
-    global _resolution_change_thread
+def _schedule_exposure_adjustment(decision: ManualExposureDecision) -> None:
+    """Apply one manual exposure correction without blocking native event reads."""
+    global _exposure_adjustment_thread
 
-    with _resolution_change_lock:
+    with _exposure_adjustment_lock:
         if _shutdown_event.is_set():
-            _resolution_controller.complete_change(decision.framesize, success=False)
+            _exposure_controller.complete(None, success=False)
             return
-        if _resolution_change_thread and _resolution_change_thread.is_alive():
+        if _exposure_adjustment_thread and _exposure_adjustment_thread.is_alive():
             return
 
         def adjust() -> None:
-            target = decision.framesize
             logging.info(
-                "[resolution] Sustained brightness %.1f%%; switching framesize to %d.",
+                "[image-control] %.1f%% brightness: %s correction to %dL, gain %d/16.",
                 decision.average_brightness * 100,
-                target,
+                decision.direction,
+                decision.shutter_lines,
+                decision.gain_x16,
             )
-            success = False
             try:
                 with _camera_configuration_lock:
-                    if not _set_camera_control("framesize", target):
-                        return
-                    if _shutdown_event.wait(3):
-                        return
-                    status = get_camera_status_with_retry(attempts=3, timeout=2)
-                    success = (
-                        status.camera_online
-                        and status.framesize is not None
-                        and int(status.framesize) == target
+                    profile = _image_control.update_exposure(
+                        decision.shutter_lines, decision.gain_x16
                     )
-            except Exception:
-                logging.exception("[resolution] Failed while verifying framesize %d.", target)
-            finally:
-                _resolution_controller.complete_change(target, success=success)
-                if success:
-                    logging.info(
-                        "[resolution] Framesize %d verified; 15-minute cooldown started.",
-                        target,
-                    )
-                elif not _shutdown_event.is_set():
-                    logging.warning(
-                        "[resolution] Framesize %d was not verified; a later brightness sample may retry.",
-                        target,
-                    )
+                _exposure_controller.complete(profile, success=True)
+                logging.info("[image-control] Applied %s", _exposure_controller.status_summary())
+            except (ImageControlAPIError, ValueError) as error:
+                _exposure_controller.complete(None, success=False)
+                if isinstance(error, ValueError) or _disable_for_image_error(error):
+                    _exposure_controller.disable(str(error))
+                logging.exception("[image-control] Manual exposure correction failed")
 
-        _resolution_change_thread = threading.Thread(
+        _exposure_adjustment_thread = threading.Thread(
             target=adjust,
             daemon=True,
-            name="cctv-dynamic-resolution",
+            name="cctv-manual-exposure",
         )
-        _resolution_change_thread.start()
+        _exposure_adjustment_thread.start()
 
 
 def _resolve_python_command() -> str:
@@ -365,19 +315,19 @@ class NativeEventReader(threading.Thread):
                 payload.get("recording"),
                 payload.get("rtsp"),
             )
-            if brightness is not None:
-                decision = _resolution_controller.observe(brightness)
+        elif event_type == "image.metrics":
+            brightness_value = payload.get("scene_brightness")
+            if isinstance(brightness_value, (int, float)):
+                decision = _exposure_controller.observe(float(brightness_value))
                 if decision is not None:
-                    _schedule_resolution_change(decision)
+                    _schedule_exposure_adjustment(decision)
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)
-            _resolution_controller.reset_observations()
-            _cancel_post_connect_adjustments()
+            _exposure_controller.reset_observations()
             _schedule_camera_recovery(reason)
         elif event_type == "stream.connected":
             logging.info("[native-stream] MJPEG signal restored.")
-            _schedule_post_connect_adjustments()
 
 
 def start_camera_pipeline() -> Optional[subprocess.Popen]:
@@ -405,7 +355,8 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
             else:
                 try:
                     with _camera_configuration_lock:
-                        startup(target_framesize=_resolution_controller.selected_framesize)
+                        startup()
+                        _initialize_manual_exposure()
                 except CameraRecoveryMode:
                     logging.exception("[orchestrator] Camera is in recovery mode; using Python controller.")
                     backend = "python"
