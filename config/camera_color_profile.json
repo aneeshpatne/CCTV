@@ -1,0 +1,13 @@
+{
+  "whiteBalance": {
+    "red": 94,
+    "green": 65,
+    "blue": 84
+  },
+  "color": {
+    "saturation": {
+      "u": 72,
+      "v": 72
+    }
+  }
+}
