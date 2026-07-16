@@ -29,6 +29,7 @@ struct WorkerEvent: Encodable, Sendable {
             encoderDroppedFrames: Int,
             processingLatencyMS: Double,
             motionScore: Double,
+            sceneBrightness: Double?,
             recording: Bool,
             rtsp: Bool
         )
@@ -41,6 +42,7 @@ struct WorkerEvent: Encodable, Sendable {
             case path, codec, size, fps, cameraFPS = "camera_fps", outputFPS = "output_fps"
             case droppedFrames = "dropped_frames", encoderDroppedFrames = "encoder_dropped_frames"
             case processingLatencyMS = "processing_latency_ms", motionScore = "motion_score"
+            case sceneBrightness = "scene_brightness"
             case recording, rtsp
             case connected, reason
         }
@@ -70,6 +72,7 @@ struct WorkerEvent: Encodable, Sendable {
                 encoderDropped,
                 processingLatencyMS,
                 score,
+                sceneBrightness,
                 recording,
                 rtsp
             ):
@@ -80,6 +83,7 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encode(encoderDropped, forKey: .encoderDroppedFrames)
                 try container.encode(processingLatencyMS, forKey: .processingLatencyMS)
                 try container.encode(score, forKey: .motionScore)
+                try container.encodeIfPresent(sceneBrightness, forKey: .sceneBrightness)
                 try container.encode(recording, forKey: .recording)
                 try container.encode(rtsp, forKey: .rtsp)
             case let .stream(connected, reason):

@@ -30,6 +30,7 @@ private struct RuntimeSnapshot: Sendable {
     let processedFPS: Double
     let processingLatencyMS: Double
     let motionScore: Double
+    let sceneBrightness: Double?
 }
 
 private actor PipelineRuntimeState {
@@ -38,9 +39,13 @@ private actor PipelineRuntimeState {
     private var processedFrameTimes: [TimeInterval] = []
     private var latencySamplesMS: [Double] = []
     private var motionScore = 0.0
+    private var sceneBrightness: Double?
     private var reconnectRequested = false
 
     func recordReceived(at monotonicTime: TimeInterval) {
+        if let lastFrameAt, monotonicTime - lastFrameAt >= 3 {
+            sceneBrightness = nil
+        }
         lastFrameAt = monotonicTime
         reconnectRequested = false
     }
@@ -63,6 +68,15 @@ private actor PipelineRuntimeState {
         }
     }
 
+    @discardableResult
+    func recordBrightness(_ brightness: Double?) -> Double? {
+        guard let brightness else { return sceneBrightness }
+        // Smooth frame-level compression noise; the orchestrator applies the longer
+        // 30-60 second decision window.
+        sceneBrightness = sceneBrightness.map { 0.9 * $0 + 0.1 * brightness } ?? brightness
+        return sceneBrightness
+    }
+
     func shouldReconnect(at now: TimeInterval) -> Bool {
         let reference = lastFrameAt ?? startedAt
         guard now - reference >= 3, !reconnectRequested else { return false }
@@ -80,7 +94,8 @@ private actor PipelineRuntimeState {
             lastFrameAge: now - reference,
             processedFPS: Self.rate(for: processedFrameTimes),
             processingLatencyMS: latency,
-            motionScore: motionScore
+            motionScore: motionScore,
+            sceneBrightness: sceneBrightness
         )
     }
 
@@ -256,6 +271,7 @@ final class FramePipeline: @unchecked Sendable {
                         encoderDroppedFrames: outputMetrics.encoderDroppedFrames,
                         processingLatencyMS: snapshot.processingLatencyMS,
                         motionScore: snapshot.motionScore,
+                        sceneBrightness: signalAvailable ? snapshot.sceneBrightness : nil,
                         recording: outputMetrics.recording,
                         rtsp: outputMetrics.rtsp
                     )
@@ -275,6 +291,7 @@ final class FramePipeline: @unchecked Sendable {
         guard let source = renderer.decodeJPEG(frame.data) else { return }
 
         let motion = await motionDetector.analyze(source)
+        let hudBrightness = await runtime.recordBrightness(motion.sceneBrightness)
         let labels = semanticClassifier.labels(
             for: source,
             candidate: motion.candidate,
@@ -302,6 +319,7 @@ final class FramePipeline: @unchecked Sendable {
             fps: measuredFPS,
             rssi: rssi,
             temperature: temperature,
+            sceneBrightness: hudBrightness,
             motion: motion.candidate,
             labels: labels,
             motionBox: motion.boundingBox,

@@ -8,6 +8,7 @@ struct HUDStatus: Sendable {
     var fps: Double = 0
     var rssi: Int?
     var temperature: Double?
+    var sceneBrightness: Double?
     var motion = false
     var labels: [SemanticLabel] = []
     var motionBox: NormalizedRect?
@@ -118,6 +119,9 @@ final class HUDRenderer: @unchecked Sendable {
         let temperature = status.temperature.map { String(format: "%.1fC", $0) } ?? "--C"
         right -= 94
         composed = panel(text: temperature, x: right, y: top, width: 94, height: panelHeight, accent: statusColor(forTemperature: status.temperature), over: composed)
+        right -= gap + 112
+        let brightness = status.sceneBrightness.map { String(format: "%.1f%% LIGHT", $0 * 100) } ?? "--% LIGHT"
+        composed = panel(text: brightness, x: right, y: top, width: 112, height: panelHeight, accent: statusColor(forBrightness: status.sceneBrightness), over: composed)
         right -= gap + 88
         composed = panel(text: String(format: "%.0f fps", status.fps), x: right, y: top, width: 88, height: panelHeight, accent: statusColor(forFPS: status.fps), over: composed)
         right -= gap + 104
@@ -222,6 +226,13 @@ final class HUDRenderer: @unchecked Sendable {
     private func statusColor(forTemperature temperature: Double?) -> CIColor {
         guard let temperature else { return CIColor(red: 0.5, green: 0.5, blue: 0.5) }
         return temperature < 70 ? CIColor(red: 0.50, green: 0.79, blue: 0.58) : temperature < 80 ? CIColor(red: 0.98, green: 0.74, blue: 0.02) : CIColor(red: 0.95, green: 0.55, blue: 0.51)
+    }
+
+    private func statusColor(forBrightness brightness: Double?) -> CIColor {
+        guard let brightness else { return CIColor(red: 0.5, green: 0.5, blue: 0.5) }
+        if brightness < 0.25 { return CIColor(red: 0.98, green: 0.74, blue: 0.02) }
+        if brightness > 0.35 { return CIColor(red: 0.50, green: 0.79, blue: 0.58) }
+        return CIColor(red: 0.74, green: 0.76, blue: 0.78)
     }
 
     private let timestampFormatter: DateFormatter = {
