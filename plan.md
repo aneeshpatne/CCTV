@@ -14,10 +14,11 @@ controlled ESP reboot. Recording and RTSP retained the HUD on a no-signal frame,
 the complete startup loop ran once, MJPEG reconnected automatically, and the
 resulting segment remained exactly 540 frames over 59.998 seconds.
 
-The legacy post-connect tuning policy is also restored: 20 seconds after each
-stable connection, AWB is disabled, exposure level 2 is applied outside the
-12pm–6pm IST exclusion window, and AGC is disabled. Live status verification
-reported `framesize=12`, `xclk=20`, `awb=0`, `ae_level=2`, and `agc=0`.
+Post-connect image tuning now uses explicit OV2640 image-control patches.
+Startup disables AE/AGC/AWB, applies a fixed dark-time RGB/saturation profile,
+and the pipeline reacts to sustained darkness within four seconds by increasing
+gain before shutter. Bright frames never reduce exposure; firmware-returned
+values remain authoritative and are cached for camera recovery.
 
 The deployed worker now uses camera-arrival timestamps end to end instead of
 sleeping after each processed frame. Its rollout canary processed and published

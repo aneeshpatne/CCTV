@@ -28,7 +28,7 @@ The operator interface is a responsive, video-first HTML, CSS, and JavaScript da
 
 | Area | What the project provides |
 | --- | --- |
-| **Camera lifecycle** | Polls the ESP32 status endpoints, dynamically selects framesize 11 or 12 from sustained scene brightness, synchronizes its clock, reapplies AWB/exposure/AGC policy after reconnects, and exposes OTA recovery state through Redis when available. |
+| **Camera lifecycle** | Polls the ESP32 status endpoints, holds framesize 12, synchronizes its clock, explicitly disables OV2640 AE/AGC/AWB, applies a fixed dark-time color profile, and rapidly raises manual exposure when the scene is too dark. |
 | **Native capture** | Parses multipart MJPEG with a bounded latest-frame queue, follows camera arrival timestamps, and uses hardware JPEG processing and VideoToolbox encoders. The recorded Apple M4 canary reduced median capture-tree CPU by 65.6% and representative segment size by 69.3% versus the Python path. |
 | **Live observability** | Composites timestamp, measured FPS, Wi-Fi RSSI, SoC temperature, motion state, and person/animal labels into the outgoing frame. Telemetry failures leave the feed running with unavailable values. |
 | **Signal recovery** | Detects a three-second JPEG stall, keeps archive and RTSP outputs alive with a `NO SIGNAL · RECONNECTING` frame, retries the stream, and coalesces disconnects into one camera startup sequence. |
@@ -236,9 +236,9 @@ There is no camera simulator. Unit tests run without hardware, but live capture,
    export CCTV_LIVE_STREAM_URL="http://127.0.0.1:8889/esp_cam1_overlay/"
    ```
 
-   `CCTV_PIPELINE_BACKEND` accepts `native`, `python`, or `auto`; the default is `native`, with fallback when the binary is missing or repeatedly fails. Native tuning is available through `CCTV_TARGET_FPS`, `CCTV_SEGMENT_SECONDS`, `CCTV_HEVC_BITRATE`, `CCTV_RTSP_BITRATE`, and `CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS`.
+   `CCTV_PIPELINE_BACKEND` accepts `native`, `python`, or `auto`; the default is `native`, with fallback when the binary is missing or repeatedly fails. Native tuning is available through `CCTV_TARGET_FPS`, `CCTV_SEGMENT_SECONDS`, `CCTV_HEVC_BITRATE`, and `CCTV_RTSP_BITRATE`.
 
-   Dynamic resolution uses full-frame BT.709 luminance before overlays. It selects framesize 11 below 25%, framesize 12 above 35%, holds the current setting inside that hysteresis band, observes for at least 30 seconds across a 60-second window, and starts a 15-minute cooldown only after the camera verifies the change. These defaults can be overridden with `CCTV_DIM_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHT_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHTNESS_OBSERVATION_SECONDS`, `CCTV_BRIGHTNESS_WINDOW_SECONDS`, and `CCTV_RESOLUTION_COOLDOWN_SECONDS`.
+   Manual image control uses clipping-resistant BT.709 luminance before overlays while keeping framesize 12: samples at or near black and white clipping are excluded from the exposure signal. Startup reads the authoritative profile, explicitly freezes shutter and gain, then applies fixed RGB white balance and U/V saturation from `config/camera_color_profile.json`; `CCTV_COLOR_PROFILE_PATH` can override it. The native worker reports luminance every two seconds. Three consecutive samples spanning four seconds below 25% increase exposure by up to 50%, lengthening shutter first to 900 lines and using sensor gain only afterward, with a default gain ceiling of `64` gainX16 (4x). Bright frames deliberately never reduce exposure because dark-time clarity is prioritized over afternoon overexposure. Configure the target and response through `CCTV_IMAGE_TARGET_BRIGHTNESS`, `CCTV_DIM_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHTNESS_OBSERVATION_SECONDS`, `CCTV_BRIGHTNESS_WINDOW_SECONDS`, `CCTV_MANUAL_SHUTTER_MIN_LINES`, `CCTV_MANUAL_SHUTTER_MAX_LINES`, `CCTV_MANUAL_GAIN_MIN_X16`, `CCTV_MANUAL_GAIN_MAX_X16`, and `CCTV_MANUAL_EXPOSURE_MAX_STEP`.
 
 5. Build the native capture worker.
 
