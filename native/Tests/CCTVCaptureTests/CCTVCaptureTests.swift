@@ -23,6 +23,41 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(configuration.streamURL.port, 8080)
     }
 
+    func testCameraSettingsSummarizeAuthoritativeManualProfile() {
+        let settings = CameraSettings(
+            framesize: 12,
+            xclk: 20,
+            autoExposure: false,
+            shutterLines: 300,
+            autoGain: false,
+            gainX16: 24,
+            gainRegister: 8,
+            autoWhiteBalance: false,
+            red: 94,
+            green: 65,
+            blue: 84,
+            saturationU: 72,
+            saturationV: 72,
+            cachedForRecovery: true
+        )
+
+        XCTAssertEqual(
+            settings.imageSummary,
+            "XCLK 20 · AE MANUAL · 300L · AGC MANUAL · GAIN 24/16 · REG 8 · AWB MANUAL · WB 94/65/84 · SAT 72/72"
+        )
+    }
+
+    func testImageMetricsEventCarriesBrightnessWithoutChangingProtocolVersion() throws {
+        let event = WorkerEvent(type: "image.metrics", payload: .imageMetrics(sceneBrightness: 0.21))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        XCTAssertEqual(object["type"] as? String, "image.metrics")
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["scene_brightness"] as? Double, 0.21)
+    }
+
     func testMotionAccumulatorRequiresPersistenceAndKeepsPadding() async {
         let accumulator = MotionEventAccumulator(cooldown: 1)
         let start = Date(timeIntervalSince1970: 1_000)
@@ -34,6 +69,43 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertNil(third)
         let event = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(1.6))
         XCTAssertNotNil(event)
+    }
+
+    func testMotionActivityStaysActiveUntilTenQuietSeconds() {
+        var guardState = MotionActivityGuard(holdDuration: 10)
+
+        let started = guardState.update(candidate: true, at: 100)
+        XCTAssertTrue(started.active)
+        XCTAssertTrue(started.started)
+
+        let quiet = guardState.update(candidate: false, at: 109.9)
+        XCTAssertTrue(quiet.active)
+        XCTAssertFalse(quiet.started)
+
+        let expired = guardState.update(candidate: false, at: 110)
+        XCTAssertFalse(expired.active)
+        XCTAssertFalse(expired.started)
+    }
+
+    func testMotionActivityExtendsWithoutRestartingBlink() {
+        var guardState = MotionActivityGuard(holdDuration: 10)
+
+        XCTAssertTrue(guardState.update(candidate: true, at: 100).started)
+        let renewed = guardState.update(candidate: true, at: 109)
+        XCTAssertTrue(renewed.active)
+        XCTAssertFalse(renewed.started)
+        XCTAssertTrue(guardState.update(candidate: false, at: 118.9).active)
+        XCTAssertFalse(guardState.update(candidate: false, at: 119).active)
+        XCTAssertTrue(guardState.update(candidate: true, at: 119.1).started)
+    }
+
+    func testCameraLEDBlinkPatternIsGuardedQuickDoubleFlash() {
+        XCTAssertEqual(CameraLEDBlinker.pattern, [
+            LEDBlinkStep(brightness: 10, duration: 0.2),
+            LEDBlinkStep(brightness: 0, duration: 0.2),
+            LEDBlinkStep(brightness: 10, duration: 0.2),
+            LEDBlinkStep(brightness: 0, duration: 1.0),
+        ])
     }
 
     func testStreamStateEventProtocol() throws {

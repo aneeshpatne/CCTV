@@ -1,0 +1,244 @@
+import os
+import unittest
+from unittest.mock import Mock, patch
+
+import numpy as np
+
+from utilities.brightness_mode import (
+    ManualExposureController,
+    clipping_resistant_brightness,
+)
+from utilities.color_profile import CameraColorProfile
+from utilities.esp32cam_client import CameraStatus
+from utilities.image_control import ImageControlAPIError, ImageControlClient
+from utilities.startup import startup
+
+
+def frozen_profile(shutter=100, gain=32, *, cached=True):
+    return {
+        "ok": True,
+        "cachedForRecovery": cached,
+        "exposure": {
+            "autoExposure": False,
+            "shutterLines": shutter,
+            "autoGain": False,
+            "gainX16": gain,
+            "gainRegister": 0,
+        },
+        "whiteBalance": {"auto": False, "red": 90, "green": 64, "blue": 80},
+    }
+
+
+class FakeResponse:
+    def __init__(self, status, payload, reason=""):
+        self.status_code = status
+        self._payload = payload
+        self.reason = reason
+
+    def json(self):
+        return self._payload
+
+
+class ImageControlClientTests(unittest.TestCase):
+    def test_freeze_has_no_request_body(self):
+        session = Mock()
+        session.put.return_value = FakeResponse(200, frozen_profile())
+        client = ImageControlClient("http://camera", session=session)
+
+        result = client.freeze()
+
+        self.assertEqual(result["exposure"]["gainX16"], 32)
+        session.put.assert_called_once_with(
+            "http://camera/image-control/freeze", timeout=2.0
+        )
+
+    def test_update_uses_partial_manual_exposure_patch(self):
+        session = Mock()
+        session.put.return_value = FakeResponse(200, frozen_profile(125, 32))
+        client = ImageControlClient("http://camera", session=session)
+
+        client.update_exposure(125, 33)
+
+        session.put.assert_called_once_with(
+            "http://camera/image-control",
+            timeout=2.0,
+            json={"exposure": {"shutterLines": 125, "gainX16": 33}},
+        )
+
+    def test_freeze_exposure_uses_returned_values_without_touching_color(self):
+        session = Mock()
+        session.put.return_value = FakeResponse(200, frozen_profile(220, 40))
+        client = ImageControlClient("http://camera", session=session)
+        client.freeze_exposure(frozen_profile(220, 40))
+        session.put.assert_called_once_with(
+            "http://camera/image-control",
+            timeout=2.0,
+            json={"exposure": {"shutterLines": 220, "gainX16": 40}},
+        )
+
+    def test_freeze_exposure_clamps_automatic_values_to_manual_limits(self):
+        session = Mock()
+        session.put.return_value = FakeResponse(200, frozen_profile(1200, 31))
+        client = ImageControlClient("http://camera", session=session)
+        profile = frozen_profile(1247, 31)
+        profile["limits"] = {
+            "shutterLines": {"min": 1, "max": 1200},
+            "gainX16": {"min": 16, "max": 496},
+        }
+        client.freeze_exposure(profile)
+        session.put.assert_called_once_with(
+            "http://camera/image-control",
+            timeout=2.0,
+            json={"exposure": {"shutterLines": 1200, "gainX16": 31}},
+        )
+
+    def test_camera_busy_retries_with_backoff(self):
+        busy = FakeResponse(
+            503,
+            {"ok": False, "error": {"code": "camera_busy", "message": "busy"}},
+        )
+        session = Mock()
+        session.get.side_effect = [busy, busy, FakeResponse(200, frozen_profile())]
+        sleeps = []
+
+        ImageControlClient("http://camera", session=session, sleep=sleeps.append).get_profile()
+
+        self.assertEqual(sleeps, [0.5, 1.0])
+        self.assertEqual(session.get.call_count, 3)
+
+    def test_validation_error_is_structured_and_not_retried(self):
+        session = Mock()
+        session.put.return_value = FakeResponse(
+            400,
+            {
+                "ok": False,
+                "error": {
+                    "code": "out_of_range",
+                    "field": "exposure.shutterLines",
+                    "message": "too large",
+                },
+            },
+        )
+        with self.assertRaises(ImageControlAPIError) as raised:
+            ImageControlClient("http://camera", session=session).update_exposure(9999, 16)
+        self.assertEqual(raised.exception.field, "exposure.shutterLines")
+        self.assertEqual(session.put.call_count, 1)
+
+
+class ManualExposureControllerTests(unittest.TestCase):
+    def make_controller(self, **overrides):
+        options = {
+            "observation_seconds": 4,
+            "window_seconds": 12,
+            "shutter_max": 300,
+            "gain_max_x16": 128,
+        }
+        options.update(overrides)
+        controller = ManualExposureController(**options)
+        controller.initialize(frozen_profile())
+        return controller
+
+    def test_three_dark_samples_increase_shutter_first_by_at_most_50_percent(self):
+        controller = self.make_controller()
+        self.assertIsNone(controller.observe(0.10, now=0))
+        self.assertIsNone(controller.observe(0.10, now=2))
+        decision = controller.observe(0.10, now=4)
+        self.assertEqual(decision.direction, "dark")
+        self.assertEqual(decision.shutter_lines, 150)
+        self.assertEqual(decision.gain_x16, 32)
+
+    def test_dark_scene_uses_shutter_after_gain_cap(self):
+        controller = self.make_controller()
+        controller.initialize(frozen_profile(100, 128))
+        controller.observe(0.10, now=0)
+        controller.observe(0.10, now=2)
+        decision = controller.observe(0.10, now=4)
+        self.assertEqual(decision.shutter_lines, 150)
+        self.assertEqual(decision.gain_x16, 128)
+
+    def test_bright_scene_never_reduces_exposure(self):
+        controller = self.make_controller()
+        self.assertIsNone(controller.observe(0.80, now=0))
+        self.assertIsNone(controller.observe(0.80, now=2))
+        self.assertIsNone(controller.observe(0.80, now=4))
+        self.assertIn("100L", controller.status_summary())
+
+    def test_middle_band_holds_and_success_uses_returned_quantized_gain(self):
+        controller = self.make_controller()
+        controller.observe(0.30, now=0)
+        self.assertIsNone(controller.observe(0.30, now=4))
+        controller.reset_observations()
+        controller.observe(0.10, now=10)
+        controller.observe(0.10, now=12)
+        decision = controller.observe(0.10, now=14)
+        controller.complete(frozen_profile(100, 44), success=True)
+        self.assertIn("GAIN 44/16", controller.status_summary())
+        self.assertEqual(decision.gain_x16, 32)
+
+    def test_default_policy_has_wider_shutter_and_lower_gain_caps(self):
+        controller = ManualExposureController()
+        self.assertEqual(controller.shutter_max, 900)
+        self.assertEqual(controller.gain_max_x16, 64)
+
+    def test_initial_profile_is_normalized_inside_caps(self):
+        controller = ManualExposureController(shutter_max=300, gain_max_x16=128)
+        patch = controller.initialize(frozen_profile(600, 32))
+        self.assertEqual(patch, {"shutterLines": 300, "gainX16": 64})
+
+    def test_disconnect_requires_fresh_evidence(self):
+        controller = self.make_controller()
+        controller.observe(0.10, now=0)
+        controller.reset_observations()
+        self.assertIsNone(controller.observe(0.10, now=4))
+        self.assertIsNone(controller.observe(0.10, now=6))
+        self.assertIsNotNone(controller.observe(0.10, now=8))
+
+    def test_invalid_environment_disables_controller_without_crashing(self):
+        with patch.dict(os.environ, {"CCTV_MANUAL_SHUTTER_MAX_LINES": "invalid"}):
+            controller = ManualExposureController.from_environment()
+        self.assertEqual(controller.status_summary(), "EXPOSURE DISABLED")
+
+
+class ClippingResistantBrightnessTests(unittest.TestCase):
+    def test_clipped_pixels_do_not_bias_usable_midtones(self):
+        frame = np.array([[[0, 0, 0], [255, 255, 255], [128, 128, 128]]], dtype=np.uint8)
+        self.assertAlmostEqual(clipping_resistant_brightness(frame), 128 / 255, places=5)
+
+    def test_fully_clipped_frame_has_directional_fallback(self):
+        black = np.zeros((2, 2, 3), dtype=np.uint8)
+        white = np.full((2, 2, 3), 255, dtype=np.uint8)
+        self.assertEqual(clipping_resistant_brightness(black), 0.0)
+        self.assertEqual(clipping_resistant_brightness(white), 1.0)
+
+
+class CameraColorProfileTests(unittest.TestCase):
+    def test_profile_produces_isolated_white_balance_and_saturation_patches(self):
+        profile = CameraColorProfile(94, 65, 84, 72, 72)
+        self.assertEqual(
+            profile.white_balance_patch(),
+            {"whiteBalance": {"auto": False, "red": 94, "green": 65, "blue": 84}},
+        )
+        self.assertEqual(
+            profile.saturation_patch(),
+            {"color": {"saturation": {"u": 72, "v": 72}}},
+        )
+
+
+class StartupResolutionTests(unittest.TestCase):
+    @patch("utilities.startup.time.sleep")
+    @patch("utilities.startup.change_clock")
+    @patch("utilities.startup.change_quality")
+    @patch("utilities.startup.get_camera_status_with_retry")
+    def test_startup_always_restores_framesize_12(
+        self, get_status, change_quality, _change_clock, _sleep
+    ):
+        get_status.side_effect = [
+            CameraStatus(state="camera-online", framesize=11, raw={"framesize": 11}),
+            CameraStatus(state="camera-online", framesize=12, raw={"framesize": 12}),
+        ]
+        startup()
+        change_quality.assert_called_once_with(12)
+
+
+if __name__ == "__main__":
+    unittest.main()
