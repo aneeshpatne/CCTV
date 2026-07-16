@@ -28,7 +28,7 @@ The operator interface is a responsive, video-first HTML, CSS, and JavaScript da
 
 | Area | What the project provides |
 | --- | --- |
-| **Camera lifecycle** | Polls the ESP32 status endpoints, raises the camera to the configured resolution, synchronizes its clock, reapplies AWB/exposure/AGC policy after reconnects, and exposes OTA recovery state through Redis when available. |
+| **Camera lifecycle** | Polls the ESP32 status endpoints, dynamically selects framesize 11 or 12 from sustained scene brightness, synchronizes its clock, reapplies AWB/exposure/AGC policy after reconnects, and exposes OTA recovery state through Redis when available. |
 | **Native capture** | Parses multipart MJPEG with a bounded latest-frame queue, follows camera arrival timestamps, and uses hardware JPEG processing and VideoToolbox encoders. The recorded Apple M4 canary reduced median capture-tree CPU by 65.6% and representative segment size by 69.3% versus the Python path. |
 | **Live observability** | Composites timestamp, measured FPS, Wi-Fi RSSI, SoC temperature, motion state, and person/animal labels into the outgoing frame. Telemetry failures leave the feed running with unavailable values. |
 | **Signal recovery** | Detects a three-second JPEG stall, keeps archive and RTSP outputs alive with a `NO SIGNAL · RECONNECTING` frame, retries the stream, and coalesces disconnects into one camera startup sequence. |
@@ -237,6 +237,8 @@ There is no camera simulator. Unit tests run without hardware, but live capture,
    ```
 
    `CCTV_PIPELINE_BACKEND` accepts `native`, `python`, or `auto`; the default is `native`, with fallback when the binary is missing or repeatedly fails. Native tuning is available through `CCTV_TARGET_FPS`, `CCTV_SEGMENT_SECONDS`, `CCTV_HEVC_BITRATE`, `CCTV_RTSP_BITRATE`, and `CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS`.
+
+   Dynamic resolution uses full-frame BT.709 luminance before overlays. It selects framesize 11 below 25%, framesize 12 above 35%, holds the current setting inside that hysteresis band, observes for at least 30 seconds across a 60-second window, and starts a 15-minute cooldown only after the camera verifies the change. These defaults can be overridden with `CCTV_DIM_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHT_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHTNESS_OBSERVATION_SECONDS`, `CCTV_BRIGHTNESS_WINDOW_SECONDS`, and `CCTV_RESOLUTION_COOLDOWN_SECONDS`.
 
 5. Build the native capture worker.
 
