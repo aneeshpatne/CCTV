@@ -181,9 +181,14 @@ final class SegmentRecorder: @unchecked Sendable {
 final class RTSPPublisher: @unchecked Sendable {
     private let rtspURL: String
     private let lock = NSLock()
+    private let writerQueue = DispatchQueue(label: "cctv.rtsp-writer", qos: .utility)
     private var process: Process?
     private var pipe: Pipe?
     private var lastStartAttempt = Date.distantPast
+    private var pendingWrites = 0
+    private var droppingUntilKeyframe = false
+    private var stopping = false
+    private let maximumPendingWrites = 8
 
     init(rtspURL: String) {
         self.rtspURL = rtspURL
@@ -194,26 +199,49 @@ final class RTSPPublisher: @unchecked Sendable {
         return process?.isRunning == true
     }
 
-    func write(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        ensureRunningLocked()
-        guard let handle = pipe?.fileHandleForWriting else { return }
-        do {
-            try handle.write(contentsOf: data)
-        } catch {
-            process?.terminate()
-            process = nil
-            pipe = nil
+    func write(_ data: Data, keyframe: Bool) {
+        let accepted = lock.withLock { () -> Bool in
+            guard !stopping else { return false }
+            if droppingUntilKeyframe {
+                guard keyframe, pendingWrites < maximumPendingWrites else { return false }
+                droppingUntilKeyframe = false
+            }
+            guard pendingWrites < maximumPendingWrites else {
+                droppingUntilKeyframe = true
+                return false
+            }
+            pendingWrites += 1
+            return true
+        }
+        guard accepted else { return }
+        writerQueue.async { [weak self] in
+            guard let self else { return }
+            defer { self.lock.withLock { self.pendingWrites -= 1 } }
+            self.lock.withLock {
+                guard !self.stopping else { return }
+                self.ensureRunningLocked()
+                guard let handle = self.pipe?.fileHandleForWriting else { return }
+                do {
+                    try handle.write(contentsOf: data)
+                } catch {
+                    self.process?.terminate()
+                    self.process = nil
+                    self.pipe = nil
+                    self.droppingUntilKeyframe = true
+                }
+            }
         }
     }
 
     func stop() {
-        lock.lock(); defer { lock.unlock() }
-        try? pipe?.fileHandleForWriting.close()
-        process?.terminate()
-        process = nil
-        pipe = nil
+        lock.withLock { stopping = true }
+        writerQueue.sync {}
+        lock.withLock {
+            try? pipe?.fileHandleForWriting.close()
+            process?.terminate()
+            process = nil
+            pipe = nil
+        }
     }
 
     private func ensureRunningLocked() {
@@ -255,6 +283,7 @@ private let h264OutputCallback: VTCompressionOutputCallback = { refcon, _, statu
 }
 
 final class H264HardwareEncoder: @unchecked Sendable {
+    private static let annexBStartCode = Data([0, 0, 0, 1])
     private let publisher: RTSPPublisher
     private let width: Int
     private let height: Int
@@ -304,6 +333,7 @@ final class H264HardwareEncoder: @unchecked Sendable {
         let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
         let keyframe = !notSync
         var output = Data()
+        output.reserveCapacity(CMBlockBufferGetDataLength(block) + 256)
 
         if keyframe, let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
             for index in 0..<2 {
@@ -319,7 +349,7 @@ final class H264HardwareEncoder: @unchecked Sendable {
                     nalUnitHeaderLengthOut: nil
                 )
                 if status == noErr, let pointer {
-                    output.append(contentsOf: [0, 0, 0, 1])
+                    output.append(Self.annexBStartCode)
                     output.append(pointer, count: size)
                 }
             }
@@ -335,11 +365,11 @@ final class H264HardwareEncoder: @unchecked Sendable {
             let length = Int(bytes[offset]) << 24 | Int(bytes[offset + 1]) << 16 | Int(bytes[offset + 2]) << 8 | Int(bytes[offset + 3])
             offset += 4
             guard length > 0, offset + length <= totalLength else { break }
-            output.append(contentsOf: [0, 0, 0, 1])
+            output.append(Self.annexBStartCode)
             output.append(bytes + offset, count: length)
             offset += length
         }
-        if !output.isEmpty { publisher.write(output) }
+        if !output.isEmpty { publisher.write(output, keyframe: keyframe) }
     }
 
     private func createSession() throws {
