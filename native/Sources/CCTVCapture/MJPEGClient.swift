@@ -16,61 +16,109 @@ struct MultipartJPEGParser: Sendable {
     private static let headerTerminator = Data([0x0D, 0x0A, 0x0D, 0x0A])
     private static let startMarker = Data([0xFF, 0xD8])
     private static let endMarker = Data([0xFF, 0xD9])
+    private static let maximumBufferSize = 8 * 1024 * 1024
+    private static let compactionThreshold = 1024 * 1024
 
     private var buffer = Data()
+    private var readOffset = 0
+    private var endMarkerSearchOffset = 0
     private var expectedJPEGLength: Int?
 
     mutating func reset() {
         buffer.removeAll(keepingCapacity: true)
+        readOffset = 0
+        endMarkerSearchOffset = 0
         expectedJPEGLength = nil
     }
 
     /// Parse multipart MJPEG incrementally. Content-Length avoids rescanning JPEG payloads;
     /// SOI/EOI remains a compatibility fallback for cameras with incomplete headers.
     mutating func append(_ data: Data) -> [Data] {
+        if buffer.isEmpty {
+            buffer.reserveCapacity(max(256 * 1024, data.count))
+        }
         buffer.append(data)
         var result: [Data] = []
         while true {
             if let expectedJPEGLength {
-                guard buffer.count >= expectedJPEGLength else { break }
-                let candidate = Data(buffer.prefix(expectedJPEGLength))
-                buffer.removeFirst(expectedJPEGLength)
+                guard unreadCount >= expectedJPEGLength else { break }
+                let frameEnd = readOffset + expectedJPEGLength
+                let candidate = Data(buffer[readOffset..<frameEnd])
+                consume(through: frameEnd)
                 self.expectedJPEGLength = nil
                 if let jpeg = Self.validJPEG(from: candidate) { result.append(jpeg) }
                 continue
             }
 
-            if buffer.starts(with: Self.startMarker) {
-                guard let end = buffer.range(of: Self.endMarker, in: buffer.startIndex..<buffer.endIndex) else {
+            if unreadData.starts(with: Self.startMarker) {
+                // Resume at the last unsearched byte. Keeping one trailing byte lets an
+                // FF D9 marker split across URLSession callbacks be detected.
+                let searchStart = max(readOffset + Self.startMarker.count, endMarkerSearchOffset)
+                guard let end = buffer.range(of: Self.endMarker, in: searchStart..<buffer.endIndex) else {
+                    endMarkerSearchOffset = max(readOffset + Self.startMarker.count, buffer.endIndex - 1)
                     break
                 }
                 let frameEnd = end.upperBound
-                result.append(Data(buffer[buffer.startIndex..<frameEnd]))
-                buffer.removeSubrange(buffer.startIndex..<frameEnd)
+                result.append(Data(buffer[readOffset..<frameEnd]))
+                consume(through: frameEnd)
                 continue
             }
 
-            if let headerEnd = buffer.range(of: Self.headerTerminator) {
-                let headerData = Data(buffer[buffer.startIndex..<headerEnd.lowerBound])
-                buffer.removeSubrange(buffer.startIndex..<headerEnd.upperBound)
-                if let length = Self.contentLength(from: headerData), length > 0, length <= 8 * 1024 * 1024 {
+            if let headerEnd = buffer.range(
+                of: Self.headerTerminator,
+                in: readOffset..<buffer.endIndex
+            ) {
+                let headerData = Data(buffer[readOffset..<headerEnd.lowerBound])
+                consume(through: headerEnd.upperBound)
+                if let length = Self.contentLength(from: headerData),
+                   length > 0,
+                   length <= Self.maximumBufferSize {
                     expectedJPEGLength = length
                 }
                 continue
             }
 
-            if let start = buffer.range(of: Self.startMarker), start.lowerBound > buffer.startIndex {
-                buffer.removeSubrange(buffer.startIndex..<start.lowerBound)
+            if let start = buffer.range(
+                of: Self.startMarker,
+                in: readOffset..<buffer.endIndex
+            ), start.lowerBound > readOffset {
+                consume(through: start.lowerBound)
                 continue
             }
 
-            if buffer.count > 8 * 1024 * 1024 {
-                buffer.removeFirst(buffer.count - 2 * 1024 * 1024)
+            if unreadCount > Self.maximumBufferSize {
+                readOffset = max(readOffset, buffer.endIndex - 2 * 1024 * 1024)
+                compact(force: true)
                 expectedJPEGLength = nil
             }
             break
         }
+        compact(force: false)
         return result
+    }
+
+    private var unreadCount: Int {
+        buffer.endIndex - readOffset
+    }
+
+    private var unreadData: Data.SubSequence {
+        buffer[readOffset..<buffer.endIndex]
+    }
+
+    private mutating func consume(through offset: Int) {
+        readOffset = offset
+        endMarkerSearchOffset = offset
+        compact(force: false)
+    }
+
+    /// Front-removing every JPEG shifts the remaining Data repeatedly. Retain a read
+    /// cursor and compact in larger batches instead.
+    private mutating func compact(force: Bool) {
+        guard readOffset > 0 else { return }
+        guard force || readOffset >= Self.compactionThreshold else { return }
+        buffer.removeSubrange(buffer.startIndex..<readOffset)
+        endMarkerSearchOffset = max(0, endMarkerSearchOffset - readOffset)
+        readOffset = 0
     }
 
     private static func contentLength(from headerData: Data) -> Int? {
