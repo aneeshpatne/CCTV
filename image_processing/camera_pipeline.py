@@ -39,6 +39,7 @@ from tools.mjpeg_capture import MJPEG_STREAM_URL, MjpegStreamCapture
 from tools.reset import reset
 from utilities.EventAccumulator import EventAccumulator
 from utilities.motion_db_new import log_motion_event
+from utilities.dynamic_resolution import DynamicResolutionController
 
 IST = pytz.timezone("Asia/Kolkata")
 NO_SIGNAL_PATH = os.path.join(os.path.dirname(__file__), "examples", "no_signal.png")
@@ -201,6 +202,7 @@ device_state = "offline"
 device_state_detail = "waiting for first status check"
 device_state_lock = threading.Lock()
 startup_lock = threading.Lock()
+resolution_controller = DynamicResolutionController.from_environment(initial_framesize=12)
 
 # Camera adjustment state (run after stream starts)
 camera_adjustments_done = False
@@ -758,13 +760,17 @@ def start_startup(force: bool = False) -> None:
             def _runner() -> None:
                 attempt = 1
                 while not startup_complete.is_set():
+                    target_framesize = resolution_controller.selected_framesize
                     try:
                         print(f"Running startup attempt {attempt}...")
                         set_device_state(
                             "wifi-online-camera-starting",
                             f"startup attempt {attempt}: polling status and applying camera settings",
                         )
-                        startup()
+                        startup(target_framesize=target_framesize)
+                        resolution_controller.complete_change(
+                            target_framesize, success=True
+                        )
                         set_device_state(
                             "camera-online",
                             "startup complete; opening MJPEG stream next",
@@ -780,6 +786,9 @@ def start_startup(force: bool = False) -> None:
                             attempt += 1
                             continue
                         print("Startup paused because device is still in OTA-only recovery mode.")
+                        resolution_controller.complete_change(
+                            target_framesize, success=False
+                        )
                         break
                     except Exception as exc:
                         set_device_state(
@@ -1085,6 +1094,7 @@ def draw_hud(
     motion_detected: bool = False,
     show_time: bool = True,
     coordinates: list = [0, 0],
+    scene_brightness: float | None = None,
 ):
     """Draws a square Material dark HUD."""
     x, y = coordinates
@@ -1340,7 +1350,48 @@ def draw_hud(
                 thickness,
             )
 
-        cursor_x -= gap
+    cursor_x -= gap
+
+    brightness_text = (
+        f"{scene_brightness * 100:.1f}% LIGHT"
+        if scene_brightness is not None
+        else "--% LIGHT"
+    )
+    tw, th = get_hud_text_size(
+        brightness_text, font_size, font, font_scale, thickness
+    )
+    brightness_box_w = tw + (pad_x * 2) + 8
+    cursor_x -= brightness_box_w
+    if should_draw("brightness", cursor_x, top_margin, brightness_box_w, box_h):
+        if scene_brightness is None:
+            brightness_color = status_neutral
+        elif scene_brightness < 0.25:
+            brightness_color = status_warn
+        elif scene_brightness > 0.35:
+            brightness_color = status_good
+        else:
+            brightness_color = status_neutral
+        draw_box(
+            frame,
+            cursor_x,
+            top_margin,
+            brightness_box_w,
+            box_h,
+            bg_color=surface_variant,
+            border_color=panel_border,
+            accent_color=brightness_color,
+        )
+        put_hud_text(
+            frame,
+            brightness_text,
+            cursor_x + pad_x + 4,
+            text_center_y,
+            font_color if scene_brightness is not None else muted_color,
+            font_size,
+            font,
+            font_scale,
+            thickness,
+        )
 
 
 def backoff(attempt: int) -> float:
@@ -1622,6 +1673,7 @@ def main() -> None:
                 print("Frame read failed - signal lost.")
                 cap.release()
                 cap = None
+                resolution_controller.reset_observations()
                 start_startup(force=True)
 
                 # Show and record "no signal" frame
@@ -1629,6 +1681,20 @@ def main() -> None:
                 record_no_signal_frame("CRASH: Restarting camera...")
 
                 time.sleep(FRAME_FAILURE_RECONNECT_DELAY)
+                continue
+
+            blue, green, red, _ = cv2.mean(frame)
+            scene_brightness = (
+                0.2126 * red + 0.7152 * green + 0.0722 * blue
+            ) / 255.0
+            resolution_decision = resolution_controller.observe(scene_brightness)
+            if resolution_decision is not None:
+                print(
+                    "Sustained scene brightness "
+                    f"{resolution_decision.average_brightness * 100:.1f}%: "
+                    f"switching framesize to {resolution_decision.framesize}."
+                )
+                start_startup(force=True)
                 continue
 
             # Apply camera adjustments after first successful frame (only once per startup)
@@ -1717,6 +1783,7 @@ def main() -> None:
                 motion_detected,
                 time_overlap,
                 coordinates,
+                scene_brightness=scene_brightness,
             )
 
             # Draw ROI polygon on display only if flag is enabled
