@@ -5,147 +5,231 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any
+
+import numpy as np
 
 
-BrightnessMode = Literal["bright", "dark"]
+def clipping_resistant_brightness(frame: np.ndarray) -> float:
+    """Return BT.709 brightness while excluding clipped black/white pixels."""
+    blue = frame[..., 0].astype(np.float32)
+    green = frame[..., 1].astype(np.float32)
+    red = frame[..., 2].astype(np.float32)
+    luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    usable = luma[(luma > 7.0) & (luma < 248.0)]
+    if usable.size:
+        return float(usable.mean() / 255.0)
+    return float(luma.mean() / 255.0)
 
 
 @dataclass(frozen=True)
-class BrightnessModeDecision:
-    mode: BrightnessMode
+class ManualExposureDecision:
+    direction: str
     average_brightness: float
+    shutter_lines: int
+    gain_x16: int
 
 
-class BrightnessModeController:
-    """Choose one reset-backed AGC mode from sustained scene brightness."""
+class ManualExposureController:
+    """Closed-loop manual exposure policy driven by measured frame luminance."""
 
     def __init__(
         self,
         *,
-        initial_mode: BrightnessMode = "bright",
+        target_brightness: float = 0.30,
         dim_threshold: float = 0.25,
         bright_threshold: float = 0.35,
-        observation_seconds: float = 30.0,
-        window_seconds: float = 60.0,
-        cooldown_seconds: float = 15 * 60.0,
+        observation_seconds: float = 4.0,
+        window_seconds: float = 12.0,
+        shutter_min: int = 1,
+        shutter_max: int = 900,
+        gain_min_x16: int = 16,
+        gain_max_x16: int = 64,
+        max_step: float = 0.50,
     ) -> None:
-        if initial_mode not in {"bright", "dark"}:
-            raise ValueError("initial brightness mode must be bright or dark")
-        if not 0 <= dim_threshold < bright_threshold <= 1:
-            raise ValueError("brightness thresholds must satisfy 0 <= dim < bright <= 1")
+        if not 0 < dim_threshold < target_brightness < bright_threshold <= 1:
+            raise ValueError("brightness values must satisfy dim < target < bright")
         if observation_seconds <= 0 or window_seconds < observation_seconds:
             raise ValueError("brightness window must cover the observation period")
-        if cooldown_seconds < 0:
-            raise ValueError("brightness reset cooldown cannot be negative")
-
+        if not 1 <= shutter_min <= shutter_max <= 1200:
+            raise ValueError("invalid shutter limits")
+        if not 16 <= gain_min_x16 <= gain_max_x16 <= 496:
+            raise ValueError("invalid gain limits")
+        if not 0 < max_step < 1:
+            raise ValueError("max_step must be between zero and one")
+        self.target_brightness = target_brightness
         self.dim_threshold = dim_threshold
         self.bright_threshold = bright_threshold
         self.observation_seconds = observation_seconds
         self.window_seconds = window_seconds
-        self.cooldown_seconds = cooldown_seconds
-        self._selected_mode = initial_mode
-        self._pending_mode: BrightnessMode | None = None
-        self._last_change_at: float | None = None
+        self.shutter_min = shutter_min
+        self.shutter_max = shutter_max
+        self.gain_min_x16 = gain_min_x16
+        self.gain_max_x16 = gain_max_x16
+        self.max_step = max_step
+        self._profile: dict[str, Any] | None = None
         self._samples: deque[tuple[float, float]] = deque()
-        self._synchronized = False
+        self._pending = False
+        self._disabled_reason: str | None = None
+        self._at_limit = False
         self._lock = threading.Lock()
 
     @classmethod
-    def from_environment(
-        cls, *, initial_mode: BrightnessMode = "bright"
-    ) -> "BrightnessModeController":
-        cooldown = os.getenv(
-            "CCTV_BRIGHTNESS_RESET_COOLDOWN_SECONDS",
-            os.getenv("CCTV_RESOLUTION_COOLDOWN_SECONDS", "900"),
-        )
-        return cls(
-            initial_mode=initial_mode,
-            dim_threshold=float(os.getenv("CCTV_DIM_BRIGHTNESS_THRESHOLD", "0.25")),
-            bright_threshold=float(os.getenv("CCTV_BRIGHT_BRIGHTNESS_THRESHOLD", "0.35")),
-            observation_seconds=float(
-                os.getenv("CCTV_BRIGHTNESS_OBSERVATION_SECONDS", "30")
-            ),
-            window_seconds=float(os.getenv("CCTV_BRIGHTNESS_WINDOW_SECONDS", "60")),
-            cooldown_seconds=float(cooldown),
-        )
-
-    @property
-    def selected_mode(self) -> BrightnessMode:
-        """Return the desired mode, including a reset currently in progress."""
-        with self._lock:
-            return self._pending_mode or self._selected_mode
-
-    @property
-    def selected_agc(self) -> int:
-        return 1 if self.selected_mode == "dark" else 0
-
-    def synchronize_from_agc(self, agc: object) -> None:
-        """Initialize mode once from camera status without overriding a transition."""
+    def from_environment(cls) -> "ManualExposureController":
         try:
-            value = int(agc)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return
-        if value not in {0, 1}:
-            return
+            return cls(
+                target_brightness=float(os.getenv("CCTV_IMAGE_TARGET_BRIGHTNESS", "0.30")),
+                dim_threshold=float(os.getenv("CCTV_DIM_BRIGHTNESS_THRESHOLD", "0.25")),
+                bright_threshold=float(os.getenv("CCTV_BRIGHT_BRIGHTNESS_THRESHOLD", "0.35")),
+                observation_seconds=float(os.getenv("CCTV_BRIGHTNESS_OBSERVATION_SECONDS", "4")),
+                window_seconds=float(os.getenv("CCTV_BRIGHTNESS_WINDOW_SECONDS", "12")),
+                shutter_min=int(os.getenv("CCTV_MANUAL_SHUTTER_MIN_LINES", "1")),
+                shutter_max=int(os.getenv("CCTV_MANUAL_SHUTTER_MAX_LINES", "900")),
+                gain_min_x16=int(os.getenv("CCTV_MANUAL_GAIN_MIN_X16", "16")),
+                gain_max_x16=int(os.getenv("CCTV_MANUAL_GAIN_MAX_X16", "64")),
+                max_step=float(os.getenv("CCTV_MANUAL_EXPOSURE_MAX_STEP", "0.50")),
+            )
+        except (TypeError, ValueError) as error:
+            controller = cls()
+            controller.disable(f"invalid manual exposure configuration: {error}")
+            return controller
 
+    def initialize(self, profile: dict[str, Any]) -> dict[str, int] | None:
+        """Store a frozen profile and return a normalization patch if caps require it."""
         with self._lock:
-            if self._synchronized or self._pending_mode is not None:
-                return
-            self._selected_mode = "dark" if value == 1 else "bright"
-            self._synchronized = True
+            self._validate_manual_profile(profile)
+            self._profile = profile
+            self._samples.clear()
+            self._pending = False
+            self._disabled_reason = None
+            self._at_limit = False
+            shutter, gain = self._values(profile)
+            normalized_shutter, normalized_gain = self._normalize(shutter, gain)
+            if (normalized_shutter, normalized_gain) == (shutter, gain):
+                return None
+            self._pending = True
+            return {"shutterLines": normalized_shutter, "gainX16": normalized_gain}
 
     def observe(
         self, brightness: float, *, now: float | None = None
-    ) -> BrightnessModeDecision | None:
+    ) -> ManualExposureDecision | None:
         now = time.monotonic() if now is None else now
-        brightness = min(1.0, max(0.0, float(brightness)))
-
+        value = min(1.0, max(0.0, float(brightness)))
         with self._lock:
-            self._samples.append((now, brightness))
+            if self._profile is None or self._pending or self._disabled_reason:
+                return None
+            # Bright and normal frames deliberately never reduce exposure. Requiring
+            # consecutive dark samples prevents transient shadows from triggering.
+            if value >= self.dim_threshold:
+                self._samples.clear()
+                self._at_limit = False
+                return None
+            self._samples.append((now, value))
             cutoff = now - self.window_seconds
             while self._samples and self._samples[0][0] < cutoff:
                 self._samples.popleft()
-
-            if self._pending_mode is not None or len(self._samples) < 2:
+            if len(self._samples) < 3:
                 return None
             if self._samples[-1][0] - self._samples[0][0] < self.observation_seconds:
                 return None
-            if self._last_change_at is not None and now - self._last_change_at < self.cooldown_seconds:
-                return None
-
-            average = sum(value for _, value in self._samples) / len(self._samples)
-            target: BrightnessMode | None = None
-            if average < self.dim_threshold:
-                target = "dark"
-            elif average > self.bright_threshold:
-                target = "bright"
-
-            if target is None or target == self._selected_mode:
-                return None
-
-            self._pending_mode = target
-            return BrightnessModeDecision(mode=target, average_brightness=average)
-
-    def complete_transition(
-        self,
-        mode: BrightnessMode,
-        *,
-        success: bool,
-        now: float | None = None,
-    ) -> None:
-        now = time.monotonic() if now is None else now
-        with self._lock:
-            if self._pending_mode != mode:
-                return
-            self._pending_mode = None
+            average = sum(sample for _, sample in self._samples) / len(self._samples)
+            shutter, gain = self._values(self._profile)
+            requested_shutter, requested_gain = self._correct(shutter, gain, average)
             self._samples.clear()
-            if success:
-                self._selected_mode = mode
-                self._last_change_at = now
-                self._synchronized = True
+            if (requested_shutter, requested_gain) == (shutter, gain):
+                self._at_limit = True
+                return None
+            self._pending = True
+            self._at_limit = False
+            return ManualExposureDecision(
+                "dark", average, requested_shutter, requested_gain
+            )
+
+    def complete(self, profile: dict[str, Any] | None, *, success: bool) -> None:
+        with self._lock:
+            if success and profile is not None:
+                self._validate_manual_profile(profile)
+                self._profile = profile
+            self._pending = False
+            self._samples.clear()
+
+    def disable(self, reason: str) -> None:
+        with self._lock:
+            self._disabled_reason = reason
+            self._pending = False
+            self._samples.clear()
 
     def reset_observations(self) -> None:
-        """Require fresh brightness evidence after a signal interruption."""
         with self._lock:
             self._samples.clear()
+
+    def profile_snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            return self._profile
+
+    def status_summary(self) -> str:
+        with self._lock:
+            if self._disabled_reason:
+                return "EXPOSURE DISABLED"
+            if self._profile is None:
+                return "EXPOSURE --"
+            shutter, gain = self._values(self._profile)
+            state = "ADJUSTING" if self._pending else "MANUAL"
+            if self._at_limit:
+                state = "DARK LIMIT"
+            white_balance = self._profile.get("whiteBalance", {})
+            rgb = ""
+            if all(key in white_balance for key in ("red", "green", "blue")):
+                rgb = (
+                    f" · WB {int(white_balance['red'])}/"
+                    f"{int(white_balance['green'])}/{int(white_balance['blue'])}"
+                )
+            saturation = self._profile.get("color", {}).get("saturation", {})
+            if all(key in saturation for key in ("u", "v")):
+                rgb += f" · SAT {int(saturation['u'])}/{int(saturation['v'])}"
+            return f"{state} · {shutter}L · GAIN {gain}/16 ({gain / 16:.2f}x){rgb}"
+
+    def _correct(self, shutter: int, gain: int, brightness: float) -> tuple[int, int]:
+        ratio = self.target_brightness / max(brightness, 0.001)
+        ratio = min(1 + self.max_step, max(1 - self.max_step, ratio))
+        target_product = shutter * gain * ratio
+        # Prefer a cleaner signal from a longer shutter. Add gain only after the
+        # configured shutter range is exhausted.
+        new_shutter = min(
+            self.shutter_max,
+            max(shutter, int(round(target_product / gain))),
+        )
+        new_gain = min(
+            self.gain_max_x16,
+            max(gain, int(round(target_product / new_shutter))),
+        )
+        return new_shutter, new_gain
+
+    def _normalize(self, shutter: int, gain: int) -> tuple[int, int]:
+        product = shutter * gain
+        new_shutter = min(self.shutter_max, max(self.shutter_min, shutter))
+        new_gain = min(
+            self.gain_max_x16,
+            max(self.gain_min_x16, int(round(product / new_shutter))),
+        )
+        if new_gain in {self.gain_min_x16, self.gain_max_x16}:
+            new_shutter = min(
+                self.shutter_max,
+                max(self.shutter_min, int(round(product / new_gain))),
+            )
+        return new_shutter, new_gain
+
+    @staticmethod
+    def _values(profile: dict[str, Any]) -> tuple[int, int]:
+        exposure = profile["exposure"]
+        return int(exposure["shutterLines"]), int(exposure["gainX16"])
+
+    @staticmethod
+    def _validate_manual_profile(profile: dict[str, Any]) -> None:
+        exposure = profile.get("exposure")
+        if not isinstance(exposure, dict):
+            raise ValueError("image profile is missing exposure")
+        if exposure.get("autoExposure") is not False or exposure.get("autoGain") is not False:
+            raise ValueError("image profile is not manually frozen")
+        int(exposure["shutterLines"])
+        int(exposure["gainX16"])
