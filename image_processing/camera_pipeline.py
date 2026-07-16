@@ -15,6 +15,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 )
 
 import threading
+import queue
 import time
 import signal
 import subprocess
@@ -287,6 +288,10 @@ MAX_RECORD_FRAME_DUPLICATES = 30
 FFMPEG_RESTART_COOLDOWN_SECONDS = 5.0
 last_record_restart_attempt: Optional[float] = None
 last_rtsp_restart_attempt: Optional[float] = None
+_frame_write_queue: queue.Queue[object] = queue.Queue(maxsize=1)
+_frame_writer_thread: Optional[threading.Thread] = None
+_frame_writer_guard = threading.Lock()
+_FRAME_WRITER_STOP = object()
 
 
 def _using_videotoolbox() -> bool:
@@ -508,14 +513,13 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
             pass
 
 
-def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
+def _write_frame_to_ffmpeg_sync(frame: np.ndarray) -> bool:
     """Push a frame into the recording/RTSP FFmpeg pipelines, restarting them when needed."""
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, last_record_write_time
     global last_record_restart_attempt, last_rtsp_restart_attempt
 
     if not ENABLE_RECORDING and not ENABLE_RTSP:
         return True
-
     with ffmpeg_lock:
         h, w = frame.shape[:2]
         new_size = (w, h)
@@ -610,7 +614,9 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         if (w, h) != expected_frame_size:
             frame = cv2.resize(frame, expected_frame_size)
 
-        frame_bytes = frame.tobytes()
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
+        frame_bytes = memoryview(frame).cast("B")
 
         def _record_frame_copies() -> int:
             global last_record_write_time
@@ -657,6 +663,75 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             ffmpeg_rtsp_proc = _write(ffmpeg_rtsp_proc, "rtsp", start_ffmpeg_rtsp)
 
         return True
+
+
+def _frame_writer_loop() -> None:
+    while True:
+        item = _frame_write_queue.get()
+        try:
+            if item is _FRAME_WRITER_STOP:
+                return
+            _write_frame_to_ffmpeg_sync(item)  # type: ignore[arg-type]
+        finally:
+            _frame_write_queue.task_done()
+
+
+def _ensure_frame_writer() -> None:
+    global _frame_writer_thread
+    with _frame_writer_guard:
+        if _frame_writer_thread is not None and _frame_writer_thread.is_alive():
+            return
+        _frame_writer_thread = threading.Thread(
+            target=_frame_writer_loop,
+            name="ffmpeg-frame-writer",
+            daemon=True,
+        )
+        _frame_writer_thread.start()
+
+
+def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
+    """Queue only the newest frame so a slow encoder cannot stall capture."""
+    _ensure_frame_writer()
+    try:
+        _frame_write_queue.put_nowait(frame)
+    except queue.Full:
+        try:
+            _frame_write_queue.get_nowait()
+            _frame_write_queue.task_done()
+        except queue.Empty:
+            pass
+        _frame_write_queue.put_nowait(frame)
+    return True
+
+
+def stop_frame_writer() -> None:
+    global _frame_writer_thread
+    with _frame_writer_guard:
+        thread = _frame_writer_thread
+        _frame_writer_thread = None
+    if thread is None:
+        return
+    try:
+        pending = _frame_write_queue.get_nowait()
+        _frame_write_queue.task_done()
+        del pending
+    except queue.Empty:
+        pass
+    try:
+        _frame_write_queue.put_nowait(_FRAME_WRITER_STOP)
+    except queue.Full:
+        return
+    thread.join(timeout=3)
+    if thread.is_alive():
+        # Closing the write ends is the only reliable way to release a pipe write
+        # blocked behind an unhealthy FFmpeg process during shutdown.
+        for proc in (ffmpeg_record_proc, ffmpeg_rtsp_proc):
+            try:
+                if proc is not None and proc.stdin is not None:
+                    proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        thread.join(timeout=3)
 
 
 def set_device_state(state: str, detail: str = "") -> None:
@@ -971,15 +1046,15 @@ def draw_box(
     w = x2 - x
     h = y2 - y
 
-    shadow = frame.copy()
     shadow_y = min(frame.shape[0] - 1, y + 2)
     shadow_y2 = min(frame.shape[0] - 1, y2 + 2)
-    cv2.rectangle(shadow, (x, shadow_y), (x2, shadow_y2), (0, 0, 0), -1)
-    cv2.addWeighted(shadow, 0.18, frame, 0.82, 0, frame)
+    shadow_roi = frame[shadow_y : shadow_y2 + 1, x : x2 + 1]
+    cv2.addWeighted(shadow_roi, 0.82, shadow_roi, 0, 0, shadow_roi)
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x, y), (x2, y2), bg_color, -1)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    panel_roi = frame[y : y2 + 1, x : x2 + 1]
+    overlay = np.empty_like(panel_roi)
+    overlay[:] = bg_color
+    cv2.addWeighted(overlay, alpha, panel_roi, 1 - alpha, 0, panel_roi)
 
     if border_color is not None:
         cv2.rectangle(frame, (x, y), (x2, y2), border_color, 1, cv2.LINE_AA)
@@ -1027,6 +1102,7 @@ def get_status_color(value, thresholds, colors):
 
 
 HUD_FONT_CACHE: dict[int, Optional[object]] = {}
+NO_SIGNAL_FRAME_CACHE: dict[tuple, np.ndarray] = {}
 
 
 def get_hud_font(size: int) -> Optional[object]:
@@ -1076,14 +1152,26 @@ def put_hud_text(
         )
         return
 
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    image = Image.fromarray(rgb_frame)
-    draw = ImageDraw.Draw(image)
-    bbox = draw.textbbox((0, 0), text, font=hud_font)
+    bbox = hud_font.getbbox(text)
     text_h = bbox[3] - bbox[1]
     y = int(center_y - text_h / 2 - bbox[1])
-    draw.text((x, y), text, font=hud_font, fill=(color[2], color[1], color[0]))
-    frame[:] = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    left = max(0, x + bbox[0])
+    top = max(0, y + bbox[1])
+    right = min(frame.shape[1], x + bbox[2])
+    bottom = min(frame.shape[0], y + bbox[3])
+    if left >= right or top >= bottom:
+        return
+
+    roi = frame[top:bottom, left:right]
+    image = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(image)
+    draw.text(
+        (x - left, y - top),
+        text,
+        font=hud_font,
+        fill=(color[2], color[1], color[0]),
+    )
+    roi[:] = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
 
 def draw_hud(
@@ -1432,6 +1520,31 @@ def show_placeholder(message: str) -> None:
 
 def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
     """Create and optionally display a no-signal frame. Always returns the frame for recording."""
+    with rssi_lock:
+        current_rssi = rssi_value
+    with fps_lock:
+        current_fps = fps_value
+    with temperature_lock:
+        current_temperature = soc_temperature_c
+    base_height, base_width = (
+        no_signal_img.shape[:2] if no_signal_img is not None else (480, 640)
+    )
+    cache_key = (
+        "display",
+        base_width,
+        base_height,
+        message,
+        current_rssi,
+        round(current_fps, 1),
+        current_temperature,
+        int(time.time()),
+    )
+    cached = NO_SIGNAL_FRAME_CACHE.get(cache_key)
+    if cached is not None:
+        if SHOW_LOCAL_VIEW:
+            cv2.imshow("frame", cached)
+        return cached
+
     # Initialize frame from no_signal_img
     if no_signal_img is not None:
         frame = no_signal_img.copy()
@@ -1450,16 +1563,11 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
 
     draw_status_message(frame, message)
 
-    # Get current status values
-    with rssi_lock:
-        current_rssi = rssi_value
-    with fps_lock:
-        current_fps = fps_value
-    with temperature_lock:
-        current_temperature = soc_temperature_c
-
     # Draw HUD
     draw_hud(frame, current_fps, current_rssi, current_temperature)
+    if len(NO_SIGNAL_FRAME_CACHE) >= 8:
+        NO_SIGNAL_FRAME_CACHE.clear()
+    NO_SIGNAL_FRAME_CACHE[cache_key] = frame
 
     # Show in window if enabled
     if SHOW_LOCAL_VIEW:
@@ -1470,6 +1578,26 @@ def show_no_signal_frame(message: str) -> Optional[np.ndarray]:
 
 def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.ndarray:
     """Create a no-signal frame matching the specified dimensions for FFmpeg."""
+    with rssi_lock:
+        current_rssi = rssi_value
+    with fps_lock:
+        current_fps = fps_value
+    with temperature_lock:
+        current_temperature = soc_temperature_c
+    cache_key = (
+        "record",
+        width,
+        height,
+        message,
+        current_rssi,
+        round(current_fps, 1),
+        current_temperature,
+        int(time.time()),
+    )
+    cached = NO_SIGNAL_FRAME_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     # Create or resize no_signal base to match camera dimensions
     if no_signal_img is not None:
         base = cv2.resize(no_signal_img, (width, height))
@@ -1490,16 +1618,12 @@ def get_no_signal_frame_for_size(width: int, height: int, message: str) -> np.nd
 
     draw_status_message(frame, message)
 
-    # Get current status values
-    with rssi_lock:
-        current_rssi = rssi_value
-    with fps_lock:
-        current_fps = fps_value
-    with temperature_lock:
-        current_temperature = soc_temperature_c
-
     # Draw HUD
     draw_hud(frame, current_fps, current_rssi, current_temperature)
+
+    if len(NO_SIGNAL_FRAME_CACHE) >= 8:
+        NO_SIGNAL_FRAME_CACHE.clear()
+    NO_SIGNAL_FRAME_CACHE[cache_key] = frame
 
     return frame
 
@@ -1589,6 +1713,17 @@ def main() -> None:
     attempt = 0
     cap = None
     last_blinker_trigger = 0.0
+    last_no_signal_frame = 0.0
+    no_signal_interval = 1.0 / max(1.0, FIXED_OUTPUT_FPS)
+    roi_mask: Optional[np.ndarray] = None
+
+    def pace_no_signal() -> None:
+        nonlocal last_no_signal_frame
+        now = time.monotonic()
+        remaining = last_no_signal_frame + no_signal_interval - now
+        if remaining > 0:
+            time.sleep(remaining)
+        last_no_signal_frame = time.monotonic()
 
     # Initialize motion detection components
     mog2 = cv2.createBackgroundSubtractorMOG2(
@@ -1628,18 +1763,13 @@ def main() -> None:
             if SHOW_LOCAL_VIEW:
                 if cv2.waitKey(1) == ord("q"):
                     break
-            else:
-                # Small sleep to prevent tight loop when not showing view
-                time.sleep(0.01)
-
             if not startup_complete.is_set():
                 if cap is not None:
                     cap.release()
                     cap = None
 
+                pace_no_signal()
                 record_no_signal_frame(get_device_state_message("STARTUP"))
-
-                time.sleep(0.05)
                 continue
 
             if cap is None or not cap.isOpened():
@@ -1712,16 +1842,18 @@ def main() -> None:
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.dilate(mask, kernel, iterations=2)
 
-            # Build ROI mask and apply
-            roi_mask = np.zeros_like(mask, dtype=np.uint8)
-            cv2.fillPoly(roi_mask, [ROI_PTS], 255)
+            # The ROI geometry is fixed; rebuild only after a resolution change.
+            if roi_mask is None or roi_mask.shape != mask.shape:
+                roi_mask = np.zeros_like(mask, dtype=np.uint8)
+                cv2.fillPoly(roi_mask, [ROI_PTS], 255)
             filtered_motion = cv2.bitwise_and(mask, roi_mask)
 
             # Find contours in filtered motion
             contours, _ = cv2.findContours(
                 filtered_motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            disp = frame.copy()
+            # Motion analysis is complete, so the source frame can become the output.
+            disp = frame
             motion_detected = False
             time_overlap = False
             coordinates = [0, 0]
@@ -1811,6 +1943,7 @@ def main() -> None:
         print("\nShutting down...")
         if cap is not None:
             cap.release()
+        stop_frame_writer()
         with ffmpeg_lock:
             if ffmpeg_record_proc is not None:
                 stop_ffmpeg(ffmpeg_record_proc)
@@ -1819,6 +1952,7 @@ def main() -> None:
                 stop_ffmpeg(ffmpeg_rtsp_proc)
                 ffmpeg_rtsp_proc = None
             expected_frame_size = None
+        acc.close()
         cv2.destroyAllWindows()
         print("Cleanup complete.")
 

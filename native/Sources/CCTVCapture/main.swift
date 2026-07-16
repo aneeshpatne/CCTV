@@ -277,7 +277,18 @@ final class FramePipeline: @unchecked Sendable {
                     )
                 ))
             }
-            try? await Task.sleep(for: .milliseconds(20))
+            let healthDueIn = max(0.005, 10 - wallClock.timeIntervalSince(lastHealth))
+            let sleepSeconds: TimeInterval
+            if snapshot.lastFrameAge >= 3 {
+                let keepaliveDueIn = max(0.005, nextKeepaliveAt - monotonicNow)
+                let renderDueIn = max(0.005, 1 - wallClock.timeIntervalSince(noSignalRenderedAt))
+                sleepSeconds = min(keepaliveDueIn, renderDueIn, healthDueIn)
+            } else {
+                // Frame processing runs independently and does not require polling here.
+                // Wake at the next health report or the exact stalled-stream deadline.
+                sleepSeconds = min(max(0.005, 3 - snapshot.lastFrameAge), healthDueIn)
+            }
+            try? await Task.sleep(for: .milliseconds(Int(sleepSeconds * 1_000)))
         }
 
         frameTask.cancel()

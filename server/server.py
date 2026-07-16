@@ -5,17 +5,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timedelta
 from pathlib import Path
+from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+import atexit
 import os
 import socket
 import subprocess
-import tempfile
 import hashlib
+import threading
+import uuid
 
 from utilities.motion_db_new import (
     get_motion_events_by_hours,
     get_motion_events_by_date,
     get_motion_events_by_range,
-    get_total_motion_count,
+    get_motion_counts,
     get_motion_event_stats_per_hour,
     get_motion_event_stats_per_hour_last_month,
     get_motion_annotations,
@@ -71,12 +75,56 @@ NIGHT_EVENTS_FOLDER = resolve_path(
     Path("/Volumes/drive/CCTV/motion/data"),
 )
 RECORDING_CATALOG = RecordingCatalog(CCTV_FOLDER)
-RECORDING_CATALOG.reconcile(force=True)
+RECORDING_CATALOG.start_background_reconcile()
+atexit.register(RECORDING_CATALOG.stop_background_reconcile)
 
 # Create temp folder if it doesn't exist
 TEMP_FOLDER.mkdir(parents=True, exist_ok=True)
 
+_generation_guard = threading.Lock()
+_generation_locks: dict[Path, tuple[threading.Lock, int]] = {}
+
 app.mount("/static", StaticFiles(directory=STATIC_FOLDER), name="static")
+
+
+@contextmanager
+def generation_lock(path: Path) -> Iterator[None]:
+    """Coalesce concurrent requests that generate the same cached media file."""
+    canonical = path.resolve()
+    with _generation_guard:
+        lock, users = _generation_locks.get(canonical, (threading.Lock(), 0))
+        _generation_locks[canonical] = (lock, users + 1)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _generation_guard:
+            current_lock, current_users = _generation_locks[canonical]
+            if current_users == 1:
+                del _generation_locks[canonical]
+            else:
+                _generation_locks[canonical] = (current_lock, current_users - 1)
+
+
+def generate_cached_media(
+    output_path: Path,
+    generator: Callable[[Path], bool | None],
+) -> None:
+    """Generate once into a temporary file and publish it atomically."""
+    with generation_lock(output_path):
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return
+        temporary = output_path.with_name(
+            f".{output_path.stem}.{uuid.uuid4().hex}.tmp{output_path.suffix}"
+        )
+        try:
+            result = generator(temporary)
+            if result is False or not temporary.exists() or temporary.stat().st_size == 0:
+                raise HTTPException(status_code=500, detail="Failed to generate video")
+            os.replace(temporary, output_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def redis_command(*parts: str) -> str | None:
@@ -163,33 +211,34 @@ async def dashboard():
 
 
 @app.get("/api")
-async def root():
+def root():
     """Server information and available endpoints."""
     return get_server_info()
 
 
 @app.get("/api/dashboard")
-async def dashboard_data(hours: int = 24):
+def dashboard_data(hours: int = 24):
     if hours <= 0 or hours > 168:
         raise HTTPException(status_code=400, detail="hours must be between 1 and 168")
 
     try:
         events = get_motion_events_by_hours(hours)
-        recordings = RECORDING_CATALOG.all(descending=True)
+        recordings = RECORDING_CATALOG.summary()
+        latest = recordings.latest
         return {
             "live_stream_url": LIVE_STREAM_URL,
             "generated_at": datetime.now().isoformat(),
             "hours": hours,
             "motion_count": len(events),
             "events": serialize_motion_events(events),
-            "recordings_count": len(recordings),
+            "recordings_count": recordings.count,
             "latest_recording": (
                 {
-                    "filename": recordings[0].path.name,
-                    "timestamp": recordings[0].start_time.isoformat(),
-                    "duration": recordings[0].duration,
+                    "filename": latest.path.name,
+                    "timestamp": latest.start_time.isoformat(),
+                    "duration": latest.duration,
                 }
-                if recordings
+                if latest
                 else None
             ),
         }
@@ -200,21 +249,21 @@ async def dashboard_data(hours: int = 24):
 
 
 @app.get("/health")
-async def health():
-    recordings = RECORDING_CATALOG.all(descending=True)
+def health():
+    recordings = RECORDING_CATALOG.summary()
     return {
         "status": "ok",
         "timestamp": datetime.now().isoformat(),
-        "recordings_available": len(recordings),
+        "recordings_available": recordings.count,
         "latest_recording_at": (
-            recordings[0].start_time.isoformat() if recordings else None
+            recordings.latest.start_time.isoformat() if recordings.latest else None
         ),
         "live_stream_url": LIVE_STREAM_URL,
     }
 
 
 @app.get("/esp32cam/recovery")
-async def get_esp32cam_recovery():
+def get_esp32cam_recovery():
     try:
         value = redis_command("GET", ESP32CAM_RECOVERY_REDIS_KEY)
     except Exception as e:
@@ -245,6 +294,10 @@ def merge_videos(video_files: list[Path], output_path: Path) -> bool:
         # Use ffmpeg to concatenate videos
         cmd = [
             "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
             "-f",
             "concat",
             "-safe",
@@ -284,29 +337,9 @@ def cleanup_old_merged_videos():
                     pass
 
 
-def get_sorted_recordings() -> list[tuple[datetime, Path]]:
-    """Return recordings sorted by timestamp parsed from recording_YYYYMMDD_HHMMSS.mp4."""
-    return [
-        (recording.start_time, recording.path)
-        for recording in RECORDING_CATALOG.all()
-    ]
-
-
-def recording_ranges(
-    recordings: list[tuple[datetime, Path]],
-) -> list[tuple[datetime, datetime, Path]]:
-    """Infer each recording's coverage from its timestamp and the next segment start."""
-    ranges = []
-    for index, (file_dt, file) in enumerate(recordings):
-        if index + 1 < len(recordings):
-            next_dt = recordings[index + 1][0]
-        else:
-            next_dt = file_dt + timedelta(seconds=60)
-        ranges.append((file_dt, next_dt, file))
-    return ranges
-
-
 def run_ffmpeg(cmd: list[str], detail: str) -> None:
+    if cmd and Path(cmd[0]).name == "ffmpeg" and "-loglevel" not in cmd:
+        cmd = [cmd[0], "-hide_banner", "-nostats", "-loglevel", "error", *cmd[1:]]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         message = result.stderr.strip() or detail
@@ -324,7 +357,11 @@ def inline_video_response(path: Path, filename: str | None = None) -> FileRespon
 
 
 def trim_video_accurate(
-    input_path: Path, output_path: Path, offset_seconds: float, duration_seconds: float
+    input_path: Path,
+    output_path: Path,
+    offset_seconds: float,
+    duration_seconds: float,
+    video_bps: int = 1_200_000,
 ) -> None:
     """Trim with re-encoding so clips do not start after the requested motion time."""
     cmd = [
@@ -342,11 +379,11 @@ def trim_video_accurate(
         "-realtime",
         "0",
         "-b:v",
-        "1200k",
+        str(video_bps),
         "-maxrate",
-        "1500k",
+        str(max(100_000, int(video_bps * 1.25))),
         "-bufsize",
-        "2400k",
+        str(max(200_000, video_bps * 2)),
         "-pix_fmt",
         "yuv420p",
         "-an",
@@ -358,31 +395,57 @@ def trim_video_accurate(
     run_ffmpeg(cmd, "Failed to trim video")
 
 
-def concat_recordings(video_files: list[Path], output_path: Path) -> None:
+def trim_concatenated_recordings(
+    video_files: list[Path],
+    output_path: Path,
+    offset_seconds: float,
+    duration_seconds: float,
+    video_bps: int = 1_200_000,
+) -> None:
+    """Concat and accurately trim in one FFmpeg process without an intermediate MP4."""
     list_file = output_path.parent / f"{output_path.stem}_list.txt"
     try:
-        with open(list_file, "w") as f:
+        with open(list_file, "w") as stream:
             for video in video_files:
                 escaped = str(video).replace("'", "'\\''")
-                f.write(f"file '{escaped}'\n")
-
-        cmd = [
-            "ffmpeg",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-c",
-            "copy",
-            "-y",
-            str(output_path),
-        ]
-        run_ffmpeg(cmd, "Failed to concatenate videos")
+                stream.write(f"file '{escaped}'\n")
+        run_ffmpeg(
+            [
+                "ffmpeg",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_file),
+                "-ss",
+                f"{max(0, offset_seconds):.3f}",
+                "-t",
+                f"{max(0.1, duration_seconds):.3f}",
+                "-c:v",
+                "h264_videotoolbox",
+                "-allow_sw",
+                "0",
+                "-realtime",
+                "0",
+                "-b:v",
+                str(video_bps),
+                "-maxrate",
+                str(max(100_000, int(video_bps * 1.25))),
+                "-bufsize",
+                str(max(200_000, video_bps * 2)),
+                "-pix_fmt",
+                "yuv420p",
+                "-an",
+                "-movflags",
+                "+faststart",
+                "-y",
+                str(output_path),
+            ],
+            "Failed to concatenate and trim video",
+        )
     finally:
-        if list_file.exists():
-            list_file.unlink()
+        list_file.unlink(missing_ok=True)
 
 
 def get_event_clip(
@@ -391,19 +454,11 @@ def get_event_clip(
     merged_path: Path,
     pre_seconds: float,
     post_seconds: float,
+    max_bytes: int | None = None,
 ) -> None:
-    recordings = get_sorted_recordings()
-    if not recordings:
-        raise HTTPException(status_code=404, detail="No videos found")
-
     clip_start = start_dt - timedelta(seconds=max(0, pre_seconds))
     clip_end = end_dt + timedelta(seconds=max(0, post_seconds))
-
-    selected = [
-        (range_start, range_end, file)
-        for range_start, range_end, file in recording_ranges(recordings)
-        if range_start < clip_end and range_end > clip_start
-    ]
+    selected = RECORDING_CATALOG.overlapping(clip_start, clip_end)
 
     if not selected:
         raise HTTPException(
@@ -411,21 +466,53 @@ def get_event_clip(
             detail=f"No video overlaps event window {clip_start.isoformat()} to {clip_end.isoformat()}",
         )
 
-    first_file_dt = selected[0][0]
+    first_file_dt = selected[0].start_time
     ss_offset = max(0, (clip_start - first_file_dt).total_seconds())
     duration = (clip_end - clip_start).total_seconds()
+    video_bps = 1_200_000
+    if max_bytes is not None:
+        video_bps = max(
+            80_000,
+            min(video_bps, int((max_bytes * 0.92 * 8) / max(0.1, duration))),
+        )
 
     if len(selected) == 1:
-        trim_video_accurate(selected[0][2], merged_path, ss_offset, duration)
+        trim_video_accurate(
+            selected[0].path, merged_path, ss_offset, duration, video_bps
+        )
         return
+    trim_concatenated_recordings(
+        [item.path for item in selected], merged_path, ss_offset, duration, video_bps
+    )
 
-    concat_path = merged_path.with_name(f"{merged_path.stem}_concat.mp4")
-    try:
-        concat_recordings([item[2] for item in selected], concat_path)
-        trim_video_accurate(concat_path, merged_path, ss_offset, duration)
-    finally:
-        if concat_path.exists():
-            concat_path.unlink()
+
+def ensure_merged_video(video_files: list[Path], output_path: Path) -> None:
+    generate_cached_media(output_path, lambda temporary: merge_videos(video_files, temporary))
+
+
+def ensure_event_clip(
+    start_dt: datetime,
+    end_dt: datetime,
+    output_path: Path,
+    pre_seconds: float,
+    post_seconds: float,
+    max_bytes: int | None = None,
+) -> None:
+    generate_cached_media(
+        output_path,
+        lambda temporary: get_event_clip(
+            start_dt, end_dt, temporary, pre_seconds, post_seconds, max_bytes
+        ),
+    )
+
+
+def media_source_tag(video_files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in video_files:
+        stat = path.stat()
+        digest.update(path.name.encode())
+        digest.update(f":{stat.st_mtime_ns}:{stat.st_size};".encode())
+    return digest.hexdigest()[:12]
 
 
 def parse_datetime_param(value: str) -> datetime:
@@ -483,47 +570,24 @@ async def get_video_by_duration(
             dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except:
             dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        dt = normalize_for_recording_time(dt)
 
         # Calculate time range
         start_time = dt
         end_time = dt + timedelta(minutes=minutes)
 
-        # Get all videos so we can handle timestamps with seconds
-        all_videos = get_sorted_recordings()
-
-        if not all_videos:
+        recordings = await run_in_threadpool(
+            RECORDING_CATALOG.range_with_neighbors,
+            start_time,
+            end_time,
+            before=2,
+            after=1,
+        )
+        if not recordings:
             raise HTTPException(
                 status_code=404, detail="No videos found in the recordings folder"
             )
-
-        all_videos.sort(key=lambda x: x[0])
-
-        start_idx = None
-        end_idx = None
-
-        for i, (file_dt, file) in enumerate(all_videos):
-            if start_idx is None and file_dt >= start_time:
-                start_idx = max(0, i - 1)
-            if file_dt > end_time:
-                end_idx = max(0, i - 1)
-                break
-
-        if start_idx is None:
-            start_idx = len(all_videos) - 1
-        if end_idx is None:
-            end_idx = len(all_videos) - 1
-
-        # Include 1 video before and after the range
-        start_idx = max(0, start_idx - 1)
-        end_idx = min(len(all_videos) - 1, end_idx + 1)
-
-        if start_idx > end_idx:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No videos found for period: {start_time.strftime('%Y-%m-%d %H:%M:%S')} to {end_time.strftime('%Y-%m-%d %H:%M:%S')}",
-            )
-
-        videos_to_merge = [all_videos[i][1] for i in range(start_idx, end_idx + 1)]
+        videos_to_merge = [recording.path for recording in recordings]
 
         # If only one video, return it directly
         if len(videos_to_merge) == 1:
@@ -539,10 +603,7 @@ async def get_video_by_duration(
         merged_path = Path(TEMP_FOLDER) / merged_filename
 
         # Check if merged video already exists
-        if not merged_path.exists():
-            # Merge videos
-            if not await run_in_threadpool(merge_videos, videos_to_merge, merged_path):
-                raise HTTPException(status_code=500, detail="Failed to merge videos")
+        await run_in_threadpool(ensure_merged_video, videos_to_merge, merged_path)
 
         # Schedule cleanup of old merged videos
         background_tasks.add_task(cleanup_old_merged_videos)
@@ -563,6 +624,7 @@ async def get_video_by_event(
     background_tasks: BackgroundTasks,
     pre_seconds: float = 10,
     post_seconds: float = 10,
+    max_bytes: int | None = None,
 ):
     """
     Get video trimmed around a motion event.
@@ -582,23 +644,28 @@ async def get_video_by_event(
 
         if start_dt >= end_dt:
             raise HTTPException(status_code=400, detail="start must be before end")
+        if max_bytes is not None and not 1_000_000 <= max_bytes <= 100_000_000:
+            raise HTTPException(
+                status_code=400,
+                detail="max_bytes must be between 1000000 and 100000000",
+            )
 
         # Build a unique cache filename
         tag = hashlib.md5(
-            f"{start}_{end}_{pre_seconds}_{post_seconds}".encode()
+            f"{start}_{end}_{pre_seconds}_{post_seconds}_{max_bytes}".encode()
         ).hexdigest()[:10]
         merged_filename = f"event_{tag}.mp4"
         merged_path = Path(TEMP_FOLDER) / merged_filename
 
-        if not merged_path.exists():
-            await run_in_threadpool(
-                get_event_clip,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                merged_path=merged_path,
-                pre_seconds=pre_seconds,
-                post_seconds=post_seconds,
-            )
+        await run_in_threadpool(
+            ensure_event_clip,
+            start_dt,
+            end_dt,
+            merged_path,
+            pre_seconds,
+            post_seconds,
+            max_bytes,
+        )
 
         background_tasks.add_task(cleanup_old_merged_videos)
 
@@ -631,13 +698,14 @@ async def get_video_by_hour(timestamp: str, background_tasks: BackgroundTasks):
             dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except:
             dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        dt = normalize_for_recording_time(dt)
 
         # Get hour range
         start_time = dt.replace(minute=0, second=0, microsecond=0)
         end_time = start_time + timedelta(hours=1) - timedelta(seconds=1)
 
         # Find videos in this hour
-        videos = find_videos_in_range(start_time, end_time)
+        videos = await run_in_threadpool(find_videos_in_range, start_time, end_time)
 
         if not videos:
             raise HTTPException(
@@ -657,10 +725,7 @@ async def get_video_by_hour(timestamp: str, background_tasks: BackgroundTasks):
         merged_path = Path(TEMP_FOLDER) / merged_filename
 
         # Check if merged video already exists
-        if not merged_path.exists():
-            # Merge videos
-            if not await run_in_threadpool(merge_videos, videos, merged_path):
-                raise HTTPException(status_code=500, detail="Failed to merge videos")
+        await run_in_threadpool(ensure_merged_video, videos, merged_path)
 
         # Schedule cleanup of old merged videos
         background_tasks.add_task(cleanup_old_merged_videos)
@@ -694,13 +759,14 @@ async def get_video_by_day(timestamp: str, background_tasks: BackgroundTasks):
             dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except:
             dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        dt = normalize_for_recording_time(dt)
 
         # Get day range
         start_time = dt.replace(hour=0, minute=0, second=0, microsecond=0)
         end_time = start_time + timedelta(days=1) - timedelta(seconds=1)
 
         # Find videos in this day
-        videos = find_videos_in_range(start_time, end_time)
+        videos = await run_in_threadpool(find_videos_in_range, start_time, end_time)
 
         if not videos:
             raise HTTPException(
@@ -720,10 +786,7 @@ async def get_video_by_day(timestamp: str, background_tasks: BackgroundTasks):
         merged_path = Path(TEMP_FOLDER) / merged_filename
 
         # Check if merged video already exists
-        if not merged_path.exists():
-            # Merge videos
-            if not await run_in_threadpool(merge_videos, videos, merged_path):
-                raise HTTPException(status_code=500, detail="Failed to merge videos")
+        await run_in_threadpool(ensure_merged_video, videos, merged_path)
 
         # Schedule cleanup of old merged videos
         background_tasks.add_task(cleanup_old_merged_videos)
@@ -761,11 +824,14 @@ async def get_last_videos(minutes: int, background_tasks: BackgroundTasks):
         end_time = datetime.now()
         start_time = end_time - timedelta(minutes=minutes)
 
+        recordings = await run_in_threadpool(
+            RECORDING_CATALOG.overlapping,
+            start_time - timedelta(minutes=10),
+            end_time,
+        )
         videos = [
             (recording.start_time, recording.path)
-            for recording in RECORDING_CATALOG.overlapping(
-                start_time - timedelta(minutes=10), end_time
-            )
+            for recording in recordings
         ]
 
         if not videos:
@@ -787,13 +853,11 @@ async def get_last_videos(minutes: int, background_tasks: BackgroundTasks):
             )
 
         # Generate unique filename for merged video
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        merged_filename = f"merged_last_{minutes}min_{timestamp_str}.mp4"
+        source_tag = await run_in_threadpool(media_source_tag, video_files)
+        merged_filename = f"merged_last_{minutes}min_{source_tag}.mp4"
         merged_path = Path(TEMP_FOLDER) / merged_filename
 
-        # Merge videos
-        if not await run_in_threadpool(merge_videos, video_files, merged_path):
-            raise HTTPException(status_code=500, detail="Failed to merge videos")
+        await run_in_threadpool(ensure_merged_video, video_files, merged_path)
 
         # Schedule cleanup of old merged videos
         background_tasks.add_task(cleanup_old_merged_videos)
@@ -802,6 +866,8 @@ async def get_last_videos(minutes: int, background_tasks: BackgroundTasks):
             path=str(merged_path), media_type="video/mp4", filename=merged_filename
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -827,40 +893,14 @@ async def get_video_by_timestamp(timestamp: str, background_tasks: BackgroundTas
         except:
             # Try parsing custom format
             dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        dt = normalize_for_recording_time(dt)
 
-        # Get all videos
-        all_videos = get_sorted_recordings()
-
-        if not all_videos:
+        recordings = await run_in_threadpool(RECORDING_CATALOG.around, dt)
+        if not recordings:
             raise HTTPException(
                 status_code=404, detail="No videos found in the recordings folder"
             )
-
-        # Sort by timestamp
-        all_videos.sort(key=lambda x: x[0])
-
-        # Find the video that would contain this timestamp
-        # This is the video that starts at or before the requested time
-        # and the next video starts after the requested time (or it's the last video)
-        target_index = None
-
-        for i, (file_dt, file) in enumerate(all_videos):
-            # If this video starts after our timestamp, the previous one contains it
-            if file_dt > dt:
-                target_index = max(0, i - 1)
-                break
-
-        # If we didn't find a video starting after, the last video contains it
-        if target_index is None:
-            target_index = len(all_videos) - 1
-
-        # Get videos: 1 before, target, 1 after
-        videos_to_merge = []
-        start_idx = max(0, target_index - 1)
-        end_idx = min(len(all_videos), target_index + 2)
-
-        for i in range(start_idx, end_idx):
-            videos_to_merge.append(all_videos[i][1])
+        videos_to_merge = [recording.path for recording in recordings]
 
         # If only one video, return it directly
         if len(videos_to_merge) == 1:
@@ -876,10 +916,7 @@ async def get_video_by_timestamp(timestamp: str, background_tasks: BackgroundTas
         merged_path = Path(TEMP_FOLDER) / merged_filename
 
         # Check if merged video already exists
-        if not merged_path.exists():
-            # Merge videos
-            if not await run_in_threadpool(merge_videos, videos_to_merge, merged_path):
-                raise HTTPException(status_code=500, detail="Failed to merge videos")
+        await run_in_threadpool(ensure_merged_video, videos_to_merge, merged_path)
 
         # Schedule cleanup of old merged videos
         background_tasks.add_task(cleanup_old_merged_videos)
@@ -896,7 +933,7 @@ async def get_video_by_timestamp(timestamp: str, background_tasks: BackgroundTas
 
 
 @app.get("/video/stream/{filename}")
-async def stream_video(filename: str):
+def stream_video(filename: str):
     """
     Stream video by exact filename.
 
@@ -915,11 +952,15 @@ async def stream_video(filename: str):
 
 
 @app.get("/video/list")
-async def list_videos():
+def list_videos(limit: int | None = None, offset: int = 0):
     """
     List all available video recordings with their timestamps.
     """
     try:
+        if limit is not None and not 1 <= limit <= 5000:
+            raise HTTPException(status_code=400, detail="limit must be between 1 and 5000")
+        if offset < 0:
+            raise HTTPException(status_code=400, detail="offset must be >= 0")
         videos = [
             {
                 "filename": recording.path.name,
@@ -928,10 +969,21 @@ async def list_videos():
                 "codec": recording.codec,
                 "duration": recording.duration,
             }
-            for recording in RECORDING_CATALOG.all(descending=True)
+            for recording in RECORDING_CATALOG.all(
+                descending=True,
+                limit=limit,
+                offset=offset,
+            )
         ]
-        return {"videos": videos, "count": len(videos)}
+        return {
+            "videos": videos,
+            "count": len(videos),
+            "total": RECORDING_CATALOG.summary().count,
+            "offset": offset,
+        }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -947,7 +999,7 @@ def serialize_motion_events(events) -> list[dict]:
 
 
 @app.get("/motion/logs")
-async def get_motion_logs(hours: int = 24):
+def get_motion_logs(hours: int = 24):
     """
     Get motion detection events from the last N hours.
 
@@ -972,7 +1024,7 @@ async def get_motion_logs(hours: int = 24):
 
 
 @app.get("/motion/day")
-async def get_motion_by_day(date: str):
+def get_motion_by_day(date: str):
     """
     Get motion detection events for a specific day.
 
@@ -1002,7 +1054,7 @@ async def get_motion_by_day(date: str):
 
 
 @app.get("/motion/range")
-async def get_motion_by_range(start: str, end: str):
+def get_motion_by_range(start: str, end: str):
     """
     Get motion detection events within a specific time range.
 
@@ -1048,7 +1100,7 @@ async def get_motion_by_range(start: str, end: str):
 
 
 @app.get("/motion/stats")
-async def get_motion_stats():
+def get_motion_stats():
     """
     Get overall motion detection statistics.
 
@@ -1056,25 +1108,13 @@ async def get_motion_stats():
         /motion/stats
     """
     try:
-        total = get_total_motion_count()
-
-        # Get counts for different time periods
-        last_hour = len(get_motion_events_by_hours(1))
-        last_12_hours = len(get_motion_events_by_hours(12))
-        last_24_hours = len(get_motion_events_by_hours(24))
-
-        return {
-            "total_events": total,
-            "last_hour": last_hour,
-            "last_12_hours": last_12_hours,
-            "last_24_hours": last_24_hours,
-        }
+        return get_motion_counts()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/motion/stats/hourly")
-async def get_motion_stats_hourly(days: int = 30):
+def get_motion_stats_hourly(days: int = 30):
     """
     Get motion event counts by hour-of-day (00-23) for the last N days.
 
@@ -1096,7 +1136,7 @@ async def get_motion_stats_hourly(days: int = 30):
 
 
 @app.get("/motion/stats/hourly-last-month")
-async def get_motion_stats_hourly_last_month():
+def get_motion_stats_hourly_last_month():
     """
     Get motion event counts for every hourly bucket over the last 30 days.
 
@@ -1119,7 +1159,7 @@ async def get_motion_stats_hourly_last_month():
 
 
 @app.get("/nightevents")
-async def get_night_events():
+def get_night_events():
     """
     Get all night event videos.
     Returns list of videos from the motion/data folder.
@@ -1156,7 +1196,7 @@ async def get_night_events():
 
 
 @app.get("/nightevents/{index}")
-async def get_night_event_by_index(index: int):
+def get_night_event_by_index(index: int):
     """
     Get a specific night event video by its index (1-based).
 
