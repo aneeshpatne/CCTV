@@ -106,10 +106,9 @@ def run_recovery_mode() -> bool:
     return False
 
 
-def startup(target_framesize: int = 12):
+def startup():
     global count
-    if target_framesize not in {11, 12}:
-        raise ValueError(f"Unsupported target framesize: {target_framesize}")
+    target_framesize = 12
 
     consecutive_connection_failures = 0
     while True:
