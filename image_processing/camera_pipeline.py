@@ -15,6 +15,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 )
 
 import threading
+import queue
 import time
 import signal
 import subprocess
@@ -287,6 +288,10 @@ MAX_RECORD_FRAME_DUPLICATES = 30
 FFMPEG_RESTART_COOLDOWN_SECONDS = 5.0
 last_record_restart_attempt: Optional[float] = None
 last_rtsp_restart_attempt: Optional[float] = None
+_frame_write_queue: queue.Queue[object] = queue.Queue(maxsize=1)
+_frame_writer_thread: Optional[threading.Thread] = None
+_frame_writer_guard = threading.Lock()
+_FRAME_WRITER_STOP = object()
 
 
 def _using_videotoolbox() -> bool:
@@ -508,14 +513,13 @@ def stop_ffmpeg(proc: Optional[subprocess.Popen]) -> None:
             pass
 
 
-def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
+def _write_frame_to_ffmpeg_sync(frame: np.ndarray) -> bool:
     """Push a frame into the recording/RTSP FFmpeg pipelines, restarting them when needed."""
     global ffmpeg_record_proc, ffmpeg_rtsp_proc, expected_frame_size, current_fps, last_record_write_time
     global last_record_restart_attempt, last_rtsp_restart_attempt
 
     if not ENABLE_RECORDING and not ENABLE_RTSP:
         return True
-
     with ffmpeg_lock:
         h, w = frame.shape[:2]
         new_size = (w, h)
@@ -610,7 +614,9 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
         if (w, h) != expected_frame_size:
             frame = cv2.resize(frame, expected_frame_size)
 
-        frame_bytes = frame.tobytes()
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
+        frame_bytes = memoryview(frame).cast("B")
 
         def _record_frame_copies() -> int:
             global last_record_write_time
@@ -657,6 +663,75 @@ def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
             ffmpeg_rtsp_proc = _write(ffmpeg_rtsp_proc, "rtsp", start_ffmpeg_rtsp)
 
         return True
+
+
+def _frame_writer_loop() -> None:
+    while True:
+        item = _frame_write_queue.get()
+        try:
+            if item is _FRAME_WRITER_STOP:
+                return
+            _write_frame_to_ffmpeg_sync(item)  # type: ignore[arg-type]
+        finally:
+            _frame_write_queue.task_done()
+
+
+def _ensure_frame_writer() -> None:
+    global _frame_writer_thread
+    with _frame_writer_guard:
+        if _frame_writer_thread is not None and _frame_writer_thread.is_alive():
+            return
+        _frame_writer_thread = threading.Thread(
+            target=_frame_writer_loop,
+            name="ffmpeg-frame-writer",
+            daemon=True,
+        )
+        _frame_writer_thread.start()
+
+
+def write_frame_to_ffmpeg(frame: np.ndarray) -> bool:
+    """Queue only the newest frame so a slow encoder cannot stall capture."""
+    _ensure_frame_writer()
+    try:
+        _frame_write_queue.put_nowait(frame)
+    except queue.Full:
+        try:
+            _frame_write_queue.get_nowait()
+            _frame_write_queue.task_done()
+        except queue.Empty:
+            pass
+        _frame_write_queue.put_nowait(frame)
+    return True
+
+
+def stop_frame_writer() -> None:
+    global _frame_writer_thread
+    with _frame_writer_guard:
+        thread = _frame_writer_thread
+        _frame_writer_thread = None
+    if thread is None:
+        return
+    try:
+        pending = _frame_write_queue.get_nowait()
+        _frame_write_queue.task_done()
+        del pending
+    except queue.Empty:
+        pass
+    try:
+        _frame_write_queue.put_nowait(_FRAME_WRITER_STOP)
+    except queue.Full:
+        return
+    thread.join(timeout=3)
+    if thread.is_alive():
+        # Closing the write ends is the only reliable way to release a pipe write
+        # blocked behind an unhealthy FFmpeg process during shutdown.
+        for proc in (ffmpeg_record_proc, ffmpeg_rtsp_proc):
+            try:
+                if proc is not None and proc.stdin is not None:
+                    proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        thread.join(timeout=3)
 
 
 def set_device_state(state: str, detail: str = "") -> None:
@@ -1811,6 +1886,7 @@ def main() -> None:
         print("\nShutting down...")
         if cap is not None:
             cap.release()
+        stop_frame_writer()
         with ffmpeg_lock:
             if ffmpeg_record_proc is not None:
                 stop_ffmpeg(ffmpeg_record_proc)
