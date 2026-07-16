@@ -227,10 +227,9 @@ actor MotionDetector {
         )
     }
 
-    /// Estimate full-frame BT.709 luma before the HUD is drawn. Sampling the existing
-    /// analysis buffer avoids another Core Image render while remaining stable enough
-    /// for the long resolution-control window.
-    nonisolated private static func averageBrightness(_ buffer: CVPixelBuffer) -> Double? {
+    /// Estimate BT.709 luma before the HUD is drawn, excluding clipped shadows and
+    /// highlights so unavoidable clipping does not dominate exposure correction.
+    nonisolated static func averageBrightness(_ buffer: CVPixelBuffer) -> Double? {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
@@ -240,8 +239,10 @@ actor MotionDetector {
         let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
         let bytes = base.assumingMemoryBound(to: UInt8.self)
         let sampleStep = 4
-        var luminance = 0.0
-        var sampleCount = 0
+        var usableLuminance = 0.0
+        var usableCount = 0
+        var allLuminance = 0.0
+        var allCount = 0
 
         for y in stride(from: 0, to: height, by: sampleStep) {
             for x in stride(from: 0, to: width, by: sampleStep) {
@@ -249,12 +250,20 @@ actor MotionDetector {
                 let blue = Double(bytes[offset])
                 let green = Double(bytes[offset + 1])
                 let red = Double(bytes[offset + 2])
-                luminance += 0.2126 * red + 0.7152 * green + 0.0722 * blue
-                sampleCount += 1
+                let value = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+                allLuminance += value
+                allCount += 1
+                if value > 7 && value < 248 {
+                    usableLuminance += value
+                    usableCount += 1
+                }
             }
         }
-        guard sampleCount > 0 else { return nil }
-        return luminance / (Double(sampleCount) * 255)
+        guard allCount > 0 else { return nil }
+        if usableCount > 0 {
+            return usableLuminance / (Double(usableCount) * 255)
+        }
+        return allLuminance / (Double(allCount) * 255)
     }
 
     nonisolated private static func estimate(

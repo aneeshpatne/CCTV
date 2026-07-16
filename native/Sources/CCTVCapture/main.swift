@@ -182,16 +182,18 @@ final class FramePipeline: @unchecked Sendable {
     private let motionDetector: MotionDetector
     private let semanticClassifier = SemanticClassifier()
     private let accumulator = MotionEventAccumulator(cooldown: 15)
+    private let ledBlinker: CameraLEDBlinker
     private let telemetry: CameraTelemetry
     private let output: FrameOutput
     private let runtime = PipelineRuntimeState()
-    private var wasMotionActive = false
+    private var motionActivity = MotionActivityGuard(holdDuration: 10)
 
     init(configuration: PipelineConfiguration) throws {
         self.configuration = configuration
         self.emitter = EventEmitter(fileDescriptor: configuration.eventFileDescriptor)
         self.renderer = HUDRenderer()
         self.motionDetector = try MotionDetector(context: renderer.context)
+        self.ledBlinker = CameraLEDBlinker(baseURL: configuration.cameraBaseURL, duration: 10)
         self.telemetry = CameraTelemetry(baseURL: configuration.cameraBaseURL)
         self.output = try FrameOutput(configuration: configuration, emitter: emitter)
     }
@@ -217,6 +219,7 @@ final class FramePipeline: @unchecked Sendable {
         var noSignalRenderedAt = Date.distantPast
         var nextKeepaliveAt = ProcessInfo.processInfo.systemUptime
         var lastHealth = Date.distantPast
+        var lastImageMetrics = Date.distantPast
         let keepaliveInterval = 1 / configuration.targetFPS
 
         while !Task.isCancelled {
@@ -229,13 +232,14 @@ final class FramePipeline: @unchecked Sendable {
                     client.reconnectStalledStream(reason: "no JPEG received for 3 seconds")
                 }
                 if noSignalFrame == nil || wallClock.timeIntervalSince(noSignalRenderedAt) >= 1 {
-                    let (rssi, temperature) = await telemetry.snapshot()
+                    let (rssi, temperature, cameraSettings) = await telemetry.snapshot()
                     noSignalFrame = renderer.renderNoSignal(
                         status: HUDStatus(
                             fps: 0,
                             rssi: rssi,
                             temperature: temperature,
-                            message: "NO SIGNAL · RECONNECTING"
+                            message: "NO SIGNAL · RECONNECTING",
+                            cameraSettings: cameraSettings
                         ),
                         now: wallClock
                     )
@@ -277,16 +281,31 @@ final class FramePipeline: @unchecked Sendable {
                     )
                 ))
             }
+            if wallClock.timeIntervalSince(lastImageMetrics) >= 2 {
+                lastImageMetrics = wallClock
+                let signalAvailable = snapshot.lastFrameAge < 3
+                emitter.emit(WorkerEvent(
+                    type: "image.metrics",
+                    payload: .imageMetrics(
+                        sceneBrightness: signalAvailable ? snapshot.sceneBrightness : nil
+                    )
+                ))
+            }
             let healthDueIn = max(0.005, 10 - wallClock.timeIntervalSince(lastHealth))
+            let imageMetricsDueIn = max(0.005, 2 - wallClock.timeIntervalSince(lastImageMetrics))
             let sleepSeconds: TimeInterval
             if snapshot.lastFrameAge >= 3 {
                 let keepaliveDueIn = max(0.005, nextKeepaliveAt - monotonicNow)
                 let renderDueIn = max(0.005, 1 - wallClock.timeIntervalSince(noSignalRenderedAt))
-                sleepSeconds = min(keepaliveDueIn, renderDueIn, healthDueIn)
+                sleepSeconds = min(keepaliveDueIn, renderDueIn, healthDueIn, imageMetricsDueIn)
             } else {
                 // Frame processing runs independently and does not require polling here.
                 // Wake at the next health report or the exact stalled-stream deadline.
-                sleepSeconds = min(max(0.005, 3 - snapshot.lastFrameAge), healthDueIn)
+                sleepSeconds = min(
+                    max(0.005, 3 - snapshot.lastFrameAge),
+                    healthDueIn,
+                    imageMetricsDueIn
+                )
             }
             try? await Task.sleep(for: .milliseconds(Int(sleepSeconds * 1_000)))
         }
@@ -302,6 +321,13 @@ final class FramePipeline: @unchecked Sendable {
         guard let source = renderer.decodeJPEG(frame.data) else { return }
 
         let motion = await motionDetector.analyze(source)
+        let motionState = motionActivity.update(
+            candidate: motion.candidate,
+            at: frame.monotonicTime
+        )
+        if motionState.started {
+            await ledBlinker.start()
+        }
         let hudBrightness = await runtime.recordBrightness(motion.sceneBrightness)
         let labels = semanticClassifier.labels(
             for: source,
@@ -318,23 +344,21 @@ final class FramePipeline: @unchecked Sendable {
         ) {
             emitter.emit(event)
         }
-        if motion.candidate && !wasMotionActive { blinkCameraLED() }
-        wasMotionActive = motion.candidate
-
         let measuredFPS = await runtime.recordProcessed(
             at: ProcessInfo.processInfo.systemUptime,
             motionScore: motion.score
         )
-        let (rssi, temperature) = await telemetry.snapshot()
+        let (rssi, temperature, cameraSettings) = await telemetry.snapshot()
         let status = HUDStatus(
             fps: measuredFPS,
             rssi: rssi,
             temperature: temperature,
             sceneBrightness: hudBrightness,
-            motion: motion.candidate,
+            motion: motionState.active,
             labels: labels,
             motionBox: motion.boundingBox,
-            message: nil
+            message: nil,
+            cameraSettings: cameraSettings
         )
         if let rendered = renderer.render(source, status: status, now: frame.receivedAt) {
             try? await output.append(
@@ -347,16 +371,6 @@ final class FramePipeline: @unchecked Sendable {
         await runtime.recordLatency(latency)
     }
 
-    private func blinkCameraLED() {
-        let base = configuration.cameraBaseURL
-        Task.detached(priority: .utility) {
-            for value in [10, 0] {
-                guard let url = URL(string: "/control?var=led_intensity&val=\(value)", relativeTo: base) else { continue }
-                _ = try? await URLSession.shared.data(from: url)
-                try? await Task.sleep(for: .milliseconds(500))
-            }
-        }
-    }
 }
 
 Task {
