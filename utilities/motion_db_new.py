@@ -9,7 +9,7 @@ from datetime import datetime, time, timedelta
 from pathlib import Path
 import os
 from typing import Generator, Optional
-from sqlalchemy import create_engine, Column, Integer, DateTime, Float, String, Text, ForeignKey, func, text
+from sqlalchemy import create_engine, Column, Integer, DateTime, Float, String, Text, ForeignKey, case, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import DatabaseError
@@ -116,6 +116,16 @@ def get_db_session() -> Generator[Session, None, None]:
         session.close()
 
 
+@contextmanager
+def get_read_session() -> Generator[Session, None, None]:
+    """Read-only sessions do not acquire a needless SQLite write transaction."""
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
 def log_motion_event(
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
@@ -177,7 +187,7 @@ def get_motion_annotations(event_ids: list[int]) -> dict[int, dict]:
         return {}
     import json
 
-    with get_db_session() as session:
+    with get_read_session() as session:
         annotations = (
             session.query(MotionEventAnnotation)
             .filter(MotionEventAnnotation.event_id.in_(event_ids))
@@ -195,18 +205,6 @@ def get_motion_annotations(event_ids: list[int]) -> dict[int, dict]:
                 "detector_version": annotation.detector_version,
             }
         return result
-
-
-def _clone_events(events: list[MotionEvent]) -> list[MotionEvent]:
-    return [
-        MotionEvent(
-            id=e.id,
-            start_time=e.start_time,
-            end_time=e.end_time,
-            duration=e.duration,
-        )
-        for e in events
-    ]
 
 
 def _coerce_dt(value: str | datetime) -> datetime:
@@ -251,8 +249,7 @@ def _read_events_with_fallback(
         MotionEvent.start_time.asc() if ascending else MotionEvent.start_time.desc()
     )
     try:
-        events = session.query(MotionEvent).filter(*filters).order_by(order_by).all()
-        return _clone_events(events)
+        return session.query(MotionEvent).filter(*filters).order_by(order_by).all()
     except DatabaseError as exc:
         if "database disk image is malformed" not in str(exc).lower():
             raise
@@ -276,7 +273,7 @@ def get_motion_events_by_hours(hours: int) -> list[MotionEvent]:
 
     start_time = datetime.now() - timedelta(hours=hours)
 
-    with get_db_session() as session:
+    with get_read_session() as session:
         return _read_events_with_fallback(
             session,
             filters=(MotionEvent.start_time >= start_time,),
@@ -292,7 +289,7 @@ def get_motion_events_daytime(date: datetime) -> list[MotionEvent]:
     start_time = datetime.combine(date.date(), time(7, 0))
     end_time = datetime.combine(date.date(), time(23, 0))
 
-    with get_db_session() as session:
+    with get_read_session() as session:
         return _read_events_with_fallback(
             session,
             filters=(
@@ -319,7 +316,7 @@ def get_motion_events_by_date(date: datetime) -> list[MotionEvent]:
     start_time = date.replace(hour=0, minute=0, second=0, microsecond=0)
     end_time = start_time + timedelta(days=1)
 
-    with get_db_session() as session:
+    with get_read_session() as session:
         return _read_events_with_fallback(
             session,
             filters=(
@@ -342,7 +339,7 @@ def get_motion_events_by_range(start: datetime, end: datetime) -> list[MotionEve
     Returns:
         List of MotionEvent instances
     """
-    with get_db_session() as session:
+    with get_read_session() as session:
         return _read_events_with_fallback(
             session,
             filters=(MotionEvent.start_time >= start, MotionEvent.start_time <= end),
@@ -354,8 +351,29 @@ def get_motion_events_by_range(start: datetime, end: datetime) -> list[MotionEve
 
 def get_total_motion_count() -> int:
     """Get total count of motion events."""
-    with get_db_session() as session:
+    with get_read_session() as session:
         return session.query(MotionEvent).count()
+
+
+def get_motion_counts() -> dict[str, int]:
+    """Count all dashboard windows in one indexed aggregate query."""
+    now = datetime.now()
+    hour_1 = now - timedelta(hours=1)
+    hour_12 = now - timedelta(hours=12)
+    hour_24 = now - timedelta(hours=24)
+    with get_read_session() as session:
+        row = session.query(
+            func.count(MotionEvent.id),
+            func.sum(case((MotionEvent.start_time >= hour_1, 1), else_=0)),
+            func.sum(case((MotionEvent.start_time >= hour_12, 1), else_=0)),
+            func.sum(case((MotionEvent.start_time >= hour_24, 1), else_=0)),
+        ).one()
+    return {
+        "total_events": int(row[0] or 0),
+        "last_hour": int(row[1] or 0),
+        "last_12_hours": int(row[2] or 0),
+        "last_24_hours": int(row[3] or 0),
+    }
 
 
 def get_motion_event_stats_per_hour(last_days: int = 30) -> list[dict]:
@@ -363,7 +381,7 @@ def get_motion_event_stats_per_hour(last_days: int = 30) -> list[dict]:
     end_time = datetime.now()
     start_time = end_time - timedelta(days=last_days)
 
-    with get_db_session() as session:
+    with get_read_session() as session:
         rows = (
             session.query(
                 func.strftime("%H", MotionEvent.start_time).label("hour"),
@@ -389,7 +407,7 @@ def get_motion_event_stats_per_hour_last_month() -> list[dict]:
     end_time = datetime.now()
     start_time = end_time - timedelta(days=30)
 
-    with get_db_session() as session:
+    with get_read_session() as session:
         rows = (
             session.query(
                 func.strftime("%Y-%m-%d %H:00:00", MotionEvent.start_time).label(
@@ -425,7 +443,7 @@ def get_motion_event_stats_per_hour_last_month() -> list[dict]:
 
 def get_motion_event_hourly_avg_all_time() -> list[dict]:
     """Get average events per day for each hour (00-23) across all stored dates."""
-    with get_db_session() as session:
+    with get_read_session() as session:
         min_ts, max_ts = session.query(
             func.min(MotionEvent.start_time),
             func.max(MotionEvent.start_time),
