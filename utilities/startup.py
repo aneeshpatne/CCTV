@@ -106,8 +106,11 @@ def run_recovery_mode() -> bool:
     return False
 
 
-def startup():
+def startup(target_framesize: int = 12):
     global count
+    if target_framesize not in {11, 12}:
+        raise ValueError(f"Unsupported target framesize: {target_framesize}")
+
     consecutive_connection_failures = 0
     while True:
         camera_status = get_camera_status_with_retry(attempts=3, timeout=2)
@@ -131,30 +134,39 @@ def startup():
             continue
         consecutive_connection_failures = 0
         stat = camera_status.framesize
-        i = 1
         logger.info("Camera Initiated")
         logger.info(f"Initial status: {camera_status.raw}")
         if stat is None:
             logger.warning("Camera status missing framesize; retrying startup")
             time.sleep(5)
             continue
-        i = max(int(stat), 10)
-        while i < 12:
-            logger.info(f"Current Resolution: {i}")
-            logger.info(f"Attempting to set Current Resolution to: {i + 1}")
+        current_framesize = int(stat)
+        if current_framesize > target_framesize:
+            resolution_steps = [target_framesize]
+        else:
+            resolution_steps = list(
+                range(max(current_framesize, 10) + 1, target_framesize + 1)
+            )
+
+        resolution_set = True
+        for next_framesize in resolution_steps:
+            logger.info(f"Current Resolution: {current_framesize}")
+            logger.info(f"Attempting to set Current Resolution to: {next_framesize}")
 
             # Wrap change_quality in try-except to handle connection timeouts
             try:
-                change_quality(i + 1)
+                change_quality(next_framesize)
                 time.sleep(3)
             except RequestException as err:
                 logger.warning(f"Failed to change quality (connection error): {err}")
                 # Camera likely crashed - restart from beginning
                 time.sleep(5)
+                resolution_set = False
                 break
             except Exception as err:
                 logger.warning(f"Unexpected error changing quality: {err}")
                 time.sleep(5)
+                resolution_set = False
                 break
 
             camera_status = get_camera_status_with_retry(attempts=3, timeout=2)
@@ -163,17 +175,16 @@ def startup():
                 raise CameraRecoveryMode(camera_status)
 
             stat = camera_status.framesize if camera_status.camera_online else None
-            if stat == None or int(stat) != i + 1:
+            if stat is None or int(stat) != next_framesize:
                 logger.warning("Resolution Change Failed")
-                i = 10
                 time.sleep(5)
-                continue
-            i += 1
+                resolution_set = False
+                break
+            current_framesize = next_framesize
 
-        # Only log success if we actually completed the loop
-        if i >= 12:
+        if resolution_set and current_framesize == target_framesize:
             time.sleep(6)
-            logger.info(f"Resolution Set Successfully to {i}")
+            logger.info(f"Resolution Set Successfully to {target_framesize}")
         else:
             logger.warning("Resolution setting incomplete - will retry")
             continue
