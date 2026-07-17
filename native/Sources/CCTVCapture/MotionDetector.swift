@@ -9,6 +9,14 @@ struct MotionResult: Sendable {
     let confidence: Double
     let boundingBox: NormalizedRect?
     let sceneBrightness: Double?
+    let redOverGreen: Double?
+    let blueOverGreen: Double?
+}
+
+struct SceneColorMetrics: Sendable, Equatable {
+    let brightness: Double
+    let redOverGreen: Double?
+    let blueOverGreen: Double?
 }
 
 private struct MotionPixelBuffer: @unchecked Sendable {
@@ -110,10 +118,12 @@ actor MotionDetector {
                 score: 0,
                 confidence: 0,
                 boundingBox: nil,
-                sceneBrightness: nil
+                sceneBrightness: nil,
+                redOverGreen: nil,
+                blueOverGreen: nil
             )
         }
-        let sceneBrightness = Self.averageBrightness(buffer)
+        let metrics = Self.imageMetrics(buffer)
         guard let previous else {
             self.previous = buffer
             return MotionResult(
@@ -121,7 +131,9 @@ actor MotionDetector {
                 score: 0,
                 confidence: 0,
                 boundingBox: nil,
-                sceneBrightness: sceneBrightness
+                sceneBrightness: metrics?.brightness,
+                redOverGreen: metrics?.redOverGreen,
+                blueOverGreen: metrics?.blueOverGreen
             )
         }
         self.previous = buffer
@@ -137,7 +149,9 @@ actor MotionDetector {
             score: motion.score,
             confidence: motion.confidence,
             boundingBox: motion.boundingBox,
-            sceneBrightness: sceneBrightness
+            sceneBrightness: metrics?.brightness,
+            redOverGreen: metrics?.redOverGreen,
+            blueOverGreen: metrics?.blueOverGreen
         )
     }
 
@@ -223,13 +237,15 @@ actor MotionDetector {
             score: score,
             confidence: confidence,
             boundingBox: box,
-            sceneBrightness: nil
+            sceneBrightness: nil,
+            redOverGreen: nil,
+            blueOverGreen: nil
         )
     }
 
     /// Estimate BT.709 luma before the HUD is drawn, excluding clipped shadows and
     /// highlights so unavoidable clipping does not dominate exposure correction.
-    nonisolated static func averageBrightness(_ buffer: CVPixelBuffer) -> Double? {
+    nonisolated static func imageMetrics(_ buffer: CVPixelBuffer) -> SceneColorMetrics? {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
@@ -243,6 +259,8 @@ actor MotionDetector {
         var usableCount = 0
         var allLuminance = 0.0
         var allCount = 0
+        var neutralRedRatios: [Double] = []
+        var neutralBlueRatios: [Double] = []
 
         for y in stride(from: 0, to: height, by: sampleStep) {
             for x in stride(from: 0, to: width, by: sampleStep) {
@@ -256,14 +274,33 @@ actor MotionDetector {
                 if value > 7 && value < 248 {
                     usableLuminance += value
                     usableCount += 1
+                    if green > 7 {
+                        let maximum = max(red, green, blue)
+                        let minimum = min(red, green, blue)
+                        if maximum - minimum <= 0.25 * max(maximum, 1) {
+                            neutralRedRatios.append(red / green)
+                            neutralBlueRatios.append(blue / green)
+                        }
+                    }
                 }
             }
         }
         guard allCount > 0 else { return nil }
-        if usableCount > 0 {
-            return usableLuminance / (Double(usableCount) * 255)
+        let brightness = usableCount > 0
+            ? usableLuminance / (Double(usableCount) * 255)
+            : allLuminance / (Double(allCount) * 255)
+        let minimumNeutral = max(1, allCount / 100)
+        guard neutralRedRatios.count >= minimumNeutral else {
+            return SceneColorMetrics(brightness: brightness, redOverGreen: nil, blueOverGreen: nil)
         }
-        return allLuminance / (Double(allCount) * 255)
+        neutralRedRatios.sort()
+        neutralBlueRatios.sort()
+        let midpoint = neutralRedRatios.count / 2
+        return SceneColorMetrics(
+            brightness: brightness,
+            redOverGreen: neutralRedRatios[midpoint],
+            blueOverGreen: neutralBlueRatios[midpoint]
+        )
     }
 
     nonisolated private static func estimate(
@@ -278,7 +315,9 @@ actor MotionDetector {
             score: 0,
             confidence: 0,
             boundingBox: nil,
-            sceneBrightness: nil
+            sceneBrightness: nil,
+            redOverGreen: nil,
+            blueOverGreen: nil
         )
         return await withCheckedContinuation { continuation in
             let box = MotionRequestBox(continuation)

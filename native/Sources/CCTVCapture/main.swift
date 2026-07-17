@@ -31,6 +31,8 @@ private struct RuntimeSnapshot: Sendable {
     let processingLatencyMS: Double
     let motionScore: Double
     let sceneBrightness: Double?
+    let redOverGreen: Double?
+    let blueOverGreen: Double?
 }
 
 private actor PipelineRuntimeState {
@@ -40,11 +42,15 @@ private actor PipelineRuntimeState {
     private var latencySamplesMS: [Double] = []
     private var motionScore = 0.0
     private var sceneBrightness: Double?
+    private var redOverGreen: Double?
+    private var blueOverGreen: Double?
     private var reconnectRequested = false
 
     func recordReceived(at monotonicTime: TimeInterval) {
         if let lastFrameAt, monotonicTime - lastFrameAt >= 3 {
             sceneBrightness = nil
+            redOverGreen = nil
+            blueOverGreen = nil
         }
         lastFrameAt = monotonicTime
         reconnectRequested = false
@@ -69,12 +75,20 @@ private actor PipelineRuntimeState {
     }
 
     @discardableResult
-    func recordBrightness(_ brightness: Double?) -> Double? {
-        guard let brightness else { return sceneBrightness }
+    func recordImageMetrics(
+        brightness: Double?, redRatio: Double?, blueRatio: Double?
+    ) -> (Double?, Double?, Double?) {
+        guard let brightness else { return (sceneBrightness, redOverGreen, blueOverGreen) }
         // Smooth frame-level compression noise; the orchestrator applies the longer
         // 30-60 second decision window.
         sceneBrightness = sceneBrightness.map { 0.9 * $0 + 0.1 * brightness } ?? brightness
-        return sceneBrightness
+        if let redRatio {
+            redOverGreen = redOverGreen.map { 0.9 * $0 + 0.1 * redRatio } ?? redRatio
+        }
+        if let blueRatio {
+            blueOverGreen = blueOverGreen.map { 0.9 * $0 + 0.1 * blueRatio } ?? blueRatio
+        }
+        return (sceneBrightness, redOverGreen, blueOverGreen)
     }
 
     func shouldReconnect(at now: TimeInterval) -> Bool {
@@ -95,7 +109,9 @@ private actor PipelineRuntimeState {
             processedFPS: Self.rate(for: processedFrameTimes),
             processingLatencyMS: latency,
             motionScore: motionScore,
-            sceneBrightness: sceneBrightness
+            sceneBrightness: sceneBrightness,
+            redOverGreen: redOverGreen,
+            blueOverGreen: blueOverGreen
         )
     }
 
@@ -276,6 +292,8 @@ final class FramePipeline: @unchecked Sendable {
                         processingLatencyMS: snapshot.processingLatencyMS,
                         motionScore: snapshot.motionScore,
                         sceneBrightness: signalAvailable ? snapshot.sceneBrightness : nil,
+                        redOverGreen: signalAvailable ? snapshot.redOverGreen : nil,
+                        blueOverGreen: signalAvailable ? snapshot.blueOverGreen : nil,
                         recording: outputMetrics.recording,
                         rtsp: outputMetrics.rtsp
                     )
@@ -287,7 +305,9 @@ final class FramePipeline: @unchecked Sendable {
                 emitter.emit(WorkerEvent(
                     type: "image.metrics",
                     payload: .imageMetrics(
-                        sceneBrightness: signalAvailable ? snapshot.sceneBrightness : nil
+                        sceneBrightness: signalAvailable ? snapshot.sceneBrightness : nil,
+                        redOverGreen: signalAvailable ? snapshot.redOverGreen : nil,
+                        blueOverGreen: signalAvailable ? snapshot.blueOverGreen : nil
                     )
                 ))
             }
@@ -328,7 +348,11 @@ final class FramePipeline: @unchecked Sendable {
         if motionState.started {
             await ledBlinker.start()
         }
-        let hudBrightness = await runtime.recordBrightness(motion.sceneBrightness)
+        let hudMetrics = await runtime.recordImageMetrics(
+            brightness: motion.sceneBrightness,
+            redRatio: motion.redOverGreen,
+            blueRatio: motion.blueOverGreen
+        )
         let labels = semanticClassifier.labels(
             for: source,
             candidate: motion.candidate,
@@ -353,7 +377,9 @@ final class FramePipeline: @unchecked Sendable {
             fps: measuredFPS,
             rssi: rssi,
             temperature: temperature,
-            sceneBrightness: hudBrightness,
+            sceneBrightness: hudMetrics.0,
+            redOverGreen: hudMetrics.1,
+            blueOverGreen: hudMetrics.2,
             motion: motionState.active,
             labels: labels,
             motionBox: motion.boundingBox,

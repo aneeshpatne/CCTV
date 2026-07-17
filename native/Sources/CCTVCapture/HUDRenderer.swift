@@ -19,6 +19,7 @@ struct CameraSettings: Sendable, Equatable {
     var saturationU: Int?
     var saturationV: Int?
     var cachedForRecovery: Bool?
+    var wbControllerState: String? = nil
 
     var imageSummary: String? {
         var values: [String] = []
@@ -30,6 +31,7 @@ struct CameraSettings: Sendable, Equatable {
         if let gainRegister { values.append("REG \(gainRegister)") }
         if let autoWhiteBalance { values.append(autoWhiteBalance ? "AWB AUTO" : "AWB MANUAL") }
         if let red, let green, let blue { values.append("WB \(red)/\(green)/\(blue)") }
+        if let wbControllerState { values.append("WBCTRL \(wbControllerState.uppercased())") }
         if let saturationU, let saturationV { values.append("SAT \(saturationU)/\(saturationV)") }
         if cachedForRecovery == false { values.append("NOT CACHED") }
         return values.isEmpty ? nil : values.joined(separator: " · ")
@@ -41,6 +43,8 @@ struct HUDStatus: Sendable {
     var rssi: Int?
     var temperature: Double?
     var sceneBrightness: Double?
+    var redOverGreen: Double? = nil
+    var blueOverGreen: Double? = nil
     var motion = false
     var labels: [SemanticLabel] = []
     var motionBox: NormalizedRect?
@@ -87,6 +91,7 @@ actor CameraTelemetry {
         let whiteBalance = imageValue?["whiteBalance"] as? [String: Any]
         let color = imageValue?["color"] as? [String: Any]
         let saturation = color?["saturation"] as? [String: Any]
+        let wbControllerState = fetchWBControllerState()
         return CameraSettings(
             framesize: intValue(merged["framesize"]),
             xclk: intValue(merged["xclk"]),
@@ -101,8 +106,21 @@ actor CameraTelemetry {
             blue: intValue(whiteBalance?["blue"]),
             saturationU: intValue(saturation?["u"]),
             saturationV: intValue(saturation?["v"]),
-            cachedForRecovery: boolValue(imageValue?["cachedForRecovery"])
+            cachedForRecovery: boolValue(imageValue?["cachedForRecovery"]),
+            wbControllerState: wbControllerState
         )
+    }
+
+    private func fetchWBControllerState() -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        let configured = environment["CCTV_IMAGE_CONTROL_STATE_PATH"]
+            ?? "~/.local/state/cctv/image-control.json"
+        let path = (configured as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object["controllerState"] as? String
     }
 
     private func intValue(_ value: Any?) -> Int? {
@@ -212,9 +230,9 @@ final class HUDRenderer: @unchecked Sendable {
         let temperature = status.temperature.map { String(format: "%.1fC", $0) } ?? "--C"
         right -= 94
         composed = panel(text: temperature, x: right, y: top, width: 94, height: panelHeight, accent: statusColor(forTemperature: status.temperature), over: composed)
-        right -= gap + 112
-        let brightness = status.sceneBrightness.map { String(format: "%.1f%% LIGHT", $0 * 100) } ?? "--% LIGHT"
-        composed = panel(text: brightness, x: right, y: top, width: 112, height: panelHeight, accent: statusColor(forBrightness: status.sceneBrightness), over: composed)
+        right -= gap + 144
+        let brightness = status.sceneBrightness.map { String(format: "%.1f%% CLIP-TRIM", $0 * 100) } ?? "--% CLIP-TRIM"
+        composed = panel(text: brightness, x: right, y: top, width: 144, height: panelHeight, accent: statusColor(forBrightness: status.sceneBrightness), over: composed)
         right -= gap + 88
         composed = panel(text: String(format: "%.0f fps", status.fps), x: right, y: top, width: 88, height: panelHeight, accent: statusColor(forFPS: status.fps), over: composed)
         right -= gap + 104
@@ -227,7 +245,11 @@ final class HUDRenderer: @unchecked Sendable {
         composed = panel(text: quality, x: settingsLeft, y: settingsTop, width: 104, height: panelHeight, accent: nil, over: composed)
         settingsLeft += 104 + gap
         if let summary = status.cameraSettings.imageSummary {
-            composed = panel(text: "IMAGE · \(summary)", x: settingsLeft, y: settingsTop, width: min(650, width - settingsLeft - gap), height: panelHeight, accent: nil, over: composed)
+            var imageText = "IMAGE · \(summary)"
+            if let red = status.redOverGreen, let blue = status.blueOverGreen {
+                imageText += String(format: " · RGB %.2f/1.00/%.2f", red, blue)
+            }
+            composed = panel(text: imageText, x: settingsLeft, y: settingsTop, width: width - settingsLeft - gap, height: panelHeight, accent: nil, over: composed)
         }
 
         if let message = status.message {
