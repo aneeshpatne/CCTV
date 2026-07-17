@@ -29,6 +29,7 @@ def frozen_profile(shutter=100, gain=32):
             "gainRegister": 8,
         },
         "whiteBalance": {"auto": False, "red": 94, "green": 65, "blue": 84},
+        "color": {"saturation": {"u": 72, "v": 72}},
     }
 
 
@@ -44,8 +45,17 @@ class ImmediateThread:
 
 
 class NativeEventProtocolTests(unittest.TestCase):
+    def setUp(self):
+        orchestrator._image_control_ready.set()
+
+    def tearDown(self):
+        orchestrator._image_control_ready.clear()
+
     def test_startup_applies_exposure_white_balance_and_saturation_separately(self):
-        controller = ManualExposureController()
+        controller = ManualExposureController(gain_max_x16=128)
+        white_balance_controller = Mock()
+        white_balance_controller.saved_white_balance.return_value = None
+        white_balance_controller.status_summary.return_value = "WBCTRL HOLD"
         client = Mock()
         automatic = frozen_profile()
         automatic["exposure"]["autoExposure"] = True
@@ -53,11 +63,13 @@ class NativeEventProtocolTests(unittest.TestCase):
         automatic["whiteBalance"]["auto"] = True
         manual = frozen_profile()
         colored = {**manual, "color": {"saturation": {"u": 72, "v": 72}}}
-        client.get_profile.return_value = automatic
+        client.get_profile.side_effect = [automatic, colored]
         client.freeze_exposure.return_value = manual
         client.update_profile.side_effect = [manual, colored]
 
         with patch.object(orchestrator, "_exposure_controller", controller), patch.object(
+            orchestrator, "_white_balance_controller", white_balance_controller
+        ), patch.object(
             orchestrator, "_image_control", client
         ), patch.object(
             orchestrator, "_color_profile", CameraColorProfile(94, 65, 84, 72, 72)
@@ -74,6 +86,7 @@ class NativeEventProtocolTests(unittest.TestCase):
                 call({"color": {"saturation": {"u": 72, "v": 72}}}),
             ],
         )
+        self.assertTrue(orchestrator._image_control_ready.is_set())
 
     def test_manual_adjustment_uses_partial_image_control_without_reset(self):
         controller = ManualExposureController()
@@ -179,6 +192,48 @@ class NativeEventProtocolTests(unittest.TestCase):
                 }
             )
         controller.observe.assert_called_once_with(0.20)
+
+    def test_image_metrics_event_feeds_white_balance_controller(self):
+        exposure = Mock()
+        exposure.observe.return_value = None
+        white_balance = Mock()
+        white_balance.observe.return_value = None
+        with (
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {
+                        "scene_brightness": 0.30,
+                        "red_over_green": 0.92,
+                        "blue_over_green": 1.08,
+                    },
+                }
+            )
+        white_balance.observe.assert_called_once_with(0.92, 1.08)
+
+    def test_image_metrics_are_ignored_until_manual_profile_is_verified(self):
+        orchestrator._image_control_ready.clear()
+        exposure = Mock()
+        orchestrator.NativeEventReader._handle(
+            {
+                "version": 1,
+                "type": "image.metrics",
+                "payload": {"scene_brightness": 0.20},
+            }
+        )
+        with patch.object(orchestrator, "_exposure_controller", exposure):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {"scene_brightness": 0.20},
+                }
+            )
+        exposure.observe.assert_not_called()
 
 
 if __name__ == "__main__":
