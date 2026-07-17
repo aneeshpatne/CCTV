@@ -2,6 +2,42 @@ import XCTest
 @testable import CCTVCapture
 
 final class CCTVCaptureTests: XCTestCase {
+    private func pixelBuffer(
+        width: Int = 8,
+        height: Int = 8,
+        blue: UInt8,
+        green: UInt8,
+        red: UInt8
+    ) throws -> CVPixelBuffer {
+        var created: CVPixelBuffer?
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                nil,
+                width,
+                height,
+                kCVPixelFormatType_32BGRA,
+                nil,
+                &created
+            ),
+            kCVReturnSuccess
+        )
+        let buffer = try XCTUnwrap(created)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * rowBytes + x * 4
+                bytes[offset] = blue
+                bytes[offset + 1] = green
+                bytes[offset + 2] = red
+                bytes[offset + 3] = 255
+            }
+        }
+        return buffer
+    }
+
     func testConfigurationDefaults() throws {
         let configuration = try PipelineConfiguration.load(environment: [:])
         XCTAssertEqual(configuration.targetFPS, 9)
@@ -48,7 +84,14 @@ final class CCTVCaptureTests: XCTestCase {
     }
 
     func testImageMetricsEventCarriesBrightnessWithoutChangingProtocolVersion() throws {
-        let event = WorkerEvent(type: "image.metrics", payload: .imageMetrics(sceneBrightness: 0.21))
+        let event = WorkerEvent(
+            type: "image.metrics",
+            payload: .imageMetrics(
+                sceneBrightness: 0.21,
+                redOverGreen: 0.94,
+                blueOverGreen: 1.08
+            )
+        )
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
         )
@@ -56,6 +99,22 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(object["type"] as? String, "image.metrics")
         let payload = try XCTUnwrap(object["payload"] as? [String: Any])
         XCTAssertEqual(payload["scene_brightness"] as? Double, 0.21)
+        XCTAssertEqual(payload["red_over_green"] as? Double, 0.94)
+        XCTAssertEqual(payload["blue_over_green"] as? Double, 1.08)
+    }
+
+    func testImageMetricsUseNeutralPixelRatios() throws {
+        let buffer = try pixelBuffer(blue: 90, green: 100, red: 110)
+        let metrics = try XCTUnwrap(MotionDetector.imageMetrics(buffer))
+        XCTAssertEqual(try XCTUnwrap(metrics.redOverGreen), 1.1, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(metrics.blueOverGreen), 0.9, accuracy: 0.0001)
+    }
+
+    func testImageMetricsDoNotUseStronglyColoredPixelsAsFallback() throws {
+        let buffer = try pixelBuffer(blue: 20, green: 40, red: 180)
+        let metrics = try XCTUnwrap(MotionDetector.imageMetrics(buffer))
+        XCTAssertNil(metrics.redOverGreen)
+        XCTAssertNil(metrics.blueOverGreen)
     }
 
     func testMotionAccumulatorRequiresPersistenceAndKeepsPadding() async {
@@ -225,6 +284,8 @@ final class CCTVCaptureTests: XCTestCase {
                 processingLatencyMS: 12.5,
                 motionScore: 0.1,
                 sceneBrightness: 0.42,
+                redOverGreen: 0.95,
+                blueOverGreen: 1.05,
                 recording: true,
                 rtsp: true
             )
