@@ -82,7 +82,7 @@ class ImageControlClient:
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 call = getattr(self.session, method)
                 kwargs: dict[str, Any] = {"timeout": self.timeout}
@@ -90,6 +90,9 @@ class ImageControlClient:
                     kwargs["json"] = json_body
                 response = call(url, **kwargs)
             except requests.RequestException as exc:
+                if attempt < 4:
+                    self._sleep(min(4.0, 0.5 * (2**attempt)))
+                    continue
                 raise ImageControlAPIError(None, "network_error", str(exc)) from exc
 
             try:
@@ -112,8 +115,8 @@ class ImageControlClient:
             code = str(error.get("code") or "http_error")
             message = str(error.get("message") or response.reason or "request failed")
             field = error.get("field")
-            if response.status_code == 503 and code == "camera_busy" and attempt < 2:
-                self._sleep(0.5 * (2**attempt))
+            if response.status_code == 503 and code == "camera_busy" and attempt < 4:
+                self._sleep(min(4.0, 0.5 * (2**attempt)))
                 continue
             raise ImageControlAPIError(
                 response.status_code,
