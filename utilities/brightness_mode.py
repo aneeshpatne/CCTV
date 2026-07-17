@@ -10,16 +10,38 @@ from typing import Any
 import numpy as np
 
 
-def clipping_resistant_brightness(frame: np.ndarray) -> float:
-    """Return BT.709 brightness while excluding clipped black/white pixels."""
+@dataclass(frozen=True)
+class ClippingResistantMetrics:
+    brightness: float
+    red_over_green: float | None
+    blue_over_green: float | None
+
+
+def clipping_resistant_metrics(frame: np.ndarray) -> ClippingResistantMetrics:
+    """Measure brightness and near-neutral chroma without clipped pixels."""
     blue = frame[..., 0].astype(np.float32)
     green = frame[..., 1].astype(np.float32)
     red = frame[..., 2].astype(np.float32)
     luma = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-    usable = luma[(luma > 7.0) & (luma < 248.0)]
-    if usable.size:
-        return float(usable.mean() / 255.0)
-    return float(luma.mean() / 255.0)
+    unclipped = (luma > 7.0) & (luma < 248.0)
+    usable_luma = luma[unclipped]
+    brightness = float((usable_luma.mean() if usable_luma.size else luma.mean()) / 255.0)
+
+    maximum = np.maximum(np.maximum(red, green), blue)
+    minimum = np.minimum(np.minimum(red, green), blue)
+    neutral = unclipped & (green > 7.0) & ((maximum - minimum) <= 0.25 * np.maximum(maximum, 1.0))
+    if np.count_nonzero(neutral) < max(1, frame.shape[0] * frame.shape[1] // 100):
+        return ClippingResistantMetrics(brightness, None, None)
+    return ClippingResistantMetrics(
+        brightness,
+        float(np.median(red[neutral] / green[neutral])),
+        float(np.median(blue[neutral] / green[neutral])),
+    )
+
+
+def clipping_resistant_brightness(frame: np.ndarray) -> float:
+    """Return BT.709 brightness while excluding clipped black/white pixels."""
+    return clipping_resistant_metrics(frame).brightness
 
 
 @dataclass(frozen=True)
@@ -42,9 +64,9 @@ class ManualExposureController:
         observation_seconds: float = 4.0,
         window_seconds: float = 12.0,
         shutter_min: int = 1,
-        shutter_max: int = 900,
+        shutter_max: int = 1200,
         gain_min_x16: int = 16,
-        gain_max_x16: int = 64,
+        gain_max_x16: int = 31,
         max_step: float = 0.50,
     ) -> None:
         if not 0 < dim_threshold < target_brightness < bright_threshold <= 1:
@@ -84,9 +106,9 @@ class ManualExposureController:
                 observation_seconds=float(os.getenv("CCTV_BRIGHTNESS_OBSERVATION_SECONDS", "4")),
                 window_seconds=float(os.getenv("CCTV_BRIGHTNESS_WINDOW_SECONDS", "12")),
                 shutter_min=int(os.getenv("CCTV_MANUAL_SHUTTER_MIN_LINES", "1")),
-                shutter_max=int(os.getenv("CCTV_MANUAL_SHUTTER_MAX_LINES", "900")),
+                shutter_max=int(os.getenv("CCTV_MANUAL_SHUTTER_MAX_LINES", "1200")),
                 gain_min_x16=int(os.getenv("CCTV_MANUAL_GAIN_MIN_X16", "16")),
-                gain_max_x16=int(os.getenv("CCTV_MANUAL_GAIN_MAX_X16", "64")),
+                gain_max_x16=int(os.getenv("CCTV_MANUAL_GAIN_MAX_X16", "31")),
                 max_step=float(os.getenv("CCTV_MANUAL_EXPOSURE_MAX_STEP", "0.50")),
             )
         except (TypeError, ValueError) as error:
@@ -118,12 +140,19 @@ class ManualExposureController:
         with self._lock:
             if self._profile is None or self._pending or self._disabled_reason:
                 return None
-            # Bright and normal frames deliberately never reduce exposure. Requiring
-            # consecutive dark samples prevents transient shadows from triggering.
-            if value >= self.dim_threshold:
+            if self.dim_threshold <= value <= self.bright_threshold:
                 self._samples.clear()
                 self._at_limit = False
                 return None
+            direction = "dark" if value < self.dim_threshold else "bright"
+            # Switching directly between dark and bright evidence must start a fresh
+            # persistence window rather than combining opposite corrections.
+            if self._samples:
+                previous_direction = (
+                    "dark" if self._samples[-1][1] < self.dim_threshold else "bright"
+                )
+                if previous_direction != direction:
+                    self._samples.clear()
             self._samples.append((now, value))
             cutoff = now - self.window_seconds
             while self._samples and self._samples[0][0] < cutoff:
@@ -142,7 +171,7 @@ class ManualExposureController:
             self._pending = True
             self._at_limit = False
             return ManualExposureDecision(
-                "dark", average, requested_shutter, requested_gain
+                direction, average, requested_shutter, requested_gain
             )
 
     def complete(self, profile: dict[str, Any] | None, *, success: bool) -> None:
@@ -161,6 +190,12 @@ class ManualExposureController:
 
     def reset_observations(self) -> None:
         with self._lock:
+            self._samples.clear()
+
+    def invalidate_pending(self) -> None:
+        """Discard decisions created against a camera generation that is gone."""
+        with self._lock:
+            self._pending = False
             self._samples.clear()
 
     def profile_snapshot(self) -> dict[str, Any] | None:
@@ -193,16 +228,28 @@ class ManualExposureController:
         ratio = self.target_brightness / max(brightness, 0.001)
         ratio = min(1 + self.max_step, max(1 - self.max_step, ratio))
         target_product = shutter * gain * ratio
-        # Prefer a cleaner signal from a longer shutter. Add gain only after the
-        # configured shutter range is exhausted.
-        new_shutter = min(
-            self.shutter_max,
-            max(shutter, int(round(target_product / gain))),
-        )
-        new_gain = min(
-            self.gain_max_x16,
-            max(gain, int(round(target_product / new_shutter))),
-        )
+        if ratio >= 1:
+            # In darkness, prefer a cleaner signal from a longer shutter. Add gain
+            # only after the shutter range is exhausted.
+            new_shutter = min(
+                self.shutter_max,
+                max(shutter, int(round(target_product / gain))),
+            )
+            new_gain = min(
+                self.gain_max_x16,
+                max(gain, int(round(target_product / new_shutter))),
+            )
+        else:
+            # In bright conditions, remove noisy gain first. Shorten shutter only
+            # when minimum gain cannot provide the requested reduction.
+            new_gain = max(
+                self.gain_min_x16,
+                min(gain, int(round(target_product / shutter))),
+            )
+            new_shutter = max(
+                self.shutter_min,
+                min(shutter, int(round(target_product / new_gain))),
+            )
         return new_shutter, new_gain
 
     def _normalize(self, shutter: int, gain: int) -> tuple[int, int]:
