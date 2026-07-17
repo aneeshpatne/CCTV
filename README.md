@@ -238,7 +238,7 @@ There is no camera simulator. Unit tests run without hardware, but live capture,
 
    `CCTV_PIPELINE_BACKEND` accepts `native`, `python`, or `auto`; the default is `native`, with fallback when the binary is missing or repeatedly fails. Native tuning is available through `CCTV_TARGET_FPS`, `CCTV_SEGMENT_SECONDS`, `CCTV_HEVC_BITRATE`, and `CCTV_RTSP_BITRATE`.
 
-   Manual image control uses clipping-resistant BT.709 luminance before overlays while keeping framesize 12: samples at or near black and white clipping are excluded from the exposure signal. Startup reads the authoritative profile, explicitly freezes shutter and gain, then applies fixed RGB white balance and U/V saturation from `config/camera_color_profile.json`; `CCTV_COLOR_PROFILE_PATH` can override it. The native worker reports luminance every two seconds. Three consecutive samples spanning four seconds below 25% increase exposure by up to 50%, lengthening shutter first to 900 lines and using sensor gain only afterward, with a default gain ceiling of `64` gainX16 (4x). Bright frames deliberately never reduce exposure because dark-time clarity is prioritized over afternoon overexposure. Configure the target and response through `CCTV_IMAGE_TARGET_BRIGHTNESS`, `CCTV_DIM_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHTNESS_OBSERVATION_SECONDS`, `CCTV_BRIGHTNESS_WINDOW_SECONDS`, `CCTV_MANUAL_SHUTTER_MIN_LINES`, `CCTV_MANUAL_SHUTTER_MAX_LINES`, `CCTV_MANUAL_GAIN_MIN_X16`, `CCTV_MANUAL_GAIN_MAX_X16`, and `CCTV_MANUAL_EXPOSURE_MAX_STEP`.
+   Manual image controls and their software tuning loops are described in [Automatic image tuner](#automatic-image-tuner).
 
 5. Build the native capture worker.
 
@@ -274,6 +274,16 @@ There is no camera simulator. Unit tests run without hardware, but live capture,
 > The repository contains development defaults for camera IPs, recording volumes, RTSP/live stream URLs, Discord targets, and absolute paths in `launchd/*.plist`. Replace them for the target machine before installing services or distributing a configured copy. The external RTSP and Discord services must be started separately.
 
 Once manual startup is verified, adapt the three property lists in `launchd/`, copy them to `~/Library/LaunchAgents/`, and load only the services you use. Do not start a second capture process while the LaunchAgent is active: the configured ESP32 MJPEG stream is treated as single-consumer.
+
+## Automatic image tuner
+
+The camera runs with its hardware AE, AGC, and AWB engines disabled. Startup explicitly freezes manual exposure, restores the saved image profile, and refuses to run the software loops unless camera readback confirms the automatic hardware controls are off. The tuned startup defaults are 1200 shutter lines, a maximum gain of `31/16` (about 1.94x), and white balance `104/65/76` at XGA/quality 12.
+
+The exposure tuner measures pre-HUD BT.709 luminance while excluding clipped black and white samples. The HUD reports this value as `CLIP-TRIM`. Three samples spanning at least four seconds outside the 25–35% hysteresis band trigger a bounded correction toward 30%. In darkness, shutter is lengthened first up to 1200 lines and gain may then rise only to `31/16`. In sustained brightness, gain is reduced first toward `16/16`, after which shutter is shortened as needed. Corrections change the exposure product by at most 50% per step, and evidence is cleared whenever the direction changes. Configure it with `CCTV_IMAGE_TARGET_BRIGHTNESS`, `CCTV_DIM_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHT_BRIGHTNESS_THRESHOLD`, `CCTV_BRIGHTNESS_OBSERVATION_SECONDS`, `CCTV_BRIGHTNESS_WINDOW_SECONDS`, `CCTV_MANUAL_SHUTTER_MIN_LINES`, `CCTV_MANUAL_SHUTTER_MAX_LINES`, `CCTV_MANUAL_GAIN_MIN_X16`, `CCTV_MANUAL_GAIN_MAX_X16`, and `CCTV_MANUAL_EXPOSURE_MAX_STEP`.
+
+The white-balance tuner measures robust median red/green and blue/green ratios from unclipped, near-neutral pixels and targets neutral `1.0/1.0` chroma. It holds green fixed and adjusts red and blue in steps of at most six register points after sustained drift. Exposure changes pause and clear WB evidence so the loops cannot fight, and strongly colored scenes with insufficient neutral evidence do not trigger a correction. Hardware AWB stays off throughout. The HUD shows `WBCTRL HOLD`, `STABLE`, `ADJUST`, or `DISABLED`, the measured `RGB R/1.00/B` ratios, and the applied WB bytes. Only verified manual RGB values are stored in version 2 state at `CCTV_IMAGE_CONTROL_STATE_PATH` (default `~/.local/state/cctv/image-control.json`); legacy learned references and disabled states are ignored. Configure it with `CCTV_AUTO_WB_ENABLED`, `CCTV_WB_OBSERVATION_SECONDS`, `CCTV_WB_WINDOW_SECONDS`, `CCTV_WB_SETTLE_SECONDS`, `CCTV_WB_DEADBAND`, and `CCTV_WB_MAX_STEP`.
+
+Every camera write validates the complete profile returned by `/image-control` before either controller commits it. Transient network resets and `camera_busy` responses use bounded backoff. A disconnect invalidates pending decisions, pauses image metrics, reapplies the manual profile after framesize/XCLK startup, and resumes tuning only after readback confirms manual AE, AGC, and AWB plus the cached color profile.
 
 ## Running tests
 
