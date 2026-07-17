@@ -3,10 +3,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+import requests
 
 from utilities.brightness_mode import (
     ManualExposureController,
     clipping_resistant_brightness,
+    clipping_resistant_metrics,
 )
 from utilities.color_profile import CameraColorProfile
 from utilities.esp32cam_client import CameraStatus
@@ -106,6 +108,22 @@ class ImageControlClientTests(unittest.TestCase):
         self.assertEqual(sleeps, [0.5, 1.0])
         self.assertEqual(session.get.call_count, 3)
 
+    def test_transient_connection_reset_retries_with_backoff(self):
+        session = Mock()
+        session.get.side_effect = [
+            requests.ConnectionError("reset"),
+            requests.ConnectionError("reset"),
+            FakeResponse(200, frozen_profile()),
+        ]
+        sleeps = []
+
+        result = ImageControlClient(
+            "http://camera", session=session, sleep=sleeps.append
+        ).get_profile()
+
+        self.assertFalse(result["exposure"]["autoExposure"])
+        self.assertEqual(sleeps, [0.5, 1.0])
+
     def test_validation_error_is_structured_and_not_retried(self):
         session = Mock()
         session.put.return_value = FakeResponse(
@@ -156,12 +174,35 @@ class ManualExposureControllerTests(unittest.TestCase):
         self.assertEqual(decision.shutter_lines, 150)
         self.assertEqual(decision.gain_x16, 128)
 
-    def test_bright_scene_never_reduces_exposure(self):
+    def test_sustained_bright_scene_reduces_gain_before_shutter(self):
         controller = self.make_controller()
         self.assertIsNone(controller.observe(0.80, now=0))
         self.assertIsNone(controller.observe(0.80, now=2))
+        decision = controller.observe(0.80, now=4)
+        self.assertEqual(decision.direction, "bright")
+        self.assertEqual(decision.shutter_lines, 100)
+        self.assertEqual(decision.gain_x16, 16)
+
+    def test_bright_scene_shortens_shutter_after_gain_floor(self):
+        controller = ManualExposureController(
+            observation_seconds=4,
+            window_seconds=12,
+            shutter_max=1200,
+            gain_max_x16=128,
+        )
+        controller.initialize(frozen_profile(1200, 16))
+        controller.observe(0.80, now=0)
+        controller.observe(0.80, now=2)
+        decision = controller.observe(0.80, now=4)
+        self.assertEqual(decision.shutter_lines, 600)
+        self.assertEqual(decision.gain_x16, 16)
+
+    def test_opposite_brightness_evidence_restarts_persistence_window(self):
+        controller = self.make_controller()
+        controller.observe(0.10, now=0)
+        controller.observe(0.80, now=2)
         self.assertIsNone(controller.observe(0.80, now=4))
-        self.assertIn("100L", controller.status_summary())
+        self.assertIsNotNone(controller.observe(0.80, now=6))
 
     def test_middle_band_holds_and_success_uses_returned_quantized_gain(self):
         controller = self.make_controller()
@@ -177,8 +218,8 @@ class ManualExposureControllerTests(unittest.TestCase):
 
     def test_default_policy_has_wider_shutter_and_lower_gain_caps(self):
         controller = ManualExposureController()
-        self.assertEqual(controller.shutter_max, 900)
-        self.assertEqual(controller.gain_max_x16, 64)
+        self.assertEqual(controller.shutter_max, 1200)
+        self.assertEqual(controller.gain_max_x16, 31)
 
     def test_initial_profile_is_normalized_inside_caps(self):
         controller = ManualExposureController(shutter_max=300, gain_max_x16=128)
@@ -209,6 +250,15 @@ class ClippingResistantBrightnessTests(unittest.TestCase):
         white = np.full((2, 2, 3), 255, dtype=np.uint8)
         self.assertEqual(clipping_resistant_brightness(black), 0.0)
         self.assertEqual(clipping_resistant_brightness(white), 1.0)
+
+    def test_chroma_ignores_clipped_pixels(self):
+        frame = np.array(
+            [[[0, 0, 0], [255, 255, 255], [100, 100, 120], [100, 100, 120]]],
+            dtype=np.uint8,
+        )
+        metrics = clipping_resistant_metrics(frame)
+        self.assertAlmostEqual(metrics.red_over_green, 1.2, places=5)
+        self.assertAlmostEqual(metrics.blue_over_green, 1.0, places=5)
 
 
 class CameraColorProfileTests(unittest.TestCase):
