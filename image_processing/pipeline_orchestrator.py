@@ -27,6 +27,10 @@ from utilities.recording_catalog import RecordingCatalog
 from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
 from utilities.color_profile import CameraColorProfile
 from utilities.image_control import ImageControlAPIError, ImageControlClient
+from utilities.white_balance_mode import (
+    ManualWhiteBalanceController,
+    WhiteBalanceDecision,
+)
 from utilities.startup import CameraRecoveryMode, startup
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
@@ -63,10 +67,16 @@ _recording_catalog = RecordingCatalog(RECORDINGS_DIR)
 _camera_recovery_lock = threading.Lock()
 _camera_recovery_thread: Optional[threading.Thread] = None
 _camera_configuration_lock = threading.Lock()
+_image_control_state_lock = threading.Lock()
+_image_control_ready = threading.Event()
+_image_control_generation = 0
 _exposure_adjustment_lock = threading.Lock()
 _exposure_adjustment_thread: Optional[threading.Thread] = None
+_white_balance_adjustment_lock = threading.Lock()
+_white_balance_adjustment_thread: Optional[threading.Thread] = None
 _image_control = ImageControlClient(CAMERA_BASE_URL)
 _exposure_controller = ManualExposureController.from_environment()
+_white_balance_controller = ManualWhiteBalanceController.from_environment()
 try:
     _color_profile = CameraColorProfile.load()
     _color_profile_error: str | None = None
@@ -79,35 +89,116 @@ def _disable_for_image_error(error: ImageControlAPIError) -> bool:
     return error.status in {400, 413, 500, 501} or error.code == "invalid_response"
 
 
-def _initialize_manual_exposure() -> None:
-    """Freeze exposure explicitly, then apply isolated manual color groups."""
-    try:
-        profile = _image_control.freeze_exposure(_image_control.get_profile())
-        normalization = _exposure_controller.initialize(profile)
-        if normalization is not None:
-            profile = _image_control.update_exposure(
-                normalization["shutterLines"], normalization["gainX16"]
-            )
-            _exposure_controller.complete(profile, success=True)
-    except (ImageControlAPIError, ValueError) as error:
-        # Startup/recovery may have rebooted the sensor, so a previously cached
-        # in-process profile is no longer safe to use after any freeze failure.
-        _exposure_controller.disable(str(error))
-        logging.exception("[image-control] Failed to freeze manual exposure")
-        return
+def _begin_image_control_recovery() -> int:
+    global _image_control_generation
+    with _image_control_state_lock:
+        _image_control_generation += 1
+        generation = _image_control_generation
+        _image_control_ready.clear()
+    _exposure_controller.invalidate_pending()
+    _white_balance_controller.invalidate_pending()
+    return generation
 
+
+def _current_image_control_generation() -> int:
+    with _image_control_state_lock:
+        return _image_control_generation
+
+
+def _generation_is_current(generation: int) -> bool:
+    return generation == _current_image_control_generation()
+
+
+def _validate_authoritative_profile(
+    profile: dict,
+    *,
+    expected_white_balance: dict[str, int] | None = None,
+) -> None:
+    exposure = profile.get("exposure")
+    white_balance = profile.get("whiteBalance")
+    if not isinstance(exposure, dict):
+        raise ValueError("image profile is missing exposure")
+    if exposure.get("autoExposure") is not False or exposure.get("autoGain") is not False:
+        raise ValueError("image profile does not have manual AE/AGC")
+    if not isinstance(white_balance, dict) or white_balance.get("auto") is not False:
+        raise ValueError("image profile does not have manual white balance")
+    if profile.get("cachedForRecovery") is not True:
+        raise ValueError("manual image profile is not cached for recovery")
+    if expected_white_balance is not None:
+        actual = {name: int(white_balance[name]) for name in ("red", "green", "blue")}
+        if actual != expected_white_balance:
+            raise ValueError(f"white-balance read-back mismatch: {actual}")
+    if _color_profile is not None:
+        saturation = profile.get("color", {}).get("saturation", {})
+        expected_saturation = {
+            "u": _color_profile.saturation_u,
+            "v": _color_profile.saturation_v,
+        }
+        actual_saturation = {name: int(saturation[name]) for name in ("u", "v")}
+        if actual_saturation != expected_saturation:
+            raise ValueError(f"saturation read-back mismatch: {actual_saturation}")
+
+
+def _initialize_manual_exposure(generation: int | None = None) -> dict:
+    """Apply and verify all manual image groups before enabling controllers."""
+    generation = _current_image_control_generation() if generation is None else generation
     if _color_profile is None:
-        logging.error("[image-control] COLOR UNAPPLIED: %s", _color_profile_error)
-    else:
+        raise ValueError(f"invalid color profile: {_color_profile_error}")
+
+    baseline_white_balance = {
+        "red": _color_profile.red,
+        "green": _color_profile.green,
+        "blue": _color_profile.blue,
+    }
+    try:
+        saved = _white_balance_controller.saved_white_balance()
+        requested_white_balance = saved or baseline_white_balance
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        logging.warning("[image-control] Ignoring invalid WB state: %s", error)
+        requested_white_balance = baseline_white_balance
+
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        if not _generation_is_current(generation):
+            raise RuntimeError("camera generation changed during image-control recovery")
         try:
-            profile = _image_control.update_profile(_color_profile.white_balance_patch())
-            profile = _image_control.update_profile(_color_profile.saturation_patch())
-            _exposure_controller.complete(profile, success=True)
-        except (ImageControlAPIError, ValueError):
-            logging.exception("[image-control] COLOR UNAPPLIED")
-    if not profile.get("cachedForRecovery", False):
-        logging.warning("[image-control] Manual image profile is not cached for recovery.")
-    logging.info("[image-control] %s", _exposure_controller.status_summary())
+            profile = _image_control.freeze_exposure(_image_control.get_profile())
+            normalization = _exposure_controller.initialize(profile)
+            if normalization is not None:
+                profile = _image_control.update_exposure(
+                    normalization["shutterLines"], normalization["gainX16"]
+                )
+            profile = _image_control.update_profile(
+                {"whiteBalance": {"auto": False, **requested_white_balance}}
+            )
+            _image_control.update_profile(_color_profile.saturation_patch())
+            profile = _image_control.get_profile()
+            _validate_authoritative_profile(
+                profile, expected_white_balance=requested_white_balance
+            )
+            _exposure_controller.initialize(profile)
+            _white_balance_controller.initialize(profile)
+            if not _generation_is_current(generation):
+                raise RuntimeError("camera generation changed after image-control verification")
+            _image_control_ready.set()
+            break
+        except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+            last_error = error
+            _image_control_ready.clear()
+            logging.warning(
+                "[image-control] Reconciliation attempt %d/3 failed: %s", attempt, error
+            )
+            if attempt < 3:
+                time.sleep(float(attempt))
+    else:
+        raise RuntimeError(f"unable to verify manual image control: {last_error}")
+
+    logging.info(
+        "[image-control] %s · %s",
+        _exposure_controller.status_summary(),
+        _white_balance_controller.status_summary(),
+    )
+    return profile
 
 
 def _schedule_camera_recovery(reason: str) -> None:
@@ -121,18 +212,26 @@ def _schedule_camera_recovery(reason: str) -> None:
             logging.info("[recovery] Camera startup already running; coalescing disconnect (%s).", reason)
             return
 
+        generation = _begin_image_control_recovery()
+
         def recover() -> None:
             logging.warning("[recovery] MJPEG disconnected (%s); running full camera startup.", reason)
-            try:
-                with _camera_configuration_lock:
-                    startup()
-                    _initialize_manual_exposure()
-            except CameraRecoveryMode:
-                logging.exception("[recovery] Camera entered OTA/recovery mode during startup.")
-            except Exception:
-                logging.exception("[recovery] Camera startup failed; native reconnect will retry.")
-            else:
-                logging.info("[recovery] Full camera startup sequence completed after disconnect.")
+            while not _shutdown_event.is_set() and _generation_is_current(generation):
+                try:
+                    with _camera_configuration_lock:
+                        startup()
+                        _initialize_manual_exposure(generation)
+                except CameraRecoveryMode:
+                    logging.exception("[recovery] Camera entered OTA/recovery mode during startup.")
+                    return
+                except Exception:
+                    logging.exception(
+                        "[recovery] Camera startup or manual verification failed; retrying in 5s."
+                    )
+                    _shutdown_event.wait(5)
+                else:
+                    logging.info("[recovery] Camera startup and manual image verification completed.")
+                    return
 
         _camera_recovery_thread = threading.Thread(
             target=recover,
@@ -142,18 +241,44 @@ def _schedule_camera_recovery(reason: str) -> None:
         _camera_recovery_thread.start()
 
 
+def _verify_profile_after_connect() -> None:
+    """Read back manual state after a connection transition without blocking events."""
+    with _camera_recovery_lock:
+        if _camera_recovery_thread and _camera_recovery_thread.is_alive():
+            return
+
+    def verify() -> None:
+        try:
+            with _camera_configuration_lock:
+                profile = _image_control.get_profile()
+                _validate_authoritative_profile(profile)
+        except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+            logging.warning("[image-control] Post-connect verification failed: %s", error)
+            _schedule_camera_recovery(f"post-connect verification failed: {error}")
+
+    threading.Thread(
+        target=verify,
+        daemon=True,
+        name="cctv-image-control-verifier",
+    ).start()
+
+
 def _schedule_exposure_adjustment(decision: ManualExposureDecision) -> None:
     """Apply one manual exposure correction without blocking native event reads."""
     global _exposure_adjustment_thread
 
+    generation = _current_image_control_generation()
     with _exposure_adjustment_lock:
-        if _shutdown_event.is_set():
+        if _shutdown_event.is_set() or not _image_control_ready.is_set():
             _exposure_controller.complete(None, success=False)
             return
         if _exposure_adjustment_thread and _exposure_adjustment_thread.is_alive():
             return
 
         def adjust() -> None:
+            if not _generation_is_current(generation):
+                _exposure_controller.complete(None, success=False)
+                return
             logging.info(
                 "[image-control] %.1f%% brightness: %s correction to %dL, gain %d/16.",
                 decision.average_brightness * 100,
@@ -163,16 +288,24 @@ def _schedule_exposure_adjustment(decision: ManualExposureDecision) -> None:
             )
             try:
                 with _camera_configuration_lock:
+                    if (
+                        not _image_control_ready.is_set()
+                        or not _generation_is_current(generation)
+                    ):
+                        _exposure_controller.complete(None, success=False)
+                        return
                     profile = _image_control.update_exposure(
                         decision.shutter_lines, decision.gain_x16
                     )
+                    _validate_authoritative_profile(profile)
                 _exposure_controller.complete(profile, success=True)
+                _white_balance_controller.sync_profile(profile)
+                _white_balance_controller.hold()
                 logging.info("[image-control] Applied %s", _exposure_controller.status_summary())
             except (ImageControlAPIError, ValueError) as error:
                 _exposure_controller.complete(None, success=False)
-                if isinstance(error, ValueError) or _disable_for_image_error(error):
-                    _exposure_controller.disable(str(error))
                 logging.exception("[image-control] Manual exposure correction failed")
+                _schedule_camera_recovery(f"manual exposure verification failed: {error}")
 
         _exposure_adjustment_thread = threading.Thread(
             target=adjust,
@@ -180,6 +313,74 @@ def _schedule_exposure_adjustment(decision: ManualExposureDecision) -> None:
             name="cctv-manual-exposure",
         )
         _exposure_adjustment_thread.start()
+
+
+def _schedule_white_balance_adjustment(decision: WhiteBalanceDecision) -> None:
+    """Apply one software WB correction without enabling sensor AWB."""
+    global _white_balance_adjustment_thread
+
+    generation = _current_image_control_generation()
+    with _white_balance_adjustment_lock:
+        if _shutdown_event.is_set() or not _image_control_ready.is_set():
+            _white_balance_controller.complete(None, success=False)
+            return
+        if _white_balance_adjustment_thread and _white_balance_adjustment_thread.is_alive():
+            return
+
+        def adjust() -> None:
+            if not _generation_is_current(generation):
+                _white_balance_controller.complete(None, success=False)
+                return
+            logging.info(
+                "[image-control] Chroma %.3f/1/%.3f: WB correction to %d/%d/%d.",
+                decision.average_red_over_green,
+                decision.average_blue_over_green,
+                decision.red,
+                decision.green,
+                decision.blue,
+            )
+            try:
+                with _camera_configuration_lock:
+                    if (
+                        not _image_control_ready.is_set()
+                        or not _generation_is_current(generation)
+                    ):
+                        _white_balance_controller.complete(None, success=False)
+                        return
+                    profile = _image_control.update_profile(
+                        {
+                            "whiteBalance": {
+                                "auto": False,
+                                "red": decision.red,
+                                "green": decision.green,
+                                "blue": decision.blue,
+                            }
+                        }
+                    )
+                    _validate_authoritative_profile(
+                        profile,
+                        expected_white_balance={
+                            "red": decision.red,
+                            "green": decision.green,
+                            "blue": decision.blue,
+                        },
+                    )
+                # Validate the complete returned profile before either controller
+                # commits it or the state store persists it.
+                _exposure_controller.complete(profile, success=True)
+                _white_balance_controller.complete(profile, success=True)
+                logging.info("[image-control] Applied %s", _white_balance_controller.status_summary())
+            except (ImageControlAPIError, ValueError) as error:
+                _white_balance_controller.complete(None, success=False)
+                logging.exception("[image-control] Manual WB correction failed")
+                _schedule_camera_recovery(f"manual WB verification failed: {error}")
+
+        _white_balance_adjustment_thread = threading.Thread(
+            target=adjust,
+            daemon=True,
+            name="cctv-manual-white-balance",
+        )
+        _white_balance_adjustment_thread.start()
 
 
 def _resolve_python_command() -> str:
@@ -316,18 +517,30 @@ class NativeEventReader(threading.Thread):
                 payload.get("rtsp"),
             )
         elif event_type == "image.metrics":
+            if not _image_control_ready.is_set():
+                return
             brightness_value = payload.get("scene_brightness")
             if isinstance(brightness_value, (int, float)):
                 decision = _exposure_controller.observe(float(brightness_value))
                 if decision is not None:
+                    _white_balance_controller.hold()
                     _schedule_exposure_adjustment(decision)
+                    return
+            red_ratio = payload.get("red_over_green")
+            blue_ratio = payload.get("blue_over_green")
+            if isinstance(red_ratio, (int, float)) and isinstance(blue_ratio, (int, float)):
+                wb_decision = _white_balance_controller.observe(
+                    float(red_ratio), float(blue_ratio)
+                )
+                if wb_decision is not None:
+                    _schedule_white_balance_adjustment(wb_decision)
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)
-            _exposure_controller.reset_observations()
             _schedule_camera_recovery(reason)
         elif event_type == "stream.connected":
             logging.info("[native-stream] MJPEG signal restored.")
+            _verify_profile_after_connect()
 
 
 def start_camera_pipeline() -> Optional[subprocess.Popen]:
@@ -355,8 +568,9 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
             else:
                 try:
                     with _camera_configuration_lock:
+                        generation = _begin_image_control_recovery()
                         startup()
-                        _initialize_manual_exposure()
+                        _initialize_manual_exposure(generation)
                 except CameraRecoveryMode:
                     logging.exception("[orchestrator] Camera is in recovery mode; using Python controller.")
                     backend = "python"
