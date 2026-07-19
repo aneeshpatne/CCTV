@@ -110,11 +110,29 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(metrics.blueOverGreen), 0.9, accuracy: 0.0001)
     }
 
-    func testImageMetricsDoNotUseStronglyColoredPixelsAsFallback() throws {
+    func testImageMetricsReferenceReportsStrongColorCast() throws {
         let buffer = try pixelBuffer(blue: 20, green: 40, red: 180)
         let metrics = try XCTUnwrap(MotionDetector.imageMetrics(buffer))
-        XCTAssertNil(metrics.redOverGreen)
-        XCTAssertNil(metrics.blueOverGreen)
+        XCTAssertEqual(try XCTUnwrap(metrics.redOverGreen), 4.5, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(metrics.blueOverGreen), 0.5, accuracy: 0.0001)
+    }
+
+    func testImageMetricsFilterDoesNotSmoothFreshChroma() throws {
+        var filter = ImageMetricsFilter()
+        _ = filter.update(brightness: 0.2, redRatio: 0.8, blueRatio: 1.2)
+        let current = filter.update(brightness: 0.4, redRatio: 1.1, blueRatio: 0.9)
+        XCTAssertEqual(try XCTUnwrap(current.1), 1.1, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(current.2), 0.9, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(current.0), 0.22, accuracy: 0.0001)
+    }
+
+    func testImageMetricsFilterClearsStaleChromaWhenNeutralPixelsDisappear() throws {
+        var filter = ImageMetricsFilter()
+        _ = filter.update(brightness: 0.3, redRatio: 1.08, blueRatio: 0.93)
+        let missing = filter.update(brightness: 0.3, redRatio: nil, blueRatio: nil)
+        XCTAssertNil(missing.1)
+        XCTAssertNil(missing.2)
+        XCTAssertNotNil(missing.0)
     }
 
     func testMotionAccumulatorRequiresPersistenceAndKeepsPadding() async {

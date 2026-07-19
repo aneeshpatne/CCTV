@@ -35,22 +35,50 @@ private struct RuntimeSnapshot: Sendable {
     let blueOverGreen: Double?
 }
 
+struct ImageMetricsFilter: Sendable {
+    private(set) var sceneBrightness: Double?
+    private(set) var redOverGreen: Double?
+    private(set) var blueOverGreen: Double?
+
+    mutating func update(
+        brightness: Double?, redRatio: Double?, blueRatio: Double?
+    ) -> (Double?, Double?, Double?) {
+        if let brightness {
+            sceneBrightness = sceneBrightness.map { 0.9 * $0 + 0.1 * brightness } ?? brightness
+        }
+        // Chroma is already median-filtered over a long decision window by the
+        // host controller. Keeping an EMA here hid the response to register writes,
+        // and retaining the last value when neutral pixels disappeared caused the
+        // controller to replay stale evidence until it hit the register extremes.
+        if let redRatio, let blueRatio {
+            redOverGreen = redRatio
+            blueOverGreen = blueRatio
+        } else {
+            redOverGreen = nil
+            blueOverGreen = nil
+        }
+        return (sceneBrightness, redOverGreen, blueOverGreen)
+    }
+
+    mutating func clear() {
+        sceneBrightness = nil
+        redOverGreen = nil
+        blueOverGreen = nil
+    }
+}
+
 private actor PipelineRuntimeState {
     private let startedAt = ProcessInfo.processInfo.systemUptime
     private var lastFrameAt: TimeInterval?
     private var processedFrameTimes: [TimeInterval] = []
     private var latencySamplesMS: [Double] = []
     private var motionScore = 0.0
-    private var sceneBrightness: Double?
-    private var redOverGreen: Double?
-    private var blueOverGreen: Double?
+    private var imageMetrics = ImageMetricsFilter()
     private var reconnectRequested = false
 
     func recordReceived(at monotonicTime: TimeInterval) {
         if let lastFrameAt, monotonicTime - lastFrameAt >= 3 {
-            sceneBrightness = nil
-            redOverGreen = nil
-            blueOverGreen = nil
+            imageMetrics.clear()
         }
         lastFrameAt = monotonicTime
         reconnectRequested = false
@@ -78,17 +106,9 @@ private actor PipelineRuntimeState {
     func recordImageMetrics(
         brightness: Double?, redRatio: Double?, blueRatio: Double?
     ) -> (Double?, Double?, Double?) {
-        guard let brightness else { return (sceneBrightness, redOverGreen, blueOverGreen) }
-        // Smooth frame-level compression noise; the orchestrator applies the longer
-        // 30-60 second decision window.
-        sceneBrightness = sceneBrightness.map { 0.9 * $0 + 0.1 * brightness } ?? brightness
-        if let redRatio {
-            redOverGreen = redOverGreen.map { 0.9 * $0 + 0.1 * redRatio } ?? redRatio
-        }
-        if let blueRatio {
-            blueOverGreen = blueOverGreen.map { 0.9 * $0 + 0.1 * blueRatio } ?? blueRatio
-        }
-        return (sceneBrightness, redOverGreen, blueOverGreen)
+        imageMetrics.update(
+            brightness: brightness, redRatio: redRatio, blueRatio: blueRatio
+        )
     }
 
     func shouldReconnect(at now: TimeInterval) -> Bool {
@@ -109,9 +129,9 @@ private actor PipelineRuntimeState {
             processedFPS: Self.rate(for: processedFrameTimes),
             processingLatencyMS: latency,
             motionScore: motionScore,
-            sceneBrightness: sceneBrightness,
-            redOverGreen: redOverGreen,
-            blueOverGreen: blueOverGreen
+            sceneBrightness: imageMetrics.sceneBrightness,
+            redOverGreen: imageMetrics.redOverGreen,
+            blueOverGreen: imageMetrics.blueOverGreen
         )
     }
 
