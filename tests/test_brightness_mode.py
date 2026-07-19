@@ -80,18 +80,18 @@ class ImageControlClientTests(unittest.TestCase):
 
     def test_freeze_exposure_clamps_automatic_values_to_manual_limits(self):
         session = Mock()
-        session.put.return_value = FakeResponse(200, frozen_profile(1200, 31))
+        session.put.return_value = FakeResponse(200, frozen_profile(1247, 31))
         client = ImageControlClient("http://camera", session=session)
-        profile = frozen_profile(1247, 31)
+        profile = frozen_profile(1300, 31)
         profile["limits"] = {
-            "shutterLines": {"min": 1, "max": 1200},
+            "shutterLines": {"min": 1, "max": 1247},
             "gainX16": {"min": 16, "max": 496},
         }
         client.freeze_exposure(profile)
         session.put.assert_called_once_with(
             "http://camera/image-control",
             timeout=2.0,
-            json={"exposure": {"shutterLines": 1200, "gainX16": 31}},
+            json={"exposure": {"shutterLines": 1247, "gainX16": 31}},
         )
 
     def test_camera_busy_retries_with_backoff(self):
@@ -218,7 +218,7 @@ class ManualExposureControllerTests(unittest.TestCase):
 
     def test_default_policy_has_wider_shutter_and_lower_gain_caps(self):
         controller = ManualExposureController()
-        self.assertEqual(controller.shutter_max, 1200)
+        self.assertEqual(controller.shutter_max, 1247)
         self.assertEqual(controller.gain_max_x16, 31)
 
     def test_initial_profile_is_normalized_inside_caps(self):
@@ -259,6 +259,16 @@ class ClippingResistantBrightnessTests(unittest.TestCase):
         metrics = clipping_resistant_metrics(frame)
         self.assertAlmostEqual(metrics.red_over_green, 1.2, places=5)
         self.assertAlmostEqual(metrics.blue_over_green, 1.0, places=5)
+
+    def test_chroma_reference_wall_reports_strong_blue_and_red_casts(self):
+        blue_frame = np.full((100, 100, 3), [120, 80, 8], dtype=np.uint8)
+        red_frame = np.full((100, 100, 3), [60, 80, 168], dtype=np.uint8)
+        blue_metrics = clipping_resistant_metrics(blue_frame)
+        red_metrics = clipping_resistant_metrics(red_frame)
+        self.assertAlmostEqual(blue_metrics.red_over_green, 0.1, places=5)
+        self.assertAlmostEqual(blue_metrics.blue_over_green, 1.5, places=5)
+        self.assertAlmostEqual(red_metrics.red_over_green, 2.1, places=5)
+        self.assertAlmostEqual(red_metrics.blue_over_green, 0.75, places=5)
 
 
 class CameraColorProfileTests(unittest.TestCase):

@@ -18,7 +18,7 @@ class ClippingResistantMetrics:
 
 
 def clipping_resistant_metrics(frame: np.ndarray) -> ClippingResistantMetrics:
-    """Measure brightness and near-neutral chroma without clipped pixels."""
+    """Measure brightness and chroma from the camera's fixed neutral wall."""
     blue = frame[..., 0].astype(np.float32)
     green = frame[..., 1].astype(np.float32)
     red = frame[..., 2].astype(np.float32)
@@ -27,15 +27,21 @@ def clipping_resistant_metrics(frame: np.ndarray) -> ClippingResistantMetrics:
     usable_luma = luma[unclipped]
     brightness = float((usable_luma.mean() if usable_luma.size else luma.mean()) / 255.0)
 
-    maximum = np.maximum(np.maximum(red, green), blue)
-    minimum = np.minimum(np.minimum(red, green), blue)
-    neutral = unclipped & (green > 7.0) & ((maximum - minimum) <= 0.25 * np.maximum(maximum, 1.0))
-    if np.count_nonzero(neutral) < max(1, frame.shape[0] * frame.shape[1] // 100):
+    height, width = frame.shape[:2]
+    x1 = int(width * 0.51)
+    x2 = max(x1 + 1, int(np.ceil(width * 0.70)))
+    y1 = int(height * 0.26)
+    y2 = max(y1 + 1, int(np.ceil(height * 0.74)))
+    reference = np.zeros((height, width), dtype=bool)
+    reference[y1:y2, x1:x2] = True
+    neutral_wall = reference & unclipped & (green > 7.0)
+    minimum_samples = max(1, (x2 - x1) * (y2 - y1) // 20)
+    if np.count_nonzero(neutral_wall) < minimum_samples:
         return ClippingResistantMetrics(brightness, None, None)
     return ClippingResistantMetrics(
         brightness,
-        float(np.median(red[neutral] / green[neutral])),
-        float(np.median(blue[neutral] / green[neutral])),
+        float(np.median(red[neutral_wall] / green[neutral_wall])),
+        float(np.median(blue[neutral_wall] / green[neutral_wall])),
     )
 
 
@@ -64,7 +70,7 @@ class ManualExposureController:
         observation_seconds: float = 4.0,
         window_seconds: float = 12.0,
         shutter_min: int = 1,
-        shutter_max: int = 1200,
+        shutter_max: int = 1247,
         gain_min_x16: int = 16,
         gain_max_x16: int = 31,
         max_step: float = 0.50,
@@ -73,7 +79,7 @@ class ManualExposureController:
             raise ValueError("brightness values must satisfy dim < target < bright")
         if observation_seconds <= 0 or window_seconds < observation_seconds:
             raise ValueError("brightness window must cover the observation period")
-        if not 1 <= shutter_min <= shutter_max <= 1200:
+        if not 1 <= shutter_min <= shutter_max <= 1247:
             raise ValueError("invalid shutter limits")
         if not 16 <= gain_min_x16 <= gain_max_x16 <= 496:
             raise ValueError("invalid gain limits")
@@ -106,7 +112,7 @@ class ManualExposureController:
                 observation_seconds=float(os.getenv("CCTV_BRIGHTNESS_OBSERVATION_SECONDS", "4")),
                 window_seconds=float(os.getenv("CCTV_BRIGHTNESS_WINDOW_SECONDS", "12")),
                 shutter_min=int(os.getenv("CCTV_MANUAL_SHUTTER_MIN_LINES", "1")),
-                shutter_max=int(os.getenv("CCTV_MANUAL_SHUTTER_MAX_LINES", "1200")),
+                shutter_max=int(os.getenv("CCTV_MANUAL_SHUTTER_MAX_LINES", "1247")),
                 gain_min_x16=int(os.getenv("CCTV_MANUAL_GAIN_MIN_X16", "16")),
                 gain_max_x16=int(os.getenv("CCTV_MANUAL_GAIN_MAX_X16", "31")),
                 max_step=float(os.getenv("CCTV_MANUAL_EXPOSURE_MAX_STEP", "0.50")),

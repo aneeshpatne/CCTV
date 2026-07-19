@@ -259,8 +259,8 @@ actor MotionDetector {
         var usableCount = 0
         var allLuminance = 0.0
         var allCount = 0
-        var neutralRedRatios: [Double] = []
-        var neutralBlueRatios: [Double] = []
+        var referenceRedRatios: [Double] = []
+        var referenceBlueRatios: [Double] = []
 
         for y in stride(from: 0, to: height, by: sampleStep) {
             for x in stride(from: 0, to: width, by: sampleStep) {
@@ -274,13 +274,17 @@ actor MotionDetector {
                 if value > 7 && value < 248 {
                     usableLuminance += value
                     usableCount += 1
-                    if green > 7 {
-                        let maximum = max(red, green, blue)
-                        let minimum = min(red, green, blue)
-                        if maximum - minimum <= 0.25 * max(maximum, 1) {
-                            neutralRedRatios.append(red / green)
-                            neutralBlueRatios.append(blue / green)
-                        }
+                    let normalizedX = (Double(x) + 0.5) / Double(width)
+                    let normalizedY = (Double(y) + 0.5) / Double(height)
+                    // The fixed stairwell view contains a painted neutral wall in
+                    // this region. Measure its actual cast even when it is strongly
+                    // blue or red; selecting only pixels that already look neutral
+                    // hid the overnight lighting transitions from the controller.
+                    if green > 7,
+                       normalizedX >= 0.51, normalizedX < 0.70,
+                       normalizedY >= 0.26, normalizedY < 0.74 {
+                        referenceRedRatios.append(red / green)
+                        referenceBlueRatios.append(blue / green)
                     }
                 }
             }
@@ -289,17 +293,17 @@ actor MotionDetector {
         let brightness = usableCount > 0
             ? usableLuminance / (Double(usableCount) * 255)
             : allLuminance / (Double(allCount) * 255)
-        let minimumNeutral = max(1, allCount / 100)
-        guard neutralRedRatios.count >= minimumNeutral else {
+        let minimumReference = max(1, allCount / 100)
+        guard referenceRedRatios.count >= minimumReference else {
             return SceneColorMetrics(brightness: brightness, redOverGreen: nil, blueOverGreen: nil)
         }
-        neutralRedRatios.sort()
-        neutralBlueRatios.sort()
-        let midpoint = neutralRedRatios.count / 2
+        referenceRedRatios.sort()
+        referenceBlueRatios.sort()
+        let midpoint = referenceRedRatios.count / 2
         return SceneColorMetrics(
             brightness: brightness,
-            redOverGreen: neutralRedRatios[midpoint],
-            blueOverGreen: neutralBlueRatios[midpoint]
+            redOverGreen: referenceRedRatios[midpoint],
+            blueOverGreen: referenceBlueRatios[midpoint]
         )
     }
 

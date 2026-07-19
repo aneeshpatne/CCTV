@@ -59,8 +59,9 @@ class ImageControlClient:
         shutter = int(exposure["shutterLines"])
         gain = int(exposure["gainX16"])
         # Automatic loops can temporarily report values outside the range accepted
-        # for manual writes (observed shutter=1247 with a documented max of 1200).
-        shutter = min(int(shutter_limits.get("max", 1200)), max(int(shutter_limits.get("min", 1)), shutter))
+        # for manual writes. Always honor the authoritative limit advertised by
+        # the camera, with the current OV2640 maximum as the compatibility fallback.
+        shutter = min(int(shutter_limits.get("max", 1247)), max(int(shutter_limits.get("min", 1)), shutter))
         gain = min(int(gain_limits.get("max", 496)), max(int(gain_limits.get("min", 16)), gain))
         return self.update_exposure(
             shutter, gain
