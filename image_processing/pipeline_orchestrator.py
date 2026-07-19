@@ -151,7 +151,7 @@ def _initialize_manual_exposure(generation: int | None = None) -> dict:
         "blue": _color_profile.blue,
     }
     try:
-        saved = _white_balance_controller.saved_white_balance()
+        saved = _white_balance_controller.saved_white_balance(baseline_white_balance)
         requested_white_balance = saved or baseline_white_balance
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         logging.warning("[image-control] Ignoring invalid WB state: %s", error)
@@ -177,7 +177,7 @@ def _initialize_manual_exposure(generation: int | None = None) -> dict:
                 profile, expected_white_balance=requested_white_balance
             )
             _exposure_controller.initialize(profile)
-            _white_balance_controller.initialize(profile)
+            _white_balance_controller.initialize(profile, baseline_white_balance)
             if not _generation_is_current(generation):
                 raise RuntimeError("camera generation changed after image-control verification")
             _image_control_ready.set()
@@ -332,9 +332,10 @@ def _schedule_white_balance_adjustment(decision: WhiteBalanceDecision) -> None:
                 _white_balance_controller.complete(None, success=False)
                 return
             logging.info(
-                "[image-control] Chroma %.3f/1/%.3f: WB correction to %d/%d/%d.",
-                decision.average_red_over_green,
-                decision.average_blue_over_green,
+                "[image-control] WB %s from chroma %s/1/%s to %d/%d/%d.",
+                decision.action,
+                "--" if decision.average_red_over_green is None else f"{decision.average_red_over_green:.3f}",
+                "--" if decision.average_blue_over_green is None else f"{decision.average_blue_over_green:.3f}",
                 decision.red,
                 decision.green,
                 decision.blue,
@@ -528,12 +529,12 @@ class NativeEventReader(threading.Thread):
                     return
             red_ratio = payload.get("red_over_green")
             blue_ratio = payload.get("blue_over_green")
-            if isinstance(red_ratio, (int, float)) and isinstance(blue_ratio, (int, float)):
-                wb_decision = _white_balance_controller.observe(
-                    float(red_ratio), float(blue_ratio)
-                )
-                if wb_decision is not None:
-                    _schedule_white_balance_adjustment(wb_decision)
+            wb_decision = _white_balance_controller.observe(
+                float(red_ratio) if isinstance(red_ratio, (int, float)) else None,
+                float(blue_ratio) if isinstance(blue_ratio, (int, float)) else None,
+            )
+            if wb_decision is not None:
+                _schedule_white_balance_adjustment(wb_decision)
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)

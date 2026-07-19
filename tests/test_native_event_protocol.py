@@ -15,6 +15,7 @@ os.environ["CCTV_PIPELINE_BACKEND"] = "python"
 from image_processing import pipeline_orchestrator as orchestrator
 from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
 from utilities.color_profile import CameraColorProfile
+from utilities.white_balance_mode import WhiteBalanceDecision
 
 
 def frozen_profile(shutter=100, gain=32):
@@ -87,6 +88,12 @@ class NativeEventProtocolTests(unittest.TestCase):
             ],
         )
         self.assertTrue(orchestrator._image_control_ready.is_set())
+        white_balance_controller.saved_white_balance.assert_called_once_with(
+            {"red": 94, "green": 65, "blue": 84}
+        )
+        white_balance_controller.initialize.assert_called_once_with(
+            colored, {"red": 94, "green": 65, "blue": 84}
+        )
 
     def test_manual_adjustment_uses_partial_image_control_without_reset(self):
         controller = ManualExposureController()
@@ -214,6 +221,51 @@ class NativeEventProtocolTests(unittest.TestCase):
                 }
             )
         white_balance.observe.assert_called_once_with(0.92, 1.08)
+
+    def test_missing_chroma_is_forwarded_to_white_balance_controller(self):
+        exposure = Mock()
+        exposure.observe.return_value = None
+        white_balance = Mock()
+        white_balance.observe.return_value = None
+        with (
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {"scene_brightness": 0.30},
+                }
+            )
+        white_balance.observe.assert_called_once_with(None, None)
+
+    def test_white_balance_rollback_uses_partial_image_control_patch(self):
+        controller = Mock()
+        client = Mock()
+        returned = frozen_profile()
+        client.update_profile.return_value = returned
+        decision = WhiteBalanceDecision("rollback", None, None, 94, 65, 84)
+
+        with (
+            patch.object(orchestrator, "_white_balance_controller", controller),
+            patch.object(orchestrator, "_image_control", client),
+            patch.object(orchestrator, "_white_balance_adjustment_thread", None),
+            patch.object(orchestrator.threading, "Thread", ImmediateThread),
+        ):
+            orchestrator._schedule_white_balance_adjustment(decision)
+
+        client.update_profile.assert_called_once_with(
+            {
+                "whiteBalance": {
+                    "auto": False,
+                    "red": 94,
+                    "green": 65,
+                    "blue": 84,
+                }
+            }
+        )
+        controller.complete.assert_called_once_with(returned, success=True)
 
     def test_image_metrics_are_ignored_until_manual_profile_is_verified(self):
         orchestrator._image_control_ready.clear()

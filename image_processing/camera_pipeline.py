@@ -949,7 +949,9 @@ def initialize_manual_exposure(generation: int | None = None) -> dict:
         raise ValueError(f"invalid color profile: {color_profile_error}")
     baseline = {"red": color_profile.red, "green": color_profile.green, "blue": color_profile.blue}
     try:
-        requested_white_balance = white_balance_controller.saved_white_balance() or baseline
+        requested_white_balance = (
+            white_balance_controller.saved_white_balance(baseline) or baseline
+        )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         print(f"Ignoring invalid WB state: {error}")
         requested_white_balance = baseline
@@ -974,7 +976,7 @@ def initialize_manual_exposure(generation: int | None = None) -> dict:
                 profile, expected_white_balance=requested_white_balance
             )
             exposure_controller.initialize(profile)
-            white_balance_controller.initialize(profile)
+            white_balance_controller.initialize(profile, baseline)
             break
         except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
             last_error = error
@@ -2019,7 +2021,7 @@ def main() -> None:
             if exposure_decision is not None:
                 white_balance_controller.hold()
                 schedule_exposure_adjustment(exposure_decision)
-            elif metrics.red_over_green is not None and metrics.blue_over_green is not None:
+            else:
                 white_balance_decision = white_balance_controller.observe(
                     metrics.red_over_green, metrics.blue_over_green
                 )
