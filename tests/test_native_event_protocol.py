@@ -63,17 +63,23 @@ class NativeEventProtocolTests(unittest.TestCase):
         automatic["exposure"]["autoGain"] = True
         automatic["whiteBalance"]["auto"] = True
         manual = frozen_profile()
-        colored = {**manual, "color": {"saturation": {"u": 72, "v": 72}}}
+        colored = {
+            **manual,
+            "color": {"saturation": {"u": 72, "v": 72}},
+            "tone": {"lumaOffset": 12, "contrastRegisters": [48, 48, 48, 10]},
+        }
         client.get_profile.side_effect = [automatic, colored]
         client.freeze_exposure.return_value = manual
-        client.update_profile.side_effect = [manual, colored]
+        client.update_profile.side_effect = [manual, manual, colored]
 
         with patch.object(orchestrator, "_exposure_controller", controller), patch.object(
             orchestrator, "_white_balance_controller", white_balance_controller
         ), patch.object(
             orchestrator, "_image_control", client
         ), patch.object(
-            orchestrator, "_color_profile", CameraColorProfile(94, 65, 84, 72, 72)
+            orchestrator,
+            "_color_profile",
+            CameraColorProfile(94, 65, 84, 72, 72, luma_offset=12, contrast_registers=(48, 48, 48, 10)),
         ), patch.object(orchestrator, "_color_profile_error", None):
             orchestrator._initialize_manual_exposure()
 
@@ -85,6 +91,7 @@ class NativeEventProtocolTests(unittest.TestCase):
                     {"whiteBalance": {"auto": False, "red": 94, "green": 65, "blue": 84}}
                 ),
                 call({"color": {"saturation": {"u": 72, "v": 72}}}),
+                call({"tone": {"lumaOffset": 12, "contrastRegisters": [48, 48, 48, 10]}}),
             ],
         )
         self.assertTrue(orchestrator._image_control_ready.is_set())
@@ -220,7 +227,9 @@ class NativeEventProtocolTests(unittest.TestCase):
                     },
                 }
             )
-        white_balance.observe.assert_called_once_with(0.92, 1.08)
+        white_balance.observe.assert_called_once_with(
+            0.92, 1.08, scene_brightness=0.30
+        )
 
     def test_missing_chroma_is_forwarded_to_white_balance_controller(self):
         exposure = Mock()
@@ -238,7 +247,9 @@ class NativeEventProtocolTests(unittest.TestCase):
                     "payload": {"scene_brightness": 0.30},
                 }
             )
-        white_balance.observe.assert_called_once_with(None, None)
+        white_balance.observe.assert_called_once_with(
+            None, None, scene_brightness=0.30
+        )
 
     def test_white_balance_rollback_uses_partial_image_control_patch(self):
         controller = Mock()

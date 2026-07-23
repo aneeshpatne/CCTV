@@ -74,6 +74,12 @@ _exposure_adjustment_lock = threading.Lock()
 _exposure_adjustment_thread: Optional[threading.Thread] = None
 _white_balance_adjustment_lock = threading.Lock()
 _white_balance_adjustment_thread: Optional[threading.Thread] = None
+_wb_drift_check_lock = threading.Lock()
+_wb_drift_check_thread: Optional[threading.Thread] = None
+_wb_drift_last_check = 0.0
+_WB_DRIFT_CHECK_INTERVAL_SECONDS = float(
+    os.getenv("CCTV_WB_DRIFT_CHECK_INTERVAL_SECONDS", "20")
+)
 _image_control = ImageControlClient(CAMERA_BASE_URL)
 _exposure_controller = ManualExposureController.from_environment()
 _white_balance_controller = ManualWhiteBalanceController.from_environment()
@@ -137,6 +143,17 @@ def _validate_authoritative_profile(
         actual_saturation = {name: int(saturation[name]) for name in ("u", "v")}
         if actual_saturation != expected_saturation:
             raise ValueError(f"saturation read-back mismatch: {actual_saturation}")
+        tone = profile.get("tone") or {}
+        if int(tone.get("lumaOffset", 0)) != _color_profile.luma_offset:
+            raise ValueError(
+                f"lumaOffset read-back mismatch: {tone.get('lumaOffset')}"
+            )
+        actual_contrast = [int(value) for value in tone.get("contrastRegisters", [])]
+        expected_contrast = list(_color_profile.contrast_registers)
+        if actual_contrast != expected_contrast:
+            raise ValueError(
+                f"contrastRegisters read-back mismatch: {actual_contrast}"
+            )
 
 
 def _initialize_manual_exposure(generation: int | None = None) -> dict:
@@ -150,12 +167,17 @@ def _initialize_manual_exposure(generation: int | None = None) -> dict:
         "green": _color_profile.green,
         "blue": _color_profile.blue,
     }
-    try:
-        saved = _white_balance_controller.saved_white_balance(baseline_white_balance)
-        requested_white_balance = saved or baseline_white_balance
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        logging.warning("[image-control] Ignoring invalid WB state: %s", error)
+    # Oneshot mode re-seeds from the profile baseline so each recovery can look at
+    # the live scene and pick values once. Continuous mode restores last verified.
+    if getattr(_white_balance_controller, "mode", None) == "oneshot":
         requested_white_balance = baseline_white_balance
+    else:
+        try:
+            saved = _white_balance_controller.saved_white_balance(baseline_white_balance)
+            requested_white_balance = saved or baseline_white_balance
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            logging.warning("[image-control] Ignoring invalid WB state: %s", error)
+            requested_white_balance = baseline_white_balance
 
     last_error: Exception | None = None
     for attempt in range(1, 4):
@@ -172,6 +194,7 @@ def _initialize_manual_exposure(generation: int | None = None) -> dict:
                 {"whiteBalance": {"auto": False, **requested_white_balance}}
             )
             _image_control.update_profile(_color_profile.saturation_patch())
+            _image_control.update_profile(_color_profile.tone_patch())
             profile = _image_control.get_profile()
             _validate_authoritative_profile(
                 profile, expected_white_balance=requested_white_balance
@@ -384,6 +407,74 @@ def _schedule_white_balance_adjustment(decision: WhiteBalanceDecision) -> None:
         _white_balance_adjustment_thread.start()
 
 
+def _schedule_wb_drift_check() -> None:
+    """Read camera RGB; if it drifted from the locked set, restore and re-open oneshot."""
+    global _wb_drift_check_thread, _wb_drift_last_check
+
+    now = time.monotonic()
+    with _wb_drift_check_lock:
+        if _shutdown_event.is_set() or not _image_control_ready.is_set():
+            return
+        if now - _wb_drift_last_check < _WB_DRIFT_CHECK_INTERVAL_SECONDS:
+            return
+        if _wb_drift_check_thread and _wb_drift_check_thread.is_alive():
+            return
+        _wb_drift_last_check = now
+        generation = _current_image_control_generation()
+
+        def check() -> None:
+            if not _generation_is_current(generation):
+                return
+            try:
+                with _camera_configuration_lock:
+                    if (
+                        not _image_control_ready.is_set()
+                        or not _generation_is_current(generation)
+                    ):
+                        return
+                    profile = _image_control.get_profile()
+                    white_balance = profile.get("whiteBalance") or {}
+                    restore = _white_balance_controller.check_camera_drift(
+                        int(white_balance["red"]),
+                        int(white_balance["green"]),
+                        int(white_balance["blue"]),
+                    )
+                    if restore is None:
+                        return
+                    logging.warning(
+                        "[image-control] Camera WB drifted to %s/%s/%s; restoring %d/%d/%d and reopening verify.",
+                        white_balance.get("red"),
+                        white_balance.get("green"),
+                        white_balance.get("blue"),
+                        restore["red"],
+                        restore["green"],
+                        restore["blue"],
+                    )
+                    profile = _image_control.update_profile(
+                        {"whiteBalance": {"auto": False, **restore}}
+                    )
+                    _validate_authoritative_profile(
+                        profile, expected_white_balance=restore
+                    )
+                _exposure_controller.complete(profile, success=True)
+                _white_balance_controller.sync_profile(profile)
+                # Leave unlocked (oneshot HOLD) so the next bright-frame window
+                # can re-enter ADJUST/VERIFY and lock again.
+                logging.info(
+                    "[image-control] Drift restore applied · %s",
+                    _white_balance_controller.status_summary(),
+                )
+            except (ImageControlAPIError, KeyError, TypeError, ValueError):
+                logging.exception("[image-control] WB drift check failed")
+
+        _wb_drift_check_thread = threading.Thread(
+            target=check,
+            daemon=True,
+            name="cctv-wb-drift-check",
+        )
+        _wb_drift_check_thread.start()
+
+
 def _resolve_python_command() -> str:
     """Return a Python executable suitable for spawning the pipeline."""
     candidates = [
@@ -517,6 +608,7 @@ class NativeEventReader(threading.Thread):
                 payload.get("recording"),
                 payload.get("rtsp"),
             )
+            _schedule_wb_drift_check()
         elif event_type == "image.metrics":
             if not _image_control_ready.is_set():
                 return
@@ -532,9 +624,15 @@ class NativeEventReader(threading.Thread):
             wb_decision = _white_balance_controller.observe(
                 float(red_ratio) if isinstance(red_ratio, (int, float)) else None,
                 float(blue_ratio) if isinstance(blue_ratio, (int, float)) else None,
+                scene_brightness=(
+                    float(brightness_value)
+                    if isinstance(brightness_value, (int, float))
+                    else None
+                ),
             )
             if wb_decision is not None:
                 _schedule_white_balance_adjustment(wb_decision)
+            _schedule_wb_drift_check()
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)
