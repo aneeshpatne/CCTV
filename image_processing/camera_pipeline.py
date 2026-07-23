@@ -964,7 +964,6 @@ def initialize_manual_exposure(generation: int | None = None) -> dict:
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             print(f"Ignoring invalid WB state: {error}")
             requested_white_balance = baseline
-        requested_white_balance = baseline
 
     last_error = None
     for attempt in range(1, 4):
@@ -1334,7 +1333,10 @@ def draw_hud(
     quality_level: int | None = None,
     startup_changes: str | None = None,
 ):
-    """Draws a square Material dark HUD."""
+    """Draws a compact Material dark HUD (timestamp, motion, wifi, fps, temp)."""
+    # scene_brightness / quality_level / startup_changes kept for call-site
+    # compatibility; they are no longer rendered on the overlay.
+    del scene_brightness, quality_level, startup_changes
     x, y = coordinates
     _, w = frame.shape[:2]
 
@@ -1582,108 +1584,6 @@ def draw_hud(
                 ic_x + icon_w + icon_pad,
                 text_center_y,
                 font_color if soc_temp_c is not None else muted_color,
-                font_size,
-                font,
-                font_scale,
-                thickness,
-            )
-
-    cursor_x -= gap
-
-    brightness_text = (
-        f"{scene_brightness * 100:.1f}% CLIP-TRIM"
-        if scene_brightness is not None
-        else "--% CLIP-TRIM"
-    )
-    tw, th = get_hud_text_size(
-        brightness_text, font_size, font, font_scale, thickness
-    )
-    brightness_box_w = tw + (pad_x * 2) + 8
-    cursor_x -= brightness_box_w
-    if should_draw("brightness", cursor_x, top_margin, brightness_box_w, box_h):
-        if scene_brightness is None:
-            brightness_color = status_neutral
-        elif scene_brightness < 0.25:
-            brightness_color = status_warn
-        elif scene_brightness > 0.35:
-            brightness_color = status_good
-        else:
-            brightness_color = status_neutral
-        draw_box(
-            frame,
-            cursor_x,
-            top_margin,
-            brightness_box_w,
-            box_h,
-            bg_color=surface_variant,
-            border_color=panel_border,
-            accent_color=brightness_color,
-        )
-        put_hud_text(
-            frame,
-            brightness_text,
-            cursor_x + pad_x + 4,
-            text_center_y,
-            font_color if scene_brightness is not None else muted_color,
-            font_size,
-            font,
-            font_scale,
-            thickness,
-        )
-
-    settings_y = top_margin + box_h + gap
-    quality_text = f"QUALITY {quality_level}" if quality_level is not None else "QUALITY --"
-    quality_w, _ = get_hud_text_size(
-        quality_text, font_size, font, font_scale, thickness
-    )
-    quality_box_w = quality_w + (pad_x * 2)
-    if should_draw("quality", gap, settings_y, quality_box_w, box_h):
-        draw_box(
-            frame,
-            gap,
-            settings_y,
-            quality_box_w,
-            box_h,
-            bg_color=surface_variant,
-            border_color=panel_border,
-        )
-        put_hud_text(
-            frame,
-            quality_text,
-            gap + pad_x,
-            settings_y + box_h // 2,
-            font_color if quality_level is not None else muted_color,
-            font_size,
-            font,
-            font_scale,
-            thickness,
-        )
-
-    if startup_changes:
-        startup_text = f"IMAGE · {startup_changes}"
-        startup_w, _ = get_hud_text_size(
-            startup_text, font_size, font, font_scale, thickness
-        )
-        startup_x = gap + quality_box_w + gap
-        startup_box_w = min(startup_w + (pad_x * 2), max(0, w - startup_x - gap))
-        if startup_box_w > 0 and should_draw(
-            "startup_changes", startup_x, settings_y, startup_box_w, box_h
-        ):
-            draw_box(
-                frame,
-                startup_x,
-                settings_y,
-                startup_box_w,
-                box_h,
-                bg_color=surface_variant,
-                border_color=panel_border,
-            )
-            put_hud_text(
-                frame,
-                startup_text,
-                startup_x + pad_x,
-                settings_y + box_h // 2,
-                font_color,
                 font_size,
                 font,
                 font_scale,
@@ -2092,7 +1992,7 @@ def main() -> None:
                     )
 
             # Hold the presentation state through brief detector gaps. Only a new
-            # episode starts the fixed, serialized thirty-second LED flash sequence.
+            # episode starts the fixed, serialized ten-second LED sequence.
             now_mono = time.monotonic()
             motion_state = motion_activity.update(motion_detected, now_mono)
             try:
@@ -2100,7 +2000,7 @@ def main() -> None:
             except Exception as e:
                 print(f"Warning: Blinker update failed: {e}")
             if motion_state.started:
-                blinker.start(duration=30, now=now_mono)
+                blinker.start(duration=10, now=now_mono)
             if motion_detected:
                 # Trigger accumulated motion event tracking
                 acc.trigger()
@@ -2121,9 +2021,6 @@ def main() -> None:
                 motion_state.active,
                 time_overlap,
                 coordinates,
-                scene_brightness=scene_brightness,
-                quality_level=12,
-                startup_changes=camera_settings_summary(),
             )
 
             # Draw ROI polygon on display only if flag is enabled
