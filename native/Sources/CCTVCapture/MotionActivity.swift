@@ -51,7 +51,7 @@ actor CameraLEDBlinker {
     private var blinkTask: Task<Void, Never>?
     private var pendingStart = false
 
-    init(baseURL: URL, duration: TimeInterval = 10) {
+    init(baseURL: URL, duration: TimeInterval = 30) {
         self.baseURL = baseURL
         self.duration = duration
         let configuration = URLSessionConfiguration.ephemeral

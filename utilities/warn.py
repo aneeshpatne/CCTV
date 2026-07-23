@@ -22,7 +22,7 @@ class NonBlockingBlinker:
     def _set_led(self, brightness: int) -> None:
         self._dispatcher.submit(brightness)
 
-    def start(self, duration=10, now=None):
+    def start(self, duration=30, now=None):
         """Start immediately, coalescing duplicate starts while active."""
         if self.is_active:
             return False

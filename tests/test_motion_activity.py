@@ -36,15 +36,15 @@ class MotionActivityTests(unittest.TestCase):
         dispatcher = FakeDispatcher()
         blinker = NonBlockingBlinker(dispatcher=dispatcher)
 
-        self.assertTrue(blinker.start(duration=10, now=100))
+        self.assertTrue(blinker.start(duration=30, now=100))
         self.assertEqual(dispatcher.values, [10])
-        self.assertFalse(blinker.start(duration=10, now=101))
+        self.assertFalse(blinker.start(duration=30, now=101))
         self.assertEqual(dispatcher.values, [10])
 
     def test_blinker_runs_quick_double_flash_and_finishes_off(self):
         dispatcher = FakeDispatcher()
         blinker = NonBlockingBlinker(dispatcher=dispatcher)
-        blinker.start(duration=10, now=100)
+        blinker.start(duration=30, now=100)
 
         blinker.update(now=100.21)
         blinker.update(now=100.41)
@@ -52,11 +52,11 @@ class MotionActivityTests(unittest.TestCase):
         blinker.update(now=101.61)
         self.assertEqual(dispatcher.values, [10, 0, 10, 0, 10])
 
-        blinker.update(now=110)
+        blinker.update(now=130)
         self.assertFalse(blinker.is_active)
         self.assertEqual(dispatcher.values[-1], 0)
 
-        self.assertTrue(blinker.start(duration=10, now=110))
+        self.assertTrue(blinker.start(duration=30, now=130))
         self.assertEqual(dispatcher.values[-1], 10)
 
 

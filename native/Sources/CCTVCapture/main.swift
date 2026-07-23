@@ -229,7 +229,7 @@ final class FramePipeline: @unchecked Sendable {
         self.emitter = EventEmitter(fileDescriptor: configuration.eventFileDescriptor)
         self.renderer = HUDRenderer()
         self.motionDetector = try MotionDetector(context: renderer.context)
-        self.ledBlinker = CameraLEDBlinker(baseURL: configuration.cameraBaseURL, duration: 10)
+        self.ledBlinker = CameraLEDBlinker(baseURL: configuration.cameraBaseURL, duration: 30)
         self.telemetry = CameraTelemetry(baseURL: configuration.cameraBaseURL)
         self.output = try FrameOutput(configuration: configuration, emitter: emitter)
     }
