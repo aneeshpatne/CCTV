@@ -273,7 +273,7 @@ class ClippingResistantBrightnessTests(unittest.TestCase):
 
 class CameraColorProfileTests(unittest.TestCase):
     def test_profile_produces_isolated_white_balance_and_saturation_patches(self):
-        profile = CameraColorProfile(94, 65, 84, 72, 72)
+        profile = CameraColorProfile(94, 65, 84, 72, 72, luma_offset=12, contrast_registers=(48, 48, 48, 10))
         self.assertEqual(
             profile.white_balance_patch(),
             {"whiteBalance": {"auto": False, "red": 94, "green": 65, "blue": 84}},
@@ -281,6 +281,10 @@ class CameraColorProfileTests(unittest.TestCase):
         self.assertEqual(
             profile.saturation_patch(),
             {"color": {"saturation": {"u": 72, "v": 72}}},
+        )
+        self.assertEqual(
+            profile.tone_patch(),
+            {"tone": {"lumaOffset": 12, "contrastRegisters": [48, 48, 48, 10]}},
         )
 
 
