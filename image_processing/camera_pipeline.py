@@ -1992,7 +1992,7 @@ def main() -> None:
                     )
 
             # Hold the presentation state through brief detector gaps. Only a new
-            # episode starts the fixed, serialized ten-second LED sequence.
+            # episode starts the fixed, serialized thirty-second LED flash sequence.
             now_mono = time.monotonic()
             motion_state = motion_activity.update(motion_detected, now_mono)
             try:
@@ -2000,7 +2000,7 @@ def main() -> None:
             except Exception as e:
                 print(f"Warning: Blinker update failed: {e}")
             if motion_state.started:
-                blinker.start(duration=10, now=now_mono)
+                blinker.start(duration=30, now=now_mono)
             if motion_detected:
                 # Trigger accumulated motion event tracking
                 acc.trigger()
