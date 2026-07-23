@@ -940,6 +940,12 @@ def validate_authoritative_profile(
     actual_saturation = {name: int(saturation[name]) for name in ("u", "v")}
     if actual_saturation != expected_saturation:
         raise ValueError(f"saturation read-back mismatch: {actual_saturation}")
+    tone = profile.get("tone") or {}
+    if int(tone.get("lumaOffset", 0)) != color_profile.luma_offset:
+        raise ValueError(f"lumaOffset read-back mismatch: {tone.get('lumaOffset')}")
+    actual_contrast = [int(value) for value in tone.get("contrastRegisters", [])]
+    if actual_contrast != list(color_profile.contrast_registers):
+        raise ValueError(f"contrastRegisters read-back mismatch: {actual_contrast}")
 
 
 def initialize_manual_exposure(generation: int | None = None) -> dict:
@@ -948,12 +954,16 @@ def initialize_manual_exposure(generation: int | None = None) -> dict:
     if color_profile is None:
         raise ValueError(f"invalid color profile: {color_profile_error}")
     baseline = {"red": color_profile.red, "green": color_profile.green, "blue": color_profile.blue}
-    try:
-        requested_white_balance = (
-            white_balance_controller.saved_white_balance(baseline) or baseline
-        )
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        print(f"Ignoring invalid WB state: {error}")
+    if getattr(white_balance_controller, "mode", None) == "oneshot":
+        requested_white_balance = baseline
+    else:
+        try:
+            requested_white_balance = (
+                white_balance_controller.saved_white_balance(baseline) or baseline
+            )
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            print(f"Ignoring invalid WB state: {error}")
+            requested_white_balance = baseline
         requested_white_balance = baseline
 
     last_error = None
@@ -971,6 +981,7 @@ def initialize_manual_exposure(generation: int | None = None) -> dict:
                 {"whiteBalance": {"auto": False, **requested_white_balance}}
             )
             image_control.update_profile(color_profile.saturation_patch())
+            image_control.update_profile(color_profile.tone_patch())
             profile = image_control.get_profile()
             validate_authoritative_profile(
                 profile, expected_white_balance=requested_white_balance
@@ -2023,7 +2034,9 @@ def main() -> None:
                 schedule_exposure_adjustment(exposure_decision)
             else:
                 white_balance_decision = white_balance_controller.observe(
-                    metrics.red_over_green, metrics.blue_over_green
+                    metrics.red_over_green,
+                    metrics.blue_over_green,
+                    scene_brightness=scene_brightness,
                 )
                 if white_balance_decision is not None:
                     schedule_white_balance_adjustment(white_balance_decision)
@@ -2079,7 +2092,7 @@ def main() -> None:
                     )
 
             # Hold the presentation state through brief detector gaps. Only a new
-            # episode starts the fixed, serialized ten-second LED sequence.
+            # episode starts the fixed, serialized thirty-second LED flash sequence.
             now_mono = time.monotonic()
             motion_state = motion_activity.update(motion_detected, now_mono)
             try:
@@ -2087,7 +2100,7 @@ def main() -> None:
             except Exception as e:
                 print(f"Warning: Blinker update failed: {e}")
             if motion_state.started:
-                blinker.start(duration=10, now=now_mono)
+                blinker.start(duration=30, now=now_mono)
             if motion_detected:
                 # Trigger accumulated motion event tracking
                 acc.trigger()
