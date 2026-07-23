@@ -4,11 +4,14 @@ import logging
 import os
 import socket
 import time
+
+import requests
 from requests.exceptions import RequestException
 
-from tools.changeQuality import change_quality
 from tools.changeClock import change_clock
+from tools.changeQuality import change_quality
 from utilities.esp32cam_client import (
+    CAMERA_BASE_URL,
     CameraStatus,
     get_camera_status,
     get_camera_status_with_retry,
@@ -194,6 +197,21 @@ def startup():
             change_clock(20)
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
+
+        # Pin hardware AE bias even though software owns exposure and AE is off.
+        # Counterproductive for the manual loop, but keeps the sensor register
+        # deterministic across restarts / recovery.
+        try:
+            logger.info("Setting ae_level=2")
+            response = requests.get(
+                f"{CAMERA_BASE_URL}/control",
+                params={"var": "ae_level", "val": 2},
+                timeout=2,
+            )
+            response.raise_for_status()
+            logger.info("ae_level set to 2")
+        except RequestException as err:
+            logger.warning(f"Setting ae_level failed: {err}")
 
         time.sleep(2)
         logger.info("Camera startup sequence completed")
