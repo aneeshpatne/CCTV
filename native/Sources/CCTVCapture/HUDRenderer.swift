@@ -230,27 +230,11 @@ final class HUDRenderer: @unchecked Sendable {
         let temperature = status.temperature.map { String(format: "%.1fC", $0) } ?? "--C"
         right -= 94
         composed = panel(text: temperature, x: right, y: top, width: 94, height: panelHeight, accent: statusColor(forTemperature: status.temperature), over: composed)
-        right -= gap + 144
-        let brightness = status.sceneBrightness.map { String(format: "%.1f%% CLIP-TRIM", $0 * 100) } ?? "--% CLIP-TRIM"
-        composed = panel(text: brightness, x: right, y: top, width: 144, height: panelHeight, accent: statusColor(forBrightness: status.sceneBrightness), over: composed)
         right -= gap + 88
         composed = panel(text: String(format: "%.0f fps", status.fps), x: right, y: top, width: 88, height: panelHeight, accent: statusColor(forFPS: status.fps), over: composed)
         right -= gap + 104
         let rssi = status.rssi.map { "\($0)dBm" } ?? "--dBm"
         composed = panel(text: rssi, x: right, y: top, width: 104, height: panelHeight, accent: statusColor(forRSSI: status.rssi), over: composed)
-
-        let settingsTop = top - panelHeight - gap
-        var settingsLeft: CGFloat = gap
-        let quality = status.cameraSettings.framesize.map { "QUALITY \($0)" } ?? "QUALITY --"
-        composed = panel(text: quality, x: settingsLeft, y: settingsTop, width: 104, height: panelHeight, accent: nil, over: composed)
-        settingsLeft += 104 + gap
-        if let summary = status.cameraSettings.imageSummary {
-            var imageText = "IMAGE · \(summary)"
-            if let red = status.redOverGreen, let blue = status.blueOverGreen {
-                imageText += String(format: " · RGB %.2f/1.00/%.2f", red, blue)
-            }
-            composed = panel(text: imageText, x: settingsLeft, y: settingsTop, width: width - settingsLeft - gap, height: panelHeight, accent: nil, over: composed)
-        }
 
         if let message = status.message {
             let messageImage = textImage(message, size: 22, color: .white)
@@ -350,13 +334,6 @@ final class HUDRenderer: @unchecked Sendable {
     private func statusColor(forTemperature temperature: Double?) -> CIColor {
         guard let temperature else { return CIColor(red: 0.5, green: 0.5, blue: 0.5) }
         return temperature < 70 ? CIColor(red: 0.50, green: 0.79, blue: 0.58) : temperature < 80 ? CIColor(red: 0.98, green: 0.74, blue: 0.02) : CIColor(red: 0.95, green: 0.55, blue: 0.51)
-    }
-
-    private func statusColor(forBrightness brightness: Double?) -> CIColor {
-        guard let brightness else { return CIColor(red: 0.5, green: 0.5, blue: 0.5) }
-        if brightness < 0.25 { return CIColor(red: 0.98, green: 0.74, blue: 0.02) }
-        if brightness > 0.35 { return CIColor(red: 0.50, green: 0.79, blue: 0.58) }
-        return CIColor(red: 0.74, green: 0.76, blue: 0.78)
     }
 
     private let timestampFormatter: DateFormatter = {
