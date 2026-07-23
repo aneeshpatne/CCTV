@@ -29,6 +29,26 @@
     <string>9</string>
     <key>CCTV_LOCAL_CODEC</key>
     <string>hevc</string>
+    <key>CCTV_AUTO_WB_MODE</key>
+    <string>oneshot</string>
+    <key>CCTV_WB_TARGET_RED_OVER_GREEN</key>
+    <string>0.92</string>
+    <key>CCTV_WB_TARGET_BLUE_OVER_GREEN</key>
+    <string>0.95</string>
+    <key>CCTV_WB_MAX_DEVIATION_FRACTION</key>
+    <string>0.25</string>
+    <key>CCTV_WB_MIN_SCENE_BRIGHTNESS</key>
+    <string>0.18</string>
+    <key>CCTV_WB_MAX_HUNT_STEPS</key>
+    <string>4</string>
+    <key>CCTV_WB_DRIFT_THRESHOLD</key>
+    <string>6</string>
+    <key>CCTV_WB_DRIFT_REOPEN_COOLDOWN_SECONDS</key>
+    <string>45</string>
+    <key>CCTV_WB_DRIFT_CHECK_INTERVAL_SECONDS</key>
+    <string>20</string>
+    <key>CCTV_MANUAL_GAIN_MAX_X16</key>
+    <string>31</string>
   </dict>
 
   <key>RunAtLoad</key>
