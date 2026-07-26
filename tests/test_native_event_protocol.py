@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ def frozen_profile(shutter=100, gain=32):
         },
         "whiteBalance": {"auto": False, "red": 94, "green": 65, "blue": 84},
         "color": {"saturation": {"u": 72, "v": 72}},
+        "tone": {"lumaOffset": 20, "contrastRegisters": [48, 48, 48, 10]},
     }
 
 
@@ -48,6 +50,8 @@ class ImmediateThread:
 class NativeEventProtocolTests(unittest.TestCase):
     def setUp(self):
         orchestrator._image_control_ready.set()
+        # Event tests must not launch the real periodic camera read-back worker.
+        orchestrator._wb_drift_last_check = time.monotonic()
 
     def tearDown(self):
         orchestrator._image_control_ready.clear()
@@ -170,7 +174,9 @@ class NativeEventProtocolTests(unittest.TestCase):
             )
 
     def test_health_event_accepts_additive_vfr_metrics(self):
-        with self.assertLogs(level="INFO") as captured:
+        with patch.object(orchestrator, "_schedule_wb_drift_check"), self.assertLogs(
+            level="INFO"
+        ) as captured:
             orchestrator.NativeEventReader._handle(
                 {
                     "version": 1,
@@ -230,6 +236,40 @@ class NativeEventProtocolTests(unittest.TestCase):
         white_balance.observe.assert_called_once_with(
             0.92, 1.08, scene_brightness=0.30
         )
+
+    def test_motion_started_event_pulses_floodlight(self):
+        floodlight = Mock()
+        with patch.object(orchestrator, "_floodlight", floodlight):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "motion.started",
+                    "payload": {},
+                }
+            )
+        floodlight.motion_started.assert_called_once_with()
+
+    def test_floodlight_transition_pauses_image_adjustment_loops(self):
+        exposure = Mock()
+        white_balance = Mock()
+        floodlight = Mock()
+        floodlight.observe.return_value = True
+        with (
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+            patch.object(orchestrator, "_floodlight", floodlight),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {"scene_brightness": 0.12},
+                }
+            )
+        floodlight.observe.assert_called_once_with(0.12)
+        exposure.reset_observations.assert_called_once_with()
+        exposure.observe.assert_not_called()
+        white_balance.hold.assert_called_once_with()
 
     def test_missing_chroma_is_forwarded_to_white_balance_controller(self):
         exposure = Mock()

@@ -366,6 +366,7 @@ final class FramePipeline: @unchecked Sendable {
             at: frame.monotonicTime
         )
         if motionState.started {
+            emitter.emit(WorkerEvent(type: "motion.started", payload: .motionStarted))
             await ledBlinker.start()
         }
         let hudMetrics = await runtime.recordImageMetrics(

@@ -48,6 +48,7 @@ from utilities.brightness_mode import (
     clipping_resistant_metrics,
 )
 from utilities.color_profile import CameraColorProfile
+from utilities.floodlight import FloodlightController
 from utilities.image_control import ImageControlAPIError, ImageControlClient
 from utilities.white_balance_mode import ManualWhiteBalanceController, WhiteBalanceDecision
 
@@ -1840,6 +1841,7 @@ def main() -> None:
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     blinker = NonBlockingBlinker(blink_interval=0.5)
+    floodlight = FloodlightController.from_environment()
     motion_activity = MotionActivityGuard(hold_seconds=10)
 
     # Ensure SIGALRM interrupts blocking frame reads after FRAME_READ_TIMEOUT seconds.
@@ -1928,7 +1930,13 @@ def main() -> None:
             scene_brightness = metrics.brightness
             scene_red_over_green = metrics.red_over_green
             scene_blue_over_green = metrics.blue_over_green
-            exposure_decision = exposure_controller.observe(scene_brightness)
+            floodlight_transition = floodlight.observe(scene_brightness)
+            if floodlight_transition or floodlight.image_adjustments_paused:
+                exposure_controller.reset_observations()
+                white_balance_controller.hold()
+                exposure_decision = None
+            else:
+                exposure_decision = exposure_controller.observe(scene_brightness)
             if exposure_decision is not None:
                 white_balance_controller.hold()
                 schedule_exposure_adjustment(exposure_decision)
@@ -2001,6 +2009,7 @@ def main() -> None:
                 print(f"Warning: Blinker update failed: {e}")
             if motion_state.started:
                 blinker.start(duration=30, now=now_mono)
+                floodlight.motion_started()
             if motion_detected:
                 # Trigger accumulated motion event tracking
                 acc.trigger()
@@ -2059,6 +2068,7 @@ def main() -> None:
             expected_frame_size = None
         acc.close()
         blinker.close()
+        floodlight.close()
         cv2.destroyAllWindows()
         print("Cleanup complete.")
 

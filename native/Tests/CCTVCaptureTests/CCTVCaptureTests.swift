@@ -185,6 +185,16 @@ final class CCTVCaptureTests: XCTestCase {
         ])
     }
 
+    func testMotionStartedEventProtocol() throws {
+        let event = WorkerEvent(type: "motion.started", payload: .motionStarted)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        XCTAssertEqual(object["type"] as? String, "motion.started")
+        XCTAssertEqual((object["payload"] as? [String: Any])?.count, 0)
+    }
+
     func testStreamStateEventProtocol() throws {
         let event = WorkerEvent(
             type: "stream.disconnected",

@@ -36,6 +36,7 @@ struct WorkerEvent: Encodable, Sendable {
             rtsp: Bool
         )
         case imageMetrics(sceneBrightness: Double?, redOverGreen: Double?, blueOverGreen: Double?)
+        case motionStarted
         case stream(connected: Bool, reason: String?)
 
         private enum CodingKeys: String, CodingKey {
@@ -98,6 +99,8 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encodeIfPresent(sceneBrightness, forKey: .sceneBrightness)
                 try container.encodeIfPresent(redOverGreen, forKey: .redOverGreen)
                 try container.encodeIfPresent(blueOverGreen, forKey: .blueOverGreen)
+            case .motionStarted:
+                break
             case let .stream(connected, reason):
                 try container.encode(connected, forKey: .connected)
                 try container.encodeIfPresent(reason, forKey: .reason)

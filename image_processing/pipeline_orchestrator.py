@@ -26,6 +26,7 @@ from utilities.motion_db_new import annotate_motion_event, log_motion_event
 from utilities.recording_catalog import RecordingCatalog
 from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
 from utilities.color_profile import CameraColorProfile
+from utilities.floodlight import FloodlightController
 from utilities.image_control import ImageControlAPIError, ImageControlClient
 from utilities.white_balance_mode import (
     ManualWhiteBalanceController,
@@ -83,6 +84,7 @@ _WB_DRIFT_CHECK_INTERVAL_SECONDS = float(
 _image_control = ImageControlClient(CAMERA_BASE_URL)
 _exposure_controller = ManualExposureController.from_environment()
 _white_balance_controller = ManualWhiteBalanceController.from_environment()
+_floodlight = FloodlightController.from_environment()
 try:
     _color_profile = CameraColorProfile.load()
     _color_profile_error: str | None = None
@@ -613,6 +615,16 @@ class NativeEventReader(threading.Thread):
             if not _image_control_ready.is_set():
                 return
             brightness_value = payload.get("scene_brightness")
+            brightness = (
+                float(brightness_value)
+                if isinstance(brightness_value, (int, float))
+                else None
+            )
+            floodlight_transition = _floodlight.observe(brightness)
+            if floodlight_transition or _floodlight.image_adjustments_paused:
+                _exposure_controller.reset_observations()
+                _white_balance_controller.hold()
+                return
             if isinstance(brightness_value, (int, float)):
                 decision = _exposure_controller.observe(float(brightness_value))
                 if decision is not None:
@@ -633,6 +645,8 @@ class NativeEventReader(threading.Thread):
             if wb_decision is not None:
                 _schedule_white_balance_adjustment(wb_decision)
             _schedule_wb_drift_check()
+        elif event_type == "motion.started":
+            _floodlight.motion_started()
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)
@@ -993,6 +1007,7 @@ def shutdown_orchestrator(sig: signal.Signals = signal.SIGTERM) -> None:
         monitor.join(timeout=STOP_TIMEOUT_SECONDS)
 
     stop_camera_pipeline(sig)
+    _floodlight.close()
 
 
 def _handle_signal(signum: int, _frame) -> None:
