@@ -65,7 +65,7 @@ ENABLE_RECORDING = True
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RECORDINGS_DIR = REPO_ROOT / "recordings" / "esp_cam1"
 PRIMARY_RECORDINGS_DIR = Path(
-    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
+    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/HP USB20FD/CCTV/recordings/esp_cam1")
 ).expanduser()
 try:
     BASE_DIR = PRIMARY_RECORDINGS_DIR

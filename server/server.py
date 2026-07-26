@@ -68,11 +68,11 @@ def resolve_path(env_keys: list[str], default_path: Path) -> Path:
 
 CCTV_FOLDER = resolve_path(
     ["CCTV_RECORDINGS_DIR", "RECORDINGS_DIR"],
-    Path("/Volumes/drive/CCTV/recordings/esp_cam1"),
+    Path("/Volumes/HP USB20FD/CCTV/recordings/esp_cam1"),
 )
 NIGHT_EVENTS_FOLDER = resolve_path(
     ["MOTION_DATA_DIR", "DATA_DIR"],
-    Path("/Volumes/drive/CCTV/motion/data"),
+    Path("/Volumes/HP USB20FD/CCTV/motion/data"),
 )
 RECORDING_CATALOG = RecordingCatalog(CCTV_FOLDER)
 RECORDING_CATALOG.start_background_reconcile()

@@ -173,7 +173,7 @@ def _resolve_data_dir() -> Path:
     data_dir = (
         os.getenv("DATA_DIR")
         or os.getenv("MOTION_DATA_DIR")
-        or "/Volumes/drive/CCTV/motion/data"
+        or "/Volumes/HP USB20FD/CCTV/motion/data"
     )
     directory = Path(data_dir).expanduser()
     directory.mkdir(parents=True, exist_ok=True)

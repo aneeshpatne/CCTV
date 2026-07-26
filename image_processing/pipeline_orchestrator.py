@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
 RECORDINGS_DIR = Path(
-    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
+    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/HP USB20FD/CCTV/recordings/esp_cam1")
 ).expanduser()
 if not RECORDINGS_DIR.exists():
     RECORDINGS_DIR = REPO_ROOT / "recordings" / "esp_cam1"

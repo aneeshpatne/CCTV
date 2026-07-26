@@ -187,7 +187,7 @@ Python owns process supervision, camera recovery, storage policy, SQLite writes,
 - Python 3.12 and a virtual environment.
 - FFmpeg and ffprobe with the `h264_videotoolbox` encoder available.
 - One ESP32-CAM reachable over the local network with MJPEG, control, status, RSSI, and system-health endpoints compatible with `utilities/esp32cam_client.py`.
-- A writable recordings directory and a writable motion-data directory. Defaults point to `/Volumes/drive/CCTV/...`; local paths can be supplied through environment variables.
+- A writable recordings directory and a writable motion-data directory. Defaults point to `/Volumes/HP USB20FD/CCTV/...`; local paths can be supplied through environment variables.
 - An RTSP service that accepts the worker's publisher URL. Browser playback also needs a browser-compatible live URL configured through `CCTV_LIVE_STREAM_URL`.
 - For notifications, the separate Discord webhook gRPC service described by `proto/discord_webhook.proto`. For the optional AI digest, an `OPENAI_API_KEY` is also required.
 - Redis is optional for ordinary capture but required for the ESP32 OTA recovery flag and `/esp32cam/recovery` status route.

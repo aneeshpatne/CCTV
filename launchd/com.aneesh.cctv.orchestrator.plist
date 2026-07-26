@@ -20,7 +20,7 @@
     <key>PYTHONPATH</key>
     <string>/Users/aneeshpatne/Desktop/Code/CCTV</string>
     <key>CCTV_RECORDINGS_DIR</key>
-    <string>/Volumes/drive/CCTV/recordings/esp_cam1</string>
+    <string>/Volumes/HP USB20FD/CCTV/recordings/esp_cam1</string>
     <key>CCTV_PIPELINE_BACKEND</key>
     <string>native</string>
     <key>CCTV_NATIVE_BINARY</key>
