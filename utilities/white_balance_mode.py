@@ -83,6 +83,7 @@ class ManualWhiteBalanceController:
         min_scene_brightness: float = 0.18,
         max_hunt_steps: int = 4,
         drift_threshold: int = 6,
+        chroma_drift_deadband: float = 0.16,
         drift_reopen_cooldown_seconds: float = 45.0,
         state_store: WhiteBalanceStateStore | None = None,
     ) -> None:
@@ -108,6 +109,8 @@ class ManualWhiteBalanceController:
             raise ValueError("max_hunt_steps must be at least one")
         if drift_threshold < 1:
             raise ValueError("drift_threshold must be at least one")
+        if not 0 < chroma_drift_deadband < 1:
+            raise ValueError("chroma_drift_deadband must be between zero and one")
         if drift_reopen_cooldown_seconds < 0:
             raise ValueError("drift_reopen_cooldown_seconds must not be negative")
         self.mode: Literal["off", "oneshot", "continuous"] = mode
@@ -130,6 +133,8 @@ class ManualWhiteBalanceController:
         self.min_scene_brightness = min_scene_brightness
         self.max_hunt_steps = max_hunt_steps
         self.drift_threshold = drift_threshold
+        # Reopening must never be more sensitive than an ordinary correction.
+        self.chroma_drift_deadband = max(deadband, chroma_drift_deadband)
         self.drift_reopen_cooldown_seconds = drift_reopen_cooldown_seconds
         self.state_store = state_store or WhiteBalanceStateStore()
         self._profile: dict[str, Any] | None = None
@@ -185,6 +190,9 @@ class ManualWhiteBalanceController:
                 ),
                 max_hunt_steps=int(os.getenv("CCTV_WB_MAX_HUNT_STEPS", "4")),
                 drift_threshold=int(os.getenv("CCTV_WB_DRIFT_THRESHOLD", "6")),
+                chroma_drift_deadband=float(
+                    os.getenv("CCTV_WB_CHROMA_DRIFT_DEADBAND", "0.16")
+                ),
                 drift_reopen_cooldown_seconds=float(
                     os.getenv("CCTV_WB_DRIFT_REOPEN_COOLDOWN_SECONDS", "45")
                 ),
@@ -267,13 +275,20 @@ class ManualWhiteBalanceController:
             if (
                 not self.enabled
                 or self._disabled_reason
-                or self._locked
                 or self._profile is None
                 or self._baseline is None
                 or self._verified_values is None
                 or self._pending
             ):
                 return None
+
+            if self._locked:
+                return self._observe_locked_drift(
+                    red_over_green,
+                    blue_over_green,
+                    scene_brightness=scene_brightness,
+                    now=now,
+                )
 
             # Dark stairwell chroma is dominated by noise and crushed red; hunting
             # there only produces teal drift.
@@ -326,6 +341,62 @@ class ManualWhiteBalanceController:
             if self._trial is not None:
                 return self._verify_trial(measured_red, measured_blue)
             return self._correction_decision(measured_red, measured_blue)
+
+    def _observe_locked_drift(
+        self,
+        red_over_green: float | None,
+        blue_over_green: float | None,
+        *,
+        scene_brightness: float | None,
+        now: float,
+    ) -> WhiteBalanceDecision | None:
+        """Re-open oneshot only for a sustained cast in the neutral reference ROI."""
+        if self.mode != "oneshot":
+            return None
+        if (
+            scene_brightness is not None
+            and float(scene_brightness) < self.min_scene_brightness
+        ):
+            self._samples.clear()
+            return None
+        ratios = self._valid_ratios(red_over_green, blue_over_green)
+        if ratios is None or now < self._hold_until:
+            self._samples.clear()
+            return None
+
+        red_ratio, blue_ratio = ratios
+        maximum_sample_gap = max(4.0, self.observation_seconds / 2)
+        if self._samples and now - self._samples[-1][0] > maximum_sample_gap:
+            self._samples.clear()
+        self._samples.append((now, red_ratio, blue_ratio))
+        cutoff = now - self.window_seconds
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        if (
+            len(self._samples) < 5
+            or self._samples[-1][0] - self._samples[0][0]
+            < self.observation_seconds
+        ):
+            return None
+
+        measured_red = self._median(sample[1] for sample in self._samples)
+        measured_blue = self._median(sample[2] for sample in self._samples)
+        self._samples.clear()
+        drift = max(
+            self._relative_error(measured_red, self.target_red_over_green),
+            self._relative_error(measured_blue, self.target_blue_over_green),
+        )
+        if drift <= self.chroma_drift_deadband:
+            return None
+        if now - self._last_drift_reopen < self.drift_reopen_cooldown_seconds:
+            return None
+
+        self._last_drift_reopen = now
+        self._locked = False
+        self._hunt_steps = 0
+        self._state = "hold"
+        self._save_state()
+        return self._correction_decision(measured_red, measured_blue)
 
     def complete(
         self,
@@ -640,6 +711,10 @@ class ManualWhiteBalanceController:
     def _median(values: Any) -> float:
         ordered = sorted(values)
         return float(ordered[len(ordered) // 2])
+
+    @staticmethod
+    def _relative_error(measured: float, target: float) -> float:
+        return max(measured / target, target / measured) - 1
 
     @staticmethod
     def _valid_ratios(

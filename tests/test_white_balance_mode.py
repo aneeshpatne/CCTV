@@ -169,7 +169,11 @@ class ManualWhiteBalanceControllerTests(unittest.TestCase):
     def test_oneshot_locks_after_successful_hunt(self):
         with tempfile.TemporaryDirectory() as directory:
             controller = self.make_controller(
-                directory, mode="oneshot", max_hunt_steps=1
+                directory,
+                mode="oneshot",
+                max_hunt_steps=1,
+                chroma_drift_deadband=0.20,
+                drift_reopen_cooldown_seconds=0,
             )
             trial = self.observe_window(controller, 0.8, 0.80)
             self.assertIsNotNone(trial)
@@ -178,8 +182,98 @@ class ManualWhiteBalanceControllerTests(unittest.TestCase):
             )
             self.assertIsNone(self.observe_window(controller, 0.85, 0.80, start=10))
             self.assertIn("LOCKED", controller.status_summary())
-            # Further chroma cannot reopen the hunt until initialize/recovery.
-            self.assertIsNone(self.observe_window(controller, 0.5, 1.2, start=40))
+            # A sustained cast in the reference wall reopens correction.
+            reopened = self.observe_window(controller, 0.5, 1.2, start=40)
+            self.assertIsNotNone(reopened)
+            self.assertEqual(reopened.action, "adjust")
+
+    def test_oneshot_ignores_transient_or_small_locked_chroma_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self.make_controller(
+                directory,
+                mode="oneshot",
+                max_hunt_steps=1,
+                chroma_drift_deadband=0.20,
+                drift_reopen_cooldown_seconds=0,
+            )
+            trial = self.observe_window(controller, 0.8, 0.80)
+            controller.complete(
+                profile(trial.red, trial.green, trial.blue), success=True, now=8
+            )
+            self.assertIsNone(
+                self.observe_window(controller, 0.85, 0.80, start=10)
+            )
+            self.assertIn("LOCKED", controller.status_summary())
+
+            for index in range(4):
+                self.assertIsNone(
+                    controller.observe(
+                        0.5,
+                        1.2,
+                        scene_brightness=0.5,
+                        now=20 + index * 2,
+                    )
+                )
+            self.assertIn("LOCKED", controller.status_summary())
+            self.assertIsNone(
+                self.observe_window(controller, 0.91, 0.88, start=40)
+            )
+            self.assertIn("LOCKED", controller.status_summary())
+
+    def test_oneshot_does_not_reopen_for_dark_scene_color_noise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller = self.make_controller(
+                directory,
+                mode="oneshot",
+                max_hunt_steps=1,
+                min_scene_brightness=0.20,
+                chroma_drift_deadband=0.20,
+                drift_reopen_cooldown_seconds=0,
+            )
+            trial = self.observe_window(controller, 0.8, 0.80)
+            controller.complete(
+                profile(trial.red, trial.green, trial.blue), success=True, now=8
+            )
+            self.assertIsNone(
+                self.observe_window(controller, 0.85, 0.80, start=10)
+            )
+            self.assertIn("LOCKED", controller.status_summary())
+            self.assertIsNone(
+                self.observe_window(
+                    controller, 0.3, 1.5, start=40, brightness=0.10
+                )
+            )
+            self.assertIn("LOCKED", controller.status_summary())
+
+    def test_oneshot_reopens_for_red_green_and_blue_casts(self):
+        casts = {
+            "red": (1.35, 0.80),
+            "green": (0.65, 0.52),
+            "blue": (1.00, 1.20),
+        }
+        for name, (red_ratio, blue_ratio) in casts.items():
+            with self.subTest(cast=name), tempfile.TemporaryDirectory() as directory:
+                controller = self.make_controller(
+                    directory,
+                    mode="oneshot",
+                    max_hunt_steps=1,
+                    chroma_drift_deadband=0.20,
+                    drift_reopen_cooldown_seconds=0,
+                )
+                trial = self.observe_window(controller, 0.8, 0.80)
+                controller.complete(
+                    profile(trial.red, trial.green, trial.blue),
+                    success=True,
+                    now=8,
+                )
+                self.assertIsNone(
+                    self.observe_window(controller, 0.85, 0.80, start=10)
+                )
+                decision = self.observe_window(
+                    controller, red_ratio, blue_ratio, start=40
+                )
+                self.assertIsNotNone(decision)
+                self.assertEqual(decision.action, "adjust")
 
     def test_camera_drift_reopens_oneshot_verify_loop(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -326,6 +420,7 @@ class ManualWhiteBalanceControllerTests(unittest.TestCase):
                 "CCTV_WB_FAILURE_COOLDOWN_SECONDS": "120",
                 "CCTV_WB_MIN_SCENE_BRIGHTNESS": "0.18",
                 "CCTV_WB_MAX_HUNT_STEPS": "2",
+                "CCTV_WB_CHROMA_DRIFT_DEADBAND": "0.19",
             },
         ):
             controller = ManualWhiteBalanceController.from_environment()
@@ -338,6 +433,7 @@ class ManualWhiteBalanceControllerTests(unittest.TestCase):
         self.assertEqual(controller.failure_cooldown_seconds, 120)
         self.assertEqual(controller.min_scene_brightness, 0.18)
         self.assertEqual(controller.max_hunt_steps, 2)
+        self.assertEqual(controller.chroma_drift_deadband, 0.19)
 
     def test_hardware_awb_must_be_off(self):
         with tempfile.TemporaryDirectory() as directory:
