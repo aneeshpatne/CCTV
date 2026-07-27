@@ -268,12 +268,13 @@ final class FramePipeline: @unchecked Sendable {
                     client.reconnectStalledStream(reason: "no JPEG received for 3 seconds")
                 }
                 if noSignalFrame == nil || wallClock.timeIntervalSince(noSignalRenderedAt) >= 1 {
-                    let (rssi, temperature, cameraSettings) = await telemetry.snapshot()
+                    let (rssi, temperature, cameraSettings, floodlightOn) = await telemetry.snapshot()
                     noSignalFrame = renderer.renderNoSignal(
                         status: HUDStatus(
                             fps: 0,
                             rssi: rssi,
                             temperature: temperature,
+                            floodlightOn: floodlightOn,
                             message: "NO SIGNAL · RECONNECTING",
                             cameraSettings: cameraSettings
                         ),
@@ -393,7 +394,7 @@ final class FramePipeline: @unchecked Sendable {
             at: ProcessInfo.processInfo.systemUptime,
             motionScore: motion.score
         )
-        let (rssi, temperature, cameraSettings) = await telemetry.snapshot()
+        let (rssi, temperature, cameraSettings, floodlightOn) = await telemetry.snapshot()
         let status = HUDStatus(
             fps: measuredFPS,
             rssi: rssi,
@@ -402,6 +403,7 @@ final class FramePipeline: @unchecked Sendable {
             redOverGreen: hudMetrics.1,
             blueOverGreen: hudMetrics.2,
             motion: motionState.active,
+            floodlightOn: floodlightOn,
             labels: labels,
             motionBox: motion.boundingBox,
             message: nil,

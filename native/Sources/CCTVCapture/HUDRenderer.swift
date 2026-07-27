@@ -46,6 +46,7 @@ struct HUDStatus: Sendable {
     var redOverGreen: Double? = nil
     var blueOverGreen: Double? = nil
     var motion = false
+    var floodlightOn = false
     var labels: [SemanticLabel] = []
     var motionBox: NormalizedRect?
     var message: String?
@@ -57,11 +58,28 @@ actor CameraTelemetry {
     private(set) var temperature: Double?
     private(set) var cameraSettings = CameraSettings()
     private let baseURL: URL
+    private let floodlightStatePath: String
 
-    init(baseURL: URL) { self.baseURL = baseURL }
+    init(baseURL: URL) {
+        self.baseURL = baseURL
+        self.floodlightStatePath = (
+            ProcessInfo.processInfo.environment["CCTV_FLOODLIGHT_STATE_PATH"]
+                ?? "~/.local/state/cctv/floodlight.json"
+        ) as NSString as String
+    }
 
-    func snapshot() -> (Int?, Double?, CameraSettings) {
-        (rssi, temperature, cameraSettings)
+    func snapshot() -> (Int?, Double?, CameraSettings, Bool) {
+        (rssi, temperature, cameraSettings, readFloodlightState())
+    }
+
+    private func readFloodlightState() -> Bool {
+        let path = (floodlightStatePath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["enabled"] as? Bool == true else {
+            return false
+        }
+        return object["on"] as? Bool == true
     }
 
     func pollForever() async {
@@ -224,7 +242,32 @@ final class HUDRenderer: @unchecked Sendable {
             let strongest = status.labels.first?.name.uppercased()
             let label = strongest.map { "MOTION · \($0)" } ?? "MOTION"
             composed = panel(text: label, x: left, y: top, width: strongest == nil ? 86 : 150, height: panelHeight, accent: CIColor(red: 0.98, green: 0.74, blue: 0.02), over: composed)
+            left += strongest == nil ? 92 : 156
         }
+
+        if status.floodlightOn {
+            composed = panel(
+                text: "● LIGHT",
+                x: left,
+                y: top,
+                width: 94,
+                height: panelHeight,
+                accent: CIColor(red: 0.98, green: 0.74, blue: 0.02),
+                over: composed
+            )
+            left += 100
+        }
+
+        let sceneText = status.sceneBrightness.map { String(format: "SCENE %.0f%%", $0 * 100) } ?? "SCENE --"
+        composed = panel(
+            text: sceneText,
+            x: left,
+            y: top,
+            width: 104,
+            height: panelHeight,
+            accent: statusColor(forSceneBrightness: status.sceneBrightness),
+            over: composed
+        )
 
         var right = width - gap
         let temperature = status.temperature.map { String(format: "%.1fC", $0) } ?? "--C"
@@ -334,6 +377,15 @@ final class HUDRenderer: @unchecked Sendable {
     private func statusColor(forTemperature temperature: Double?) -> CIColor {
         guard let temperature else { return CIColor(red: 0.5, green: 0.5, blue: 0.5) }
         return temperature < 70 ? CIColor(red: 0.50, green: 0.79, blue: 0.58) : temperature < 80 ? CIColor(red: 0.98, green: 0.74, blue: 0.02) : CIColor(red: 0.95, green: 0.55, blue: 0.51)
+    }
+
+    private func statusColor(forSceneBrightness brightness: Double?) -> CIColor {
+        guard let brightness else { return CIColor(red: 0.5, green: 0.5, blue: 0.5) }
+        return brightness <= 0.18
+            ? CIColor(red: 0.95, green: 0.55, blue: 0.51)
+            : brightness <= 0.30
+            ? CIColor(red: 0.98, green: 0.74, blue: 0.02)
+            : CIColor(red: 0.50, green: 0.79, blue: 0.58)
     }
 
     private let timestampFormatter: DateFormatter = {
