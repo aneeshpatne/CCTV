@@ -1,8 +1,8 @@
 {
   "whiteBalance": {
-    "red": 110,
+    "red": 122,
     "green": 55,
-    "blue": 62
+    "blue": 54
   },
   "color": {
     "saturation": {
@@ -11,7 +11,7 @@
     }
   },
   "tone": {
-    "lumaOffset": 20,
+    "lumaOffset": 24,
     "contrastRegisters": [
       48,
       48,
