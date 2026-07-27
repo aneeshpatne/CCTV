@@ -48,7 +48,25 @@
     <key>CCTV_WB_DRIFT_CHECK_INTERVAL_SECONDS</key>
     <string>20</string>
     <key>CCTV_MANUAL_GAIN_MAX_X16</key>
-    <string>31</string>
+    <string>34</string>
+    <key>CCTV_FLOODLIGHT_BASE_URL</key>
+    <string>http://192.168.0.167</string>
+    <key>CCTV_FLOODLIGHT_MINIMUM_ON_SECONDS</key>
+    <string>120</string>
+    <key>CCTV_FLOODLIGHT_MINIMUM_OFF_SECONDS</key>
+    <string>15</string>
+    <key>CCTV_FLOODLIGHT_BRIGHT_THRESHOLD</key>
+    <string>0.25</string>
+    <key>CCTV_FLOODLIGHT_NIGHT_DARK_THRESHOLD</key>
+    <string>0.15</string>
+    <key>CCTV_FLOODLIGHT_NIGHT_BRIGHT_THRESHOLD</key>
+    <string>0.22</string>
+    <key>CCTV_FLOODLIGHT_NIGHT_START_HOUR</key>
+    <string>19</string>
+    <key>CCTV_FLOODLIGHT_NIGHT_END_HOUR</key>
+    <string>6</string>
+    <key>CCTV_FLOODLIGHT_PROBE_INTERVAL_SECONDS</key>
+    <string>300</string>
   </dict>
 
   <key>RunAtLoad</key>
