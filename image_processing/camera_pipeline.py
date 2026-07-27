@@ -1333,11 +1333,10 @@ def draw_hud(
     scene_brightness: float | None = None,
     quality_level: int | None = None,
     startup_changes: str | None = None,
+    floodlight_on: bool = False,
 ):
-    """Draws a compact Material dark HUD (timestamp, motion, wifi, fps, temp)."""
-    # scene_brightness / quality_level / startup_changes kept for call-site
-    # compatibility; they are no longer rendered on the overlay.
-    del scene_brightness, quality_level, startup_changes
+    """Draws a compact HUD including the brightness used by light control."""
+    del quality_level, startup_changes
     x, y = coordinates
     _, w = frame.shape[:2]
 
@@ -1433,6 +1432,81 @@ def draw_hud(
                 font_scale,
                 thickness,
             )
+
+    if floodlight_on:
+        light_text = "● LIGHT"
+        tw, _ = get_hud_text_size(
+            light_text, font_size, font, font_scale, thickness
+        )
+        light_box_w = tw + (pad_x * 2)
+        light_x = gap + ts_box_w + gap
+        if motion_detected:
+            light_x += warn_box_w + gap
+        if should_draw("floodlight", light_x, top_margin, light_box_w, box_h):
+            draw_box(
+                frame,
+                light_x,
+                top_margin,
+                light_box_w,
+                box_h,
+                bg_color=motion_panel,
+                alpha=0.94,
+                border_color=(92, 76, 31),
+                accent_color=status_warn,
+            )
+            put_hud_text(
+                frame,
+                light_text,
+                light_x + pad_x + 4,
+                text_center_y,
+                status_warn,
+                font_size,
+                font,
+                font_scale,
+                thickness,
+            )
+
+    scene_text = (
+        f"SCENE {max(0.0, min(1.0, scene_brightness)) * 100:.0f}%"
+        if scene_brightness is not None
+        else "SCENE --"
+    )
+    tw, _ = get_hud_text_size(scene_text, font_size, font, font_scale, thickness)
+    scene_box_w = tw + (pad_x * 2)
+    scene_x = gap + ts_box_w + gap
+    if motion_detected:
+        scene_x += warn_box_w + gap
+    if floodlight_on:
+        scene_x += light_box_w + gap
+    if should_draw("scene_brightness", scene_x, top_margin, scene_box_w, box_h):
+        scene_color = (
+            status_warn
+            if scene_brightness is not None and scene_brightness <= 0.30
+            else status_good
+            if scene_brightness is not None
+            else muted_color
+        )
+        draw_box(
+            frame,
+            scene_x,
+            top_margin,
+            scene_box_w,
+            box_h,
+            bg_color=surface_variant,
+            border_color=panel_border,
+            accent_color=scene_color,
+        )
+        put_hud_text(
+            frame,
+            scene_text,
+            scene_x + pad_x + 4,
+            text_center_y,
+            font_color if scene_brightness is not None else muted_color,
+            font_size,
+            font,
+            font_scale,
+            thickness,
+        )
 
     cursor_x = w - gap
 
@@ -2009,7 +2083,6 @@ def main() -> None:
                 print(f"Warning: Blinker update failed: {e}")
             if motion_state.started:
                 blinker.start(duration=30, now=now_mono)
-                floodlight.motion_started()
             if motion_detected:
                 # Trigger accumulated motion event tracking
                 acc.trigger()
@@ -2030,6 +2103,8 @@ def main() -> None:
                 motion_state.active,
                 time_overlap,
                 coordinates,
+                scene_brightness=scene_brightness,
+                floodlight_on=floodlight.is_on,
             )
 
             # Draw ROI polygon on display only if flag is enabled

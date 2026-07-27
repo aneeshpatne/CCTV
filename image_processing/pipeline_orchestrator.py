@@ -646,7 +646,7 @@ class NativeEventReader(threading.Thread):
                 _schedule_white_balance_adjustment(wb_decision)
             _schedule_wb_drift_check()
         elif event_type == "motion.started":
-            _floodlight.motion_started()
+            pass
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)

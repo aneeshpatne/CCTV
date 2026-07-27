@@ -237,7 +237,7 @@ class NativeEventProtocolTests(unittest.TestCase):
             0.92, 1.08, scene_brightness=0.30
         )
 
-    def test_motion_started_event_pulses_floodlight(self):
+    def test_motion_started_event_does_not_control_floodlight(self):
         floodlight = Mock()
         with patch.object(orchestrator, "_floodlight", floodlight):
             orchestrator.NativeEventReader._handle(
@@ -247,7 +247,7 @@ class NativeEventProtocolTests(unittest.TestCase):
                     "payload": {},
                 }
             )
-        floodlight.motion_started.assert_called_once_with()
+        floodlight.motion_started.assert_not_called()
 
     def test_floodlight_transition_pauses_image_adjustment_loops(self):
         exposure = Mock()

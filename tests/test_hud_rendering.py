@@ -121,6 +121,13 @@ class HUDRenderingTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(optimized, reference)
 
+    def test_floodlight_badge_changes_the_hud_when_light_is_on(self):
+        off = np.zeros((240, 640, 3), dtype=np.uint8)
+        on = off.copy()
+        pipeline.draw_hud(off, 9, -55, 50, floodlight_on=False)
+        pipeline.draw_hud(on, 9, -55, 50, floodlight_on=True)
+        self.assertFalse(np.array_equal(off, on))
+
 
 if __name__ == "__main__":
     unittest.main()
