@@ -108,6 +108,110 @@ class ImageControlClientTests(unittest.TestCase):
         self.assertEqual(sleeps, [0.5, 1.0])
         self.assertEqual(session.get.call_count, 3)
 
+    def test_freeze_awb_uses_no_body_and_longer_default_timeout(self):
+        session = Mock()
+        payload = frozen_profile()
+        payload["whiteBalance"] = {
+            "auto": False,
+            "red": 142,
+            "green": 64,
+            "blue": 71,
+            "awbStable": True,
+            "awbFrames": 0,
+        }
+        session.put.return_value = FakeResponse(200, payload)
+        client = ImageControlClient("http://camera", session=session)
+
+        result = client.freeze_awb()
+
+        self.assertEqual(result["whiteBalance"]["red"], 142)
+        session.put.assert_called_once_with(
+            "http://camera/image-control/awb/freeze", timeout=15.0
+        )
+
+    def test_image_stats_parses_roi_medians(self):
+        session = Mock()
+        session.get.return_value = FakeResponse(
+            200,
+            {
+                "ok": True,
+                "sensor": "OV2640",
+                "timestampMs": 1,
+                "domain": "jpeg",
+                "global": {
+                    "meanR": 0.2,
+                    "meanG": 0.3,
+                    "meanB": 0.25,
+                    "meanY": 0.28,
+                    "clipBlackFrac": 0.0,
+                    "clipWhiteFrac": 0.1,
+                },
+                "histogram": {"bins": 2, "y": [1, 2], "r": [1, 2], "g": [1, 2], "b": [1, 2]},
+                "whiteBalance": {"auto": False, "red": 128, "green": 128, "blue": 128},
+                "roi": {
+                    "normalized": {"x": 0.51, "y": 0.26, "w": 0.19, "h": 0.48},
+                    "samples": 100,
+                    "meanR": 0.2,
+                    "meanG": 0.3,
+                    "meanB": 0.25,
+                    "medianRg": 0.9,
+                    "medianBg": 0.87,
+                    "usable": True,
+                },
+            },
+        )
+        stats = ImageControlClient("http://camera", session=session).get_image_stats()
+        self.assertTrue(stats.roi.usable)
+        self.assertAlmostEqual(stats.roi.median_rg, 0.9)
+        self.assertAlmostEqual(stats.roi.median_bg, 0.87)
+        self.assertAlmostEqual(stats.mean_y, 0.28)
+
+    def test_probe_capabilities_detects_stats_and_awb_fields(self):
+        session = Mock()
+
+        def get(url, timeout=2.0):
+            if url.endswith("/image-control"):
+                profile = frozen_profile()
+                profile["whiteBalance"]["awbStable"] = True
+                profile["whiteBalance"]["awbFrames"] = 3
+                return FakeResponse(200, profile)
+            if url.endswith("/image-stats"):
+                return FakeResponse(
+                    200,
+                    {
+                        "ok": True,
+                        "global": {"meanY": 0.2},
+                        "whiteBalance": {},
+                        "roi": {
+                            "normalized": {"x": 0.5, "y": 0.2, "w": 0.2, "h": 0.4},
+                            "samples": 10,
+                            "meanR": 0.1,
+                            "meanG": 0.1,
+                            "meanB": 0.1,
+                            "medianRg": 1.0,
+                            "medianBg": 1.0,
+                            "usable": True,
+                        },
+                    },
+                )
+            if url.endswith("/image-stats/roi"):
+                return FakeResponse(
+                    200, {"ok": True, "normalized": {"x": 0.5, "y": 0.2, "w": 0.2, "h": 0.4}}
+                )
+            if url.endswith("/raw-stats"):
+                return FakeResponse(
+                    501, {"ok": False, "error": {"code": "unsupported_sensor", "message": "no"}}
+                )
+            raise AssertionError(url)
+
+        session.get.side_effect = get
+        caps = ImageControlClient("http://camera", session=session).probe_capabilities()
+        self.assertTrue(caps.awb_truthful_fields)
+        self.assertTrue(caps.image_stats)
+        self.assertTrue(caps.image_stats_roi)
+        self.assertTrue(caps.awb_freeze)
+        self.assertFalse(caps.raw_stats)
+
     def test_transient_connection_reset_retries_with_backoff(self):
         session = Mock()
         session.get.side_effect = [
@@ -302,6 +406,7 @@ class StartupResolutionTests(unittest.TestCase):
         ]
         startup()
         change_quality.assert_called_once_with(12)
+        _change_clock.assert_called_once_with(10)
 
 
 if __name__ == "__main__":
