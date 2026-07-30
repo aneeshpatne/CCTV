@@ -216,11 +216,17 @@ exposure_controller = ManualExposureController.from_environment()
 white_balance_controller = ManualWhiteBalanceController.from_environment()
 image_control = ImageControlClient(CAMERA_BASE_URL)
 try:
-    color_profile = CameraColorProfile.load()
+    color_profile = CameraColorProfile.load_active()
     color_profile_error = None
 except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
     color_profile = None
     color_profile_error = str(error)
+HARDWARE_AWB = os.getenv("CCTV_HARDWARE_AWB", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 camera_configuration_lock = threading.Lock()
 image_control_generation_lock = threading.Lock()
 image_control_generation = 0
@@ -928,7 +934,10 @@ def validate_authoritative_profile(
     white_balance = profile.get("whiteBalance", {})
     if exposure.get("autoExposure") is not False or exposure.get("autoGain") is not False:
         raise ValueError("image profile does not have manual AE/AGC")
-    if white_balance.get("auto") is not False:
+    if HARDWARE_AWB:
+        if white_balance.get("auto") is not True:
+            raise ValueError("image profile does not have hardware AWB enabled")
+    elif white_balance.get("auto") is not False:
         raise ValueError("image profile does not have manual white balance")
     if profile.get("cachedForRecovery") is not True:
         raise ValueError("manual image profile is not cached for recovery")
@@ -977,17 +986,26 @@ def initialize_manual_exposure(generation: int | None = None) -> dict:
                 image_control.update_exposure(
                     normalization["shutterLines"], normalization["gainX16"]
                 )
-            image_control.update_profile(
-                {"whiteBalance": {"auto": False, **requested_white_balance}}
-            )
+            if HARDWARE_AWB:
+                image_control.update_profile({"whiteBalance": {"auto": True}})
+            else:
+                image_control.update_profile(
+                    {"whiteBalance": {"auto": False, **requested_white_balance}}
+                )
             image_control.update_profile(color_profile.saturation_patch())
             image_control.update_profile(color_profile.tone_patch())
             profile = image_control.get_profile()
             validate_authoritative_profile(
-                profile, expected_white_balance=requested_white_balance
+                profile,
+                expected_white_balance=(
+                    None if HARDWARE_AWB else requested_white_balance
+                ),
             )
             exposure_controller.initialize(profile)
-            white_balance_controller.initialize(profile, baseline)
+            if HARDWARE_AWB:
+                white_balance_controller.disable("hardware AWB enabled")
+            else:
+                white_balance_controller.initialize(profile, baseline)
             break
         except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
             last_error = error

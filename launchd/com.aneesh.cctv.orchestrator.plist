@@ -29,24 +29,44 @@
     <string>9</string>
     <key>CCTV_LOCAL_CODEC</key>
     <string>hevc</string>
+    <key>CCTV_HARDWARE_ISP</key>
+    <string>1</string>
     <key>CCTV_AUTO_WB_MODE</key>
-    <string>oneshot</string>
+    <string>off</string>
+    <key>CCTV_HARDWARE_AWB</key>
+    <string>1</string>
+    <key>CCTV_WB_AWB_BOOTSTRAP</key>
+    <string>0</string>
+    <key>CCTV_IMAGE_STATS</key>
+    <string>0</string>
     <key>CCTV_WB_TARGET_RED_OVER_GREEN</key>
-    <string>0.92</string>
+    <string>0.90</string>
     <key>CCTV_WB_TARGET_BLUE_OVER_GREEN</key>
-    <string>0.95</string>
+    <string>0.87</string>
+    <key>CCTV_WB_DEADBAND</key>
+    <string>0.10</string>
+    <key>CCTV_WB_MAX_STEP</key>
+    <string>2</string>
+    <key>CCTV_WB_OBSERVATION_SECONDS</key>
+    <string>15</string>
+    <key>CCTV_WB_WINDOW_SECONDS</key>
+    <string>36</string>
+    <key>CCTV_WB_SETTLE_SECONDS</key>
+    <string>12</string>
     <key>CCTV_WB_MAX_DEVIATION_FRACTION</key>
-    <string>0.25</string>
+    <string>0.35</string>
     <key>CCTV_WB_MIN_SCENE_BRIGHTNESS</key>
-    <string>0.18</string>
+    <string>0.16</string>
     <key>CCTV_WB_MAX_HUNT_STEPS</key>
-    <string>4</string>
-    <key>CCTV_WB_DRIFT_THRESHOLD</key>
-    <string>6</string>
-    <key>CCTV_WB_DRIFT_REOPEN_COOLDOWN_SECONDS</key>
+    <string>3</string>
+    <key>CCTV_WB_FAILURE_COOLDOWN_SECONDS</key>
     <string>45</string>
+    <key>CCTV_WB_DRIFT_THRESHOLD</key>
+    <string>999</string>
+    <key>CCTV_WB_DRIFT_REOPEN_COOLDOWN_SECONDS</key>
+    <string>120</string>
     <key>CCTV_WB_DRIFT_CHECK_INTERVAL_SECONDS</key>
-    <string>20</string>
+    <string>60</string>
     <key>CCTV_MANUAL_GAIN_MAX_X16</key>
     <string>34</string>
     <key>CCTV_FLOODLIGHT_BASE_URL</key>

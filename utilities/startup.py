@@ -191,16 +191,14 @@ def startup():
             logger.warning("Resolution setting incomplete - will retry")
             continue
 
-        # Set camera clock
+        # Clean ISP look: leave clock at 10 MHz (matches the good hardware-default look).
         try:
-            logger.info("Setting camera clock to 20")
-            change_clock(20)
+            logger.info("Setting camera clock to 10")
+            change_clock(10)
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
 
-        # Pin hardware AE bias even though software owns exposure and AE is off.
-        # Counterproductive for the manual loop, but keeps the sensor register
-        # deterministic across restarts / recovery.
+        # Pin hardware AE bias while AE/AGC stay in automatic mode.
         try:
             logger.info("Setting ae_level=2")
             response = requests.get(

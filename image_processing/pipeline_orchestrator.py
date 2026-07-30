@@ -25,7 +25,7 @@ from typing import Optional
 from utilities.motion_db_new import annotate_motion_event, log_motion_event
 from utilities.recording_catalog import RecordingCatalog
 from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
-from utilities.color_profile import CameraColorProfile
+from utilities.color_profile import CameraColorProfile, color_period_for_now
 from utilities.floodlight import FloodlightController
 from utilities.image_control import ImageControlAPIError, ImageControlClient
 from utilities.white_balance_mode import (
@@ -81,20 +81,169 @@ _wb_drift_last_check = 0.0
 _WB_DRIFT_CHECK_INTERVAL_SECONDS = float(
     os.getenv("CCTV_WB_DRIFT_CHECK_INTERVAL_SECONDS", "20")
 )
+_HARDWARE_ISP = os.getenv("CCTV_HARDWARE_ISP", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# Legacy flags — ignored while CCTV_HARDWARE_ISP is on (no software color/exposure).
+_HARDWARE_AWB = _HARDWARE_ISP or os.getenv("CCTV_HARDWARE_AWB", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_AWB_BOOTSTRAP = (
+    False
+    if _HARDWARE_ISP
+    else os.getenv("CCTV_WB_AWB_BOOTSTRAP", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_USE_IMAGE_STATS = (
+    False
+    if _HARDWARE_ISP
+    else os.getenv("CCTV_IMAGE_STATS", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 _image_control = ImageControlClient(CAMERA_BASE_URL)
 _exposure_controller = ManualExposureController.from_environment()
 _white_balance_controller = ManualWhiteBalanceController.from_environment()
 _floodlight = FloodlightController.from_environment()
+_color_profile_lock = threading.Lock()
+_camera_capabilities_lock = threading.Lock()
+_camera_capabilities_probed = False
 try:
-    _color_profile = CameraColorProfile.load()
+    _color_profile = CameraColorProfile.load_active()
     _color_profile_error: str | None = None
+    _color_profile_period = _color_profile.period
+    logging.info(
+        "[image-control] Loaded %s color profile WB %d/%d/%d.",
+        _color_profile.period,
+        _color_profile.red,
+        _color_profile.green,
+        _color_profile.blue,
+    )
 except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
     _color_profile = None
     _color_profile_error = str(error)
+    _color_profile_period = color_period_for_now()
 
 
 def _disable_for_image_error(error: ImageControlAPIError) -> bool:
     return error.status in {400, 413, 500, 501} or error.code == "invalid_response"
+
+
+def _probe_camera_capabilities(*, force: bool = False) -> None:
+    global _camera_capabilities_probed
+    with _camera_capabilities_lock:
+        if _camera_capabilities_probed and not force:
+            return
+        try:
+            caps = _image_control.probe_capabilities(probe_awb_freeze=False)
+            _camera_capabilities_probed = True
+            logging.info(
+                "[image-control] Firmware capabilities: %s",
+                ", ".join(f"{k}={v}" for k, v in caps.as_dict().items()),
+            )
+            if caps.image_stats_roi and _USE_IMAGE_STATS:
+                try:
+                    roi = _image_control.set_image_stats_roi()
+                    logging.info(
+                        "[image-control] Stats ROI set to x=%.2f y=%.2f w=%.2f h=%.2f",
+                        roi["x"],
+                        roi["y"],
+                        roi["w"],
+                        roi["h"],
+                    )
+                except ImageControlAPIError as error:
+                    logging.warning("[image-control] Unable to set stats ROI: %s", error)
+        except Exception:
+            logging.exception("[image-control] Capability probe failed")
+
+
+def _bootstrap_white_balance_from_awb() -> dict[str, int] | None:
+    """Run firmware AWB freeze and return latched manual RGB, or None on failure."""
+    if not _AWB_BOOTSTRAP or _HARDWARE_AWB:
+        return None
+    try:
+        _image_control.set_white_balance_auto(True)
+        # Brief settle so soft-latch / awbStable can advance when firmware supports it.
+        deadline = time.monotonic() + float(os.getenv("CCTV_WB_AWB_SETTLE_SECONDS", "1.5"))
+        while time.monotonic() < deadline:
+            profile = _image_control.get_profile()
+            white_balance = profile.get("whiteBalance") or {}
+            if white_balance.get("auto") is True and white_balance.get("awbStable") is True:
+                break
+            time.sleep(0.2)
+        frozen = _image_control.freeze_awb()
+        rgb = ImageControlClient.extract_manual_rgb(frozen)
+        logging.info(
+            "[image-control] AWB freeze latched manual WB %d/%d/%d (stable=%s).",
+            rgb["red"],
+            rgb["green"],
+            rgb["blue"],
+            (frozen.get("whiteBalance") or {}).get("awbStable"),
+        )
+        return rgb
+    except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+        logging.warning("[image-control] AWB bootstrap unavailable: %s", error)
+        return None
+
+
+def _maybe_switch_color_period() -> None:
+    """Reload day/night color profile when local wall-clock period changes."""
+    global _color_profile, _color_profile_error, _color_profile_period
+
+    if _HARDWARE_ISP:
+        return
+
+    desired = color_period_for_now()
+    with _color_profile_lock:
+        if _color_profile is not None and _color_profile_period == desired:
+            return
+        try:
+            profile = CameraColorProfile.load_active()
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            _color_profile = None
+            _color_profile_error = str(error)
+            logging.warning(
+                "[image-control] Unable to load %s color profile: %s", desired, error
+            )
+            return
+        previous = _color_profile_period
+        _color_profile = profile
+        _color_profile_error = None
+        _color_profile_period = profile.period
+        changed = previous != profile.period
+
+    if not changed:
+        return
+
+    logging.info(
+        "[image-control] Switching color profile %s → %s (WB %d/%d/%d).",
+        previous,
+        profile.period,
+        profile.red,
+        profile.green,
+        profile.blue,
+    )
+    generation = _begin_image_control_recovery()
+    try:
+        with _camera_configuration_lock:
+            _initialize_manual_exposure(generation)
+        logging.info(
+            "[image-control] Applied %s color profile · %s",
+            profile.period,
+            _exposure_controller.status_summary(),
+        )
+    except Exception as error:
+        logging.exception(
+            "[image-control] Failed applying %s color profile: %s",
+            profile.period,
+            error,
+        )
+        _schedule_camera_recovery(f"color profile switch failed: {error}")
 
 
 def _begin_image_control_recovery() -> int:
@@ -121,15 +270,35 @@ def _validate_authoritative_profile(
     profile: dict,
     *,
     expected_white_balance: dict[str, int] | None = None,
+    require_manual_white_balance: bool | None = None,
 ) -> None:
     exposure = profile.get("exposure")
     white_balance = profile.get("whiteBalance")
     if not isinstance(exposure, dict):
         raise ValueError("image profile is missing exposure")
+    if not isinstance(white_balance, dict):
+        raise ValueError("image profile is missing white balance")
+
+    if _HARDWARE_ISP:
+        # Clean look: hardware owns AE/AGC/AWB. Do not require manual freeze or
+        # host color-profile sat/tone match.
+        if exposure.get("autoExposure") is not True or exposure.get("autoGain") is not True:
+            raise ValueError("image profile does not have hardware AE/AGC enabled")
+        if white_balance.get("auto") is not True:
+            raise ValueError("image profile does not have hardware AWB enabled")
+        return
+
     if exposure.get("autoExposure") is not False or exposure.get("autoGain") is not False:
         raise ValueError("image profile does not have manual AE/AGC")
-    if not isinstance(white_balance, dict) or white_balance.get("auto") is not False:
+    require_manual_wb = (
+        (not _HARDWARE_AWB)
+        if require_manual_white_balance is None
+        else require_manual_white_balance
+    )
+    if require_manual_wb and white_balance.get("auto") is not False:
         raise ValueError("image profile does not have manual white balance")
+    if not require_manual_wb and white_balance.get("auto") is not True:
+        raise ValueError("image profile does not have hardware AWB enabled")
     if profile.get("cachedForRecovery") is not True:
         raise ValueError("manual image profile is not cached for recovery")
     if expected_white_balance is not None:
@@ -158,20 +327,83 @@ def _validate_authoritative_profile(
             )
 
 
+def _initialize_hardware_isp(generation: int) -> dict:
+    """Enable sensor AWB + AE/AGC only — no software color or exposure control."""
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        if not _generation_is_current(generation):
+            raise RuntimeError("camera generation changed during image-control recovery")
+        try:
+            # Hand the full ISP look back to hardware. Do not freeze exposure,
+            # apply color profiles, AWB-freeze, or software WB/exposure loops.
+            profile = _image_control.update_profile(
+                {
+                    "exposure": {"autoExposure": True, "autoGain": True},
+                    "whiteBalance": {"auto": True},
+                }
+            )
+            # Prefer factory-mild tone when firmware supports reset (clean look).
+            try:
+                profile = _image_control.update_profile({"tone": {"reset": True}})
+            except ImageControlAPIError as error:
+                logging.info(
+                    "[image-control] tone.reset unavailable (%s); leaving tone as-is.",
+                    error,
+                )
+            profile = _image_control.get_profile()
+            _validate_authoritative_profile(profile)
+            _white_balance_controller.disable("hardware ISP only (no software color)")
+            if not _generation_is_current(generation):
+                raise RuntimeError(
+                    "camera generation changed after image-control verification"
+                )
+            _image_control_ready.set()
+            logging.info(
+                "[image-control] Hardware ISP · AE=%s AGC=%s AWB=%s · shutter=%s gain=%s/16 · %s",
+                profile.get("exposure", {}).get("autoExposure"),
+                profile.get("exposure", {}).get("autoGain"),
+                profile.get("whiteBalance", {}).get("auto"),
+                profile.get("exposure", {}).get("shutterLines"),
+                profile.get("exposure", {}).get("gainX16"),
+                _white_balance_controller.status_summary(),
+            )
+            return profile
+        except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+            last_error = error
+            _image_control_ready.clear()
+            logging.warning(
+                "[image-control] Hardware ISP setup attempt %d/3 failed: %s",
+                attempt,
+                error,
+            )
+            if attempt < 3:
+                time.sleep(float(attempt))
+    raise RuntimeError(f"unable to enable hardware ISP image control: {last_error}")
+
+
 def _initialize_manual_exposure(generation: int | None = None) -> dict:
-    """Apply and verify all manual image groups before enabling controllers."""
+    """Apply image-control policy after camera startup/recovery."""
     generation = _current_image_control_generation() if generation is None else generation
+    if _HARDWARE_ISP:
+        return _initialize_hardware_isp(generation)
+
     if _color_profile is None:
         raise ValueError(f"invalid color profile: {_color_profile_error}")
 
-    baseline_white_balance = {
+    _probe_camera_capabilities()
+
+    profile_baseline = {
         "red": _color_profile.red,
         "green": _color_profile.green,
         "blue": _color_profile.blue,
     }
-    # Oneshot mode re-seeds from the profile baseline so each recovery can look at
-    # the live scene and pick values once. Continuous mode restores last verified.
-    if getattr(_white_balance_controller, "mode", None) == "oneshot":
+    # Prefer firmware AWB latch as the session baseline (natural look seed).
+    awb_seed = None if _HARDWARE_AWB else _bootstrap_white_balance_from_awb()
+    baseline_white_balance = awb_seed or profile_baseline
+
+    # Oneshot always re-seeds from the chosen baseline. Continuous restores last
+    # verified only when it still matches the same baseline family.
+    if awb_seed is not None or getattr(_white_balance_controller, "mode", None) == "oneshot":
         requested_white_balance = baseline_white_balance
     else:
         try:
@@ -192,17 +424,39 @@ def _initialize_manual_exposure(generation: int | None = None) -> dict:
                 profile = _image_control.update_exposure(
                     normalization["shutterLines"], normalization["gainX16"]
                 )
-            profile = _image_control.update_profile(
-                {"whiteBalance": {"auto": False, **requested_white_balance}}
-            )
+            if _HARDWARE_AWB:
+                profile = _image_control.update_profile(
+                    {"whiteBalance": {"auto": True}}
+                )
+            else:
+                # Re-apply manual RGB even after AWB freeze so sat/tone writes cannot
+                # leave an inconsistent auto flag on older firmware mixes.
+                profile = _image_control.update_profile(
+                    {"whiteBalance": {"auto": False, **requested_white_balance}}
+                )
             _image_control.update_profile(_color_profile.saturation_patch())
             _image_control.update_profile(_color_profile.tone_patch())
             profile = _image_control.get_profile()
+            if not _HARDWARE_AWB:
+                # Prefer readback RGB after sat/tone (authoritative hardware state).
+                requested_white_balance = ImageControlClient.extract_manual_rgb(profile)
             _validate_authoritative_profile(
-                profile, expected_white_balance=requested_white_balance
+                profile,
+                expected_white_balance=(
+                    None if _HARDWARE_AWB else requested_white_balance
+                ),
             )
             _exposure_controller.initialize(profile)
-            _white_balance_controller.initialize(profile, baseline_white_balance)
+            if _HARDWARE_AWB:
+                # Leave software WB idle while sensor AWB owns the RGB gains.
+                _white_balance_controller.disable("hardware AWB enabled")
+            else:
+                _white_balance_controller.initialize(
+                    profile,
+                    baseline_white_balance
+                    if awb_seed is None
+                    else requested_white_balance,
+                )
             if not _generation_is_current(generation):
                 raise RuntimeError("camera generation changed after image-control verification")
             _image_control_ready.set()
@@ -413,6 +667,10 @@ def _schedule_wb_drift_check() -> None:
     """Read camera RGB; if it drifted from the locked set, restore and re-open oneshot."""
     global _wb_drift_check_thread, _wb_drift_last_check
 
+    if _HARDWARE_AWB:
+        # Sensor AWB owns RGB; do not force manual gains back.
+        return
+
     now = time.monotonic()
     with _wb_drift_check_lock:
         if _shutdown_event.is_set() or not _image_control_ready.is_set():
@@ -610,8 +868,23 @@ class NativeEventReader(threading.Thread):
                 payload.get("recording"),
                 payload.get("rtsp"),
             )
-            _schedule_wb_drift_check()
+            if not _HARDWARE_ISP:
+                _maybe_switch_color_period()
+                _schedule_wb_drift_check()
         elif event_type == "image.metrics":
+            if _HARDWARE_ISP:
+                # No software exposure/WB/color. Floodlight may still use brightness.
+                if not _image_control_ready.is_set():
+                    return
+                brightness_value = payload.get("scene_brightness")
+                brightness = (
+                    float(brightness_value)
+                    if isinstance(brightness_value, (int, float))
+                    else None
+                )
+                _floodlight.observe(brightness)
+                return
+            _maybe_switch_color_period()
             if not _image_control_ready.is_set():
                 return
             brightness_value = payload.get("scene_brightness")
@@ -633,14 +906,35 @@ class NativeEventReader(threading.Thread):
                     return
             red_ratio = payload.get("red_over_green")
             blue_ratio = payload.get("blue_over_green")
+            scene_brightness = (
+                float(brightness_value)
+                if isinstance(brightness_value, (int, float))
+                else None
+            )
+            # Prefer on-device wall stats when firmware supports them (no MJPEG steal).
+            if (
+                _USE_IMAGE_STATS
+                and not _HARDWARE_AWB
+                and _image_control.capabilities.image_stats
+            ):
+                try:
+                    stats = _image_control.get_image_stats()
+                    if (
+                        stats.roi is not None
+                        and stats.roi.usable
+                        and stats.roi.median_rg is not None
+                        and stats.roi.median_bg is not None
+                    ):
+                        red_ratio = stats.roi.median_rg
+                        blue_ratio = stats.roi.median_bg
+                    if stats.mean_y is not None and scene_brightness is None:
+                        scene_brightness = stats.mean_y
+                except ImageControlAPIError:
+                    pass
             wb_decision = _white_balance_controller.observe(
                 float(red_ratio) if isinstance(red_ratio, (int, float)) else None,
                 float(blue_ratio) if isinstance(blue_ratio, (int, float)) else None,
-                scene_brightness=(
-                    float(brightness_value)
-                    if isinstance(brightness_value, (int, float))
-                    else None
-                ),
+                scene_brightness=scene_brightness,
             )
             if wb_decision is not None:
                 _schedule_white_balance_adjustment(wb_decision)

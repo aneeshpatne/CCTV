@@ -52,9 +52,19 @@ class NativeEventProtocolTests(unittest.TestCase):
         orchestrator._image_control_ready.set()
         # Event tests must not launch the real periodic camera read-back worker.
         orchestrator._wb_drift_last_check = time.monotonic()
+        # Default production path is hardware ISP; legacy software-loop tests
+        # opt into the manual path explicitly.
+        self._hardware_isp = orchestrator._HARDWARE_ISP
+        self._hardware_awb = orchestrator._HARDWARE_AWB
+        orchestrator._HARDWARE_ISP = False
+        orchestrator._HARDWARE_AWB = False
+        orchestrator._AWB_BOOTSTRAP = False
+        orchestrator._USE_IMAGE_STATS = False
 
     def tearDown(self):
         orchestrator._image_control_ready.clear()
+        orchestrator._HARDWARE_ISP = self._hardware_isp
+        orchestrator._HARDWARE_AWB = self._hardware_awb
 
     def test_startup_applies_exposure_white_balance_and_saturation_separately(self):
         controller = ManualExposureController(gain_max_x16=128)
@@ -76,7 +86,13 @@ class NativeEventProtocolTests(unittest.TestCase):
         client.freeze_exposure.return_value = manual
         client.update_profile.side_effect = [manual, manual, colored]
 
-        with patch.object(orchestrator, "_exposure_controller", controller), patch.object(
+        with patch.object(orchestrator, "_HARDWARE_ISP", False), patch.object(
+            orchestrator, "_HARDWARE_AWB", False
+        ), patch.object(
+            orchestrator, "_AWB_BOOTSTRAP", False
+        ), patch.object(
+            orchestrator, "_exposure_controller", controller
+        ), patch.object(
             orchestrator, "_white_balance_controller", white_balance_controller
         ), patch.object(
             orchestrator, "_image_control", client
@@ -105,6 +121,36 @@ class NativeEventProtocolTests(unittest.TestCase):
         white_balance_controller.initialize.assert_called_once_with(
             colored, {"red": 94, "green": 65, "blue": 84}
         )
+
+    def test_hardware_isp_enables_ae_agc_awb_without_color_profile(self):
+        white_balance_controller = Mock()
+        white_balance_controller.status_summary.return_value = "WBCTRL DISABLED"
+        client = Mock()
+        hardware = frozen_profile()
+        hardware["exposure"]["autoExposure"] = True
+        hardware["exposure"]["autoGain"] = True
+        hardware["whiteBalance"]["auto"] = True
+        client.update_profile.return_value = hardware
+        client.get_profile.return_value = hardware
+
+        orchestrator._HARDWARE_ISP = True
+        with patch.object(
+            orchestrator, "_white_balance_controller", white_balance_controller
+        ), patch.object(orchestrator, "_image_control", client):
+            orchestrator._initialize_manual_exposure()
+
+        self.assertEqual(
+            client.update_profile.call_args_list[0],
+            call(
+                {
+                    "exposure": {"autoExposure": True, "autoGain": True},
+                    "whiteBalance": {"auto": True},
+                }
+            ),
+        )
+        client.freeze_exposure.assert_not_called()
+        white_balance_controller.disable.assert_called()
+        self.assertTrue(orchestrator._image_control_ready.is_set())
 
     def test_manual_adjustment_uses_partial_image_control_without_reset(self):
         controller = ManualExposureController()
@@ -203,7 +249,9 @@ class NativeEventProtocolTests(unittest.TestCase):
     def test_image_metrics_event_feeds_exposure_controller(self):
         controller = Mock()
         controller.observe.return_value = None
-        with patch.object(orchestrator, "_exposure_controller", controller):
+        with patch.object(orchestrator, "_HARDWARE_ISP", False), patch.object(
+            orchestrator, "_exposure_controller", controller
+        ):
             orchestrator.NativeEventReader._handle(
                 {
                     "version": 1,
@@ -219,6 +267,7 @@ class NativeEventProtocolTests(unittest.TestCase):
         white_balance = Mock()
         white_balance.observe.return_value = None
         with (
+            patch.object(orchestrator, "_HARDWARE_ISP", False),
             patch.object(orchestrator, "_exposure_controller", exposure),
             patch.object(orchestrator, "_white_balance_controller", white_balance),
         ):
@@ -236,6 +285,33 @@ class NativeEventProtocolTests(unittest.TestCase):
         white_balance.observe.assert_called_once_with(
             0.92, 1.08, scene_brightness=0.30
         )
+
+    def test_hardware_isp_skips_software_image_loops(self):
+        exposure = Mock()
+        white_balance = Mock()
+        floodlight = Mock()
+        floodlight.observe.return_value = None
+        orchestrator._image_control_ready.set()
+        orchestrator._HARDWARE_ISP = True
+        with (
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+            patch.object(orchestrator, "_floodlight", floodlight),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {
+                        "scene_brightness": 0.30,
+                        "red_over_green": 0.92,
+                        "blue_over_green": 1.08,
+                    },
+                }
+            )
+        exposure.observe.assert_not_called()
+        white_balance.observe.assert_not_called()
+        floodlight.observe.assert_called_once_with(0.30)
 
     def test_motion_started_event_does_not_control_floodlight(self):
         floodlight = Mock()
@@ -255,6 +331,7 @@ class NativeEventProtocolTests(unittest.TestCase):
         floodlight = Mock()
         floodlight.observe.return_value = True
         with (
+            patch.object(orchestrator, "_HARDWARE_ISP", False),
             patch.object(orchestrator, "_exposure_controller", exposure),
             patch.object(orchestrator, "_white_balance_controller", white_balance),
             patch.object(orchestrator, "_floodlight", floodlight),
