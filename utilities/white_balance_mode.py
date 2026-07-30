@@ -74,13 +74,13 @@ class ManualWhiteBalanceController:
         settle_seconds: float = 8.0,
         deadband: float = 0.08,
         max_step: int = 4,
-        # Neutral-cool wall targets: oneshot was locking too yellow-red at 1.00/0.80.
-        target_red_over_green: float = 0.92,
-        target_blue_over_green: float = 0.95,
+        # Natural wall ratios measured under good hardware AWB (morning stairwell).
+        target_red_over_green: float = 0.90,
+        target_blue_over_green: float = 0.87,
         max_deviation_fraction: float = 0.25,
         min_response: float = 0.004,
         failure_cooldown_seconds: float = 120.0,
-        min_scene_brightness: float = 0.18,
+        min_scene_brightness: float = 0.10,
         max_hunt_steps: int = 4,
         drift_threshold: int = 6,
         chroma_drift_deadband: float = 0.16,
@@ -173,10 +173,10 @@ class ManualWhiteBalanceController:
                 deadband=float(os.getenv("CCTV_WB_DEADBAND", "0.08")),
                 max_step=int(os.getenv("CCTV_WB_MAX_STEP", "4")),
                 target_red_over_green=float(
-                    os.getenv("CCTV_WB_TARGET_RED_OVER_GREEN", "0.92")
+                    os.getenv("CCTV_WB_TARGET_RED_OVER_GREEN", "0.90")
                 ),
                 target_blue_over_green=float(
-                    os.getenv("CCTV_WB_TARGET_BLUE_OVER_GREEN", "0.95")
+                    os.getenv("CCTV_WB_TARGET_BLUE_OVER_GREEN", "0.87")
                 ),
                 max_deviation_fraction=float(
                     os.getenv("CCTV_WB_MAX_DEVIATION_FRACTION", "0.25")
@@ -186,7 +186,7 @@ class ManualWhiteBalanceController:
                     os.getenv("CCTV_WB_FAILURE_COOLDOWN_SECONDS", "120")
                 ),
                 min_scene_brightness=float(
-                    os.getenv("CCTV_WB_MIN_SCENE_BRIGHTNESS", "0.18")
+                    os.getenv("CCTV_WB_MIN_SCENE_BRIGHTNESS", "0.10")
                 ),
                 max_hunt_steps=int(os.getenv("CCTV_WB_MAX_HUNT_STEPS", "4")),
                 drift_threshold=int(os.getenv("CCTV_WB_DRIFT_THRESHOLD", "6")),
@@ -572,7 +572,12 @@ class ManualWhiteBalanceController:
             if self.mode == "oneshot":
                 self._lock_for_session()
             else:
-                self._state = "limit"
+                # Continuous: rest after a short burst so we never thrash, then resume.
+                self._hunt_steps = 0
+                self._state = "hold"
+                self._hold_until = time.monotonic() + max(
+                    self.settle_seconds, self.failure_cooldown_seconds * 0.25
+                )
             self._save_state()
             return None
 
@@ -604,6 +609,8 @@ class ManualWhiteBalanceController:
                 # Good enough (or unachievable): lock whatever is verified now.
                 self._lock_for_session()
             else:
+                # Continuous equilibrium (or rails): clear burst counter, stay quiet.
+                self._hunt_steps = 0
                 self._state = "limit" if outside_deadband else "stable"
             self._save_state()
             return None
@@ -639,14 +646,24 @@ class ManualWhiteBalanceController:
             self._hunt_steps += 1
             # Accept small improvements but freeze after a short hunt so night
             # scenes with unreachable R/G targets cannot walk forever.
-            done = (
-                self._hunt_steps >= self.max_hunt_steps
-                or after_error <= self.deadband
-            )
+            in_band = after_error <= self.deadband
+            done = self._hunt_steps >= self.max_hunt_steps or in_band
             if self.mode == "oneshot" and done:
                 self._lock_for_session()
+            elif self.mode == "continuous" and in_band:
+                # Natural equilibrium — keep watching, no permanent freeze.
+                self._hunt_steps = 0
+                self._state = "stable"
             elif done:
-                self._state = "stable" if after_error <= self.deadband else "limit"
+                if self.mode == "continuous":
+                    # Burst cap: rest, then allow another slow correction later.
+                    self._hunt_steps = 0
+                    self._state = "hold"
+                    self._hold_until = time.monotonic() + max(
+                        self.settle_seconds * 2, 20.0
+                    )
+                else:
+                    self._state = "stable" if in_band else "limit"
             else:
                 self._state = "stable"
             self._save_state()
