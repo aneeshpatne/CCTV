@@ -148,9 +148,22 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertNotNil(event)
     }
 
+    func testMotionActivityIgnoresSingleFrameNoise() {
+        var guardState = MotionActivityGuard(holdDuration: 10)
+
+        let first = guardState.update(candidate: true, at: 100)
+        XCTAssertFalse(first.active)
+        XCTAssertFalse(first.started)
+
+        let second = guardState.update(candidate: true, at: 100.1)
+        XCTAssertTrue(second.active)
+        XCTAssertTrue(second.started)
+    }
+
     func testMotionActivityStaysActiveUntilTenQuietSeconds() {
         var guardState = MotionActivityGuard(holdDuration: 10)
 
+        _ = guardState.update(candidate: true, at: 99.9)
         let started = guardState.update(candidate: true, at: 100)
         XCTAssertTrue(started.active)
         XCTAssertTrue(started.started)
@@ -167,13 +180,77 @@ final class CCTVCaptureTests: XCTestCase {
     func testMotionActivityExtendsWithoutRestartingBlink() {
         var guardState = MotionActivityGuard(holdDuration: 10)
 
+        _ = guardState.update(candidate: true, at: 99.9)
         XCTAssertTrue(guardState.update(candidate: true, at: 100).started)
         let renewed = guardState.update(candidate: true, at: 109)
         XCTAssertTrue(renewed.active)
         XCTAssertFalse(renewed.started)
         XCTAssertTrue(guardState.update(candidate: false, at: 118.9).active)
         XCTAssertFalse(guardState.update(candidate: false, at: 119).active)
+        _ = guardState.update(candidate: true, at: 119.0)
         XCTAssertTrue(guardState.update(candidate: true, at: 119.1).started)
+    }
+
+    func testMotionScoringRejectsScatteredNoise() {
+        // Sparse single-block hits with barely-threshold magnitudes look like
+        // sensor/JPEG noise rather than an object.
+        let cells = (0..<12).map { index in
+            (x: (index * 3) % 24, y: (index * 5) % 18, magnitude: 12)
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+    }
+
+    func testMotionScoringRejectsRibbonFlickerBand() {
+        // Full-width one-row band is typical of AC light frequency / rolling flicker.
+        let cells = (0..<24).map { x in (x: x, y: 10, magnitude: 20) }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+    }
+
+    func testMotionScoringAcceptsCompactObjectMotion() {
+        var cells: [(x: Int, y: Int, magnitude: Int)] = []
+        for y in 8..<12 {
+            for x in 10..<15 {
+                cells.append((x: x, y: y, magnitude: 22))
+            }
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertTrue(result.candidate)
+        XCTAssertNotNil(result.boundingBox)
+        XCTAssertGreaterThan(result.score, 0.02)
+    }
+
+    func testMotionScoringRejectsNearGlobalLightingChange() {
+        var cells: [(x: Int, y: Int, magnitude: Int)] = []
+        for y in 0..<24 {
+            for x in 0..<20 {
+                cells.append((x: x, y: y, magnitude: 30))
+            }
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+        XCTAssertGreaterThanOrEqual(result.score, MotionScoring.maxActiveFraction)
     }
 
     func testCameraLEDBlinkPatternIsGuardedQuickDoubleFlash() {
