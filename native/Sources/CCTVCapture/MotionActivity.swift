@@ -7,14 +7,26 @@ struct MotionActivityUpdate: Sendable {
 
 struct MotionActivityGuard: Sendable {
     let holdDuration: TimeInterval
+    /// Require this many true candidates inside the rolling window before a new episode.
+    let persistenceRequired: Int
+    private var recent: [Bool]
+    private var recentIndex = 0
     private var activeUntil: TimeInterval?
 
-    init(holdDuration: TimeInterval = 10) {
+    init(holdDuration: TimeInterval = 10, persistenceWindow: Int = 3, persistenceRequired: Int = 2) {
         self.holdDuration = holdDuration
+        self.persistenceRequired = max(1, min(persistenceRequired, max(1, persistenceWindow)))
+        self.recent = [Bool](repeating: false, count: max(1, persistenceWindow))
     }
 
     mutating func update(candidate: Bool, at now: TimeInterval) -> MotionActivityUpdate {
-        if candidate {
+        recent[recentIndex] = candidate
+        recentIndex = (recentIndex + 1) % recent.count
+        // Require the current frame plus recent support so single-frame noise is
+        // ignored, while a quiet frame never extends the hold from stale history.
+        let accepted = candidate && recent.filter(\.self).count >= persistenceRequired
+
+        if accepted {
             let started = activeUntil == nil || now >= activeUntil!
             activeUntil = now + holdDuration
             return MotionActivityUpdate(active: true, started: started)
