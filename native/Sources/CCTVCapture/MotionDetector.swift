@@ -41,6 +41,35 @@ private final class MotionRequestBox: @unchecked Sendable {
     }
 }
 
+/// Single-frame motion gates used by VideoToolbox vector summarization.
+/// Tuned to suppress ESP32-CAM sensor noise, JPEG mosquito noise, and AC-mains
+/// light flicker while still accepting compact object-sized motion.
+enum MotionScoring {
+    /// Mild blur on the analysis frame kills high-frequency noise before ME.
+    static let analysisBlurSigma: Double = 1.25
+    /// L1 |dx|+|dy| floor for a 16×16 block. Raised from 6; noise vectors cluster lower.
+    static let minVectorMagnitude = 12
+    /// Minimum ROI fraction of active blocks (was 0.012).
+    static let minActiveFraction = 0.020
+    /// Near-global change is exposure/lighting, not an object (was 0.65).
+    static let maxActiveFraction = 0.50
+    /// Largest 4-connected active cluster must cover at least this many blocks.
+    static let minClusterBlocks = 6
+    /// Active fill density inside the largest-cluster bounding box.
+    static let minClusterDensity = 0.28
+    /// Mean magnitude inside the largest cluster; barely-threshold noise is cooler.
+    static let minMeanClusterMagnitude = 16.0
+    /// Thin ribbons across most of a frame axis are typical of flicker / rolling bands.
+    static let maxRibbonAspect = 8.0
+    static let maxRibbonThickness = 2
+}
+
+private struct MotionActiveCell: Sendable {
+    let x: Int
+    let y: Int
+    let magnitude: Int
+}
+
 actor MotionDetector {
     private let width = 512
     private let height = 384
@@ -162,13 +191,19 @@ actor MotionDetector {
         let extent = image.extent
         let scaleX = CGFloat(width) / max(extent.width, 1)
         let scaleY = CGFloat(height) / max(extent.height, 1)
+        let analysisBounds = CGRect(x: 0, y: 0, width: width, height: height)
+        // Downscale first, then lightly blur so sensor/JPEG noise does not seed
+        // spurious motion vectors while real object edges remain usable.
         let normalized = image
             .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
             .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            .clampedToExtent()
+            .applyingGaussianBlur(sigma: MotionScoring.analysisBlurSigma)
+            .cropped(to: analysisBounds)
         context.render(
             normalized,
             to: output,
-            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+            bounds: analysisBounds,
             colorSpace: colorSpace
         )
         return output
@@ -181,12 +216,8 @@ actor MotionDetector {
     ) -> MotionResult {
         let gridWidth = max(CVPixelBufferGetWidth(vectors), 1)
         let gridHeight = max(CVPixelBufferGetHeight(vectors), 1)
-        var active = 0
         var eligible = 0
-        var minX = gridWidth
-        var minY = gridHeight
-        var maxX = -1
-        var maxY = -1
+        var activeCells: [MotionActiveCell] = []
 
         CVPixelBufferLockBaseAddress(vectors, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(vectors, .readOnly) }
@@ -209,38 +240,140 @@ actor MotionDetector {
                     let dx = Int16(bitPattern: UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8)
                     let dy = Int16(bitPattern: UInt16(bytes[offset + 2]) | UInt16(bytes[offset + 3]) << 8)
                     let magnitude = abs(Int(dx)) + abs(Int(dy))
-                    if magnitude >= 6 {
-                        active += 1
-                        minX = min(minX, x)
-                        minY = min(minY, y)
-                        maxX = max(maxX, x)
-                        maxY = max(maxY, y)
+                    if magnitude >= MotionScoring.minVectorMagnitude {
+                        activeCells.append(MotionActiveCell(x: x, y: y, magnitude: magnitude))
                     }
                 }
             }
         }
 
+        return evaluate(
+            activeCells: activeCells,
+            gridWidth: gridWidth,
+            gridHeight: gridHeight,
+            eligible: eligible
+        )
+    }
+
+    /// Pure scoring path for production summarization and unit tests.
+    nonisolated static func evaluate(
+        activeCells: [(x: Int, y: Int, magnitude: Int)],
+        gridWidth: Int,
+        gridHeight: Int,
+        eligible: Int
+    ) -> MotionResult {
+        let cells = activeCells.map { MotionActiveCell(x: $0.x, y: $0.y, magnitude: $0.magnitude) }
+        return evaluate(activeCells: cells, gridWidth: gridWidth, gridHeight: gridHeight, eligible: eligible)
+    }
+
+    nonisolated private static func evaluate(
+        activeCells: [MotionActiveCell],
+        gridWidth: Int,
+        gridHeight: Int,
+        eligible: Int
+    ) -> MotionResult {
+        let active = activeCells.count
         let score = eligible > 0 ? Double(active) / Double(eligible) : 0
-        // A near-global one-frame change is normally exposure or lighting, not an object.
-        let candidate = score >= 0.012 && score < 0.65
-        let confidence = min(1, max(0, (score - 0.006) / 0.08))
-        let box: NormalizedRect? = maxX >= minX && maxY >= minY
-            ? NormalizedRect(
-                x: Double(minX) / Double(gridWidth),
-                y: Double(minY) / Double(gridHeight),
-                width: Double(maxX - minX + 1) / Double(gridWidth),
-                height: Double(maxY - minY + 1) / Double(gridHeight)
+        let confidence = min(1, max(0, (score - 0.010) / 0.08))
+
+        guard
+            score >= MotionScoring.minActiveFraction,
+            score < MotionScoring.maxActiveFraction,
+            let cluster = largestCluster(activeCells, gridWidth: gridWidth),
+            cluster.cells.count >= MotionScoring.minClusterBlocks
+        else {
+            return MotionResult(
+                candidate: false,
+                score: score,
+                confidence: confidence,
+                boundingBox: nil,
+                sceneBrightness: nil,
+                redOverGreen: nil,
+                blueOverGreen: nil
             )
-            : nil
+        }
+
+        let boxWidth = cluster.maxX - cluster.minX + 1
+        let boxHeight = cluster.maxY - cluster.minY + 1
+        let boxArea = max(1, boxWidth * boxHeight)
+        let density = Double(cluster.cells.count) / Double(boxArea)
+        let meanMagnitude = Double(cluster.cells.reduce(0) { $0 + $1.magnitude })
+            / Double(cluster.cells.count)
+        let aspect = Double(max(boxWidth, boxHeight)) / Double(max(1, min(boxWidth, boxHeight)))
+        let ribbonLike = aspect >= MotionScoring.maxRibbonAspect
+            && min(boxWidth, boxHeight) <= MotionScoring.maxRibbonThickness
+
+        let candidate = density >= MotionScoring.minClusterDensity
+            && meanMagnitude >= MotionScoring.minMeanClusterMagnitude
+            && !ribbonLike
+
+        let box = NormalizedRect(
+            x: Double(cluster.minX) / Double(gridWidth),
+            y: Double(cluster.minY) / Double(gridHeight),
+            width: Double(boxWidth) / Double(gridWidth),
+            height: Double(boxHeight) / Double(gridHeight)
+        )
         return MotionResult(
             candidate: candidate,
             score: score,
             confidence: confidence,
-            boundingBox: box,
+            boundingBox: candidate ? box : nil,
             sceneBrightness: nil,
             redOverGreen: nil,
             blueOverGreen: nil
         )
+    }
+
+    nonisolated private static func largestCluster(
+        _ cells: [MotionActiveCell],
+        gridWidth: Int
+    ) -> (cells: [MotionActiveCell], minX: Int, minY: Int, maxX: Int, maxY: Int)? {
+        guard !cells.isEmpty else { return nil }
+
+        var byKey: [Int: MotionActiveCell] = [:]
+        byKey.reserveCapacity(cells.count)
+        for cell in cells {
+            byKey[cell.y * gridWidth + cell.x] = cell
+        }
+
+        var visited = Set<Int>()
+        visited.reserveCapacity(cells.count)
+        var best: [MotionActiveCell] = []
+
+        for cell in cells {
+            let startKey = cell.y * gridWidth + cell.x
+            guard visited.insert(startKey).inserted else { continue }
+
+            var component: [MotionActiveCell] = []
+            var queue: [MotionActiveCell] = [cell]
+            var head = 0
+            while head < queue.count {
+                let current = queue[head]
+                head += 1
+                component.append(current)
+                let neighbors = [
+                    (current.x + 1, current.y),
+                    (current.x - 1, current.y),
+                    (current.x, current.y + 1),
+                    (current.x, current.y - 1),
+                ]
+                for (nx, ny) in neighbors {
+                    let key = ny * gridWidth + nx
+                    guard let next = byKey[key], visited.insert(key).inserted else { continue }
+                    queue.append(next)
+                }
+            }
+            if component.count > best.count {
+                best = component
+            }
+        }
+
+        guard !best.isEmpty else { return nil }
+        let minX = best.map(\.x).min()!
+        let maxX = best.map(\.x).max()!
+        let minY = best.map(\.y).min()!
+        let maxY = best.map(\.y).max()!
+        return (best, minX, minY, maxX, maxY)
     }
 
     /// Estimate BT.709 luma before the HUD is drawn, excluding clipped shadows and

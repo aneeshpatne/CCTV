@@ -61,7 +61,7 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encode(duration, forKey: .duration)
                 try container.encode(confidence, forKey: .confidence)
                 try container.encode(labels, forKey: .labels)
-                try container.encode("vt-motion-v1", forKey: .detectorVersion)
+                try container.encode("vt-motion-v2", forKey: .detectorVersion)
             case let .segment(path, start, end, duration, codec, size):
                 try container.encode(path, forKey: .path)
                 try container.encode(start, forKey: .startTime)
