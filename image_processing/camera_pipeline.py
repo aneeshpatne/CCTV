@@ -105,7 +105,9 @@ DEFAULT_HUD_FONT_PATH = next(
 HUD_FONT_PATH = os.getenv("CCTV_HUD_FONT", str(DEFAULT_HUD_FONT_PATH))
 
 # Motion detection configuration
-MIN_AREA = 800
+# Contour area floor after morphology. Raised to ignore JPEG/sensor speckles
+# and AC-mains flicker bands that still leave small residual blobs.
+MIN_AREA = 1400
 ROI_PTS = np.array(
     [
         [12, 5],
@@ -1928,10 +1930,12 @@ def main() -> None:
         last_no_signal_frame = time.monotonic()
 
     # Initialize motion detection components
+    # Higher varThreshold + stronger open reduce noise/flicker false positives
+    # on the ESP32-CAM JPEG stream (native VT path is preferred when available).
     mog2 = cv2.createBackgroundSubtractorMOG2(
-        history=500, varThreshold=25, detectShadows=True
+        history=500, varThreshold=40, detectShadows=True
     )
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     blinker = NonBlockingBlinker(blink_interval=0.5)
     floodlight = FloodlightController.from_environment()
     motion_activity = MotionActivityGuard(hold_seconds=10)
@@ -2044,11 +2048,13 @@ def main() -> None:
             # Update FPS calculation
             update_fps()
 
-            # Motion detection on the current frame
-            fg_mask = mog2.apply(frame)
+            # Motion detection on the current frame. Light blur first so sensor
+            # noise and light-frequency banding do not dominate the FG mask.
+            motion_frame = cv2.GaussianBlur(frame, (5, 5), 0)
+            fg_mask = mog2.apply(motion_frame)
             _, mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.dilate(mask, kernel, iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+            mask = cv2.dilate(mask, kernel, iterations=1)
 
             # The ROI geometry is fixed; rebuild only after a resolution change.
             if roi_mask is None or roi_mask.shape != mask.shape:
