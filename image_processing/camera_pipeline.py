@@ -107,7 +107,11 @@ HUD_FONT_PATH = os.getenv("CCTV_HUD_FONT", str(DEFAULT_HUD_FONT_PATH))
 # Motion detection configuration
 # Contour area floor after morphology. Raised to ignore JPEG/sensor speckles
 # and AC-mains flicker bands that still leave small residual blobs.
-MIN_AREA = 1400
+MIN_AREA = 2200
+# Reject wide, short contours (rolling-shutter / AC light frequency bands).
+MAX_FLICKER_BAND_WIDTH_FRAC = 0.55
+MAX_FLICKER_BAND_HEIGHT_PX = 28
+MIN_CONTOUR_FILL = 0.18
 ROI_PTS = np.array(
     [
         [12, 5],
@@ -1933,9 +1937,11 @@ def main() -> None:
     # Higher varThreshold + stronger open reduce noise/flicker false positives
     # on the ESP32-CAM JPEG stream (native VT path is preferred when available).
     mog2 = cv2.createBackgroundSubtractorMOG2(
-        history=500, varThreshold=40, detectShadows=True
+        history=600, varThreshold=55, detectShadows=True
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    # Tall vertical open kills thin horizontal AC-flicker bands before contours.
+    flicker_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 9))
     blinker = NonBlockingBlinker(blink_interval=0.5)
     floodlight = FloodlightController.from_environment()
     motion_activity = MotionActivityGuard(hold_seconds=10)
@@ -2048,12 +2054,13 @@ def main() -> None:
             # Update FPS calculation
             update_fps()
 
-            # Motion detection on the current frame. Light blur first so sensor
+            # Motion detection on the current frame. Stronger blur first so sensor
             # noise and light-frequency banding do not dominate the FG mask.
-            motion_frame = cv2.GaussianBlur(frame, (5, 5), 0)
+            motion_frame = cv2.GaussianBlur(frame, (7, 7), 0)
             fg_mask = mog2.apply(motion_frame)
-            _, mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
+            _, mask = cv2.threshold(fg_mask, 220, 255, cv2.THRESH_BINARY)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, flicker_kernel, iterations=1)
             mask = cv2.dilate(mask, kernel, iterations=1)
 
             # The ROI geometry is fixed; rebuild only after a resolution change.
@@ -2061,6 +2068,7 @@ def main() -> None:
                 roi_mask = np.zeros_like(mask, dtype=np.uint8)
                 cv2.fillPoly(roi_mask, [ROI_PTS], 255)
             filtered_motion = cv2.bitwise_and(mask, roi_mask)
+            frame_h, frame_w = filtered_motion.shape[:2]
 
             # Find contours in filtered motion
             contours, _ = cv2.findContours(
@@ -2075,8 +2083,20 @@ def main() -> None:
                 area = cv2.contourArea(c)
                 if area < MIN_AREA:
                     continue
-                motion_detected = True
                 x, y, w, h = cv2.boundingRect(c)
+                # AC/rolling flicker → wide short strip. Real subjects are bulkier.
+                if (
+                    w >= MAX_FLICKER_BAND_WIDTH_FRAC * frame_w
+                    and h <= MAX_FLICKER_BAND_HEIGHT_PX
+                ):
+                    continue
+                box_area = max(1, w * h)
+                if area / box_area < MIN_CONTOUR_FILL:
+                    continue
+                # Near-global residual is lighting / exposure, not an object.
+                if box_area >= 0.45 * frame_w * frame_h:
+                    continue
+                motion_detected = True
                 coordinates = [x, y]
                 if 10 <= x <= 46 and 15 <= y <= 276:
                     time_overlap = True
