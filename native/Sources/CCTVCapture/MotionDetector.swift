@@ -43,31 +43,45 @@ private final class MotionRequestBox: @unchecked Sendable {
 
 /// Single-frame motion gates used by VideoToolbox vector summarization.
 /// Tuned to suppress ESP32-CAM sensor noise, JPEG mosquito noise, and AC-mains
-/// light flicker while still accepting compact object-sized motion.
+/// light flicker (50/60 Hz → rolling bands + global luma pulse) while still
+/// accepting compact object-sized motion.
 enum MotionScoring {
-    /// Mild blur on the analysis frame kills high-frequency noise before ME.
-    static let analysisBlurSigma: Double = 1.25
-    /// L1 |dx|+|dy| floor for a 16×16 block. Raised from 6; noise vectors cluster lower.
-    static let minVectorMagnitude = 12
-    /// Minimum ROI fraction of active blocks (was 0.012).
-    static let minActiveFraction = 0.020
-    /// Near-global change is exposure/lighting, not an object (was 0.65).
-    static let maxActiveFraction = 0.50
+    /// Stronger blur damps high-frequency JPEG mosquito noise and thin flicker edges.
+    static let analysisBlurSigma: Double = 2.0
+    /// L1 |dx|+|dy| floor for a 16×16 block. Noise/flicker vectors cluster lower.
+    static let minVectorMagnitude = 14
+    /// Minimum ROI fraction of active blocks.
+    static let minActiveFraction = 0.024
+    /// Near-global change is exposure/lighting, not an object.
+    static let maxActiveFraction = 0.42
     /// Largest 4-connected active cluster must cover at least this many blocks.
-    static let minClusterBlocks = 6
+    static let minClusterBlocks = 8
     /// Active fill density inside the largest-cluster bounding box.
-    static let minClusterDensity = 0.28
+    static let minClusterDensity = 0.32
     /// Mean magnitude inside the largest cluster; barely-threshold noise is cooler.
-    static let minMeanClusterMagnitude = 16.0
+    static let minMeanClusterMagnitude = 18.0
     /// Thin ribbons across most of a frame axis are typical of flicker / rolling bands.
-    static let maxRibbonAspect = 8.0
-    static let maxRibbonThickness = 2
+    static let maxRibbonAspect = 6.0
+    static let maxRibbonThickness = 3
+    /// Wide multi-row bands (rolling-shutter AC flicker) even when not razor-thin.
+    static let maxBandWidthFraction = 0.55
+    static let maxBandHeightBlocks = 4
+    /// Real objects move coherently; light-frequency artifacts scatter vector angles.
+    static let minDirectionCoherence = 0.45
+    /// Cosine threshold (~55°) for counting a vector as agreeing with the cluster mean.
+    static let directionCosineThreshold = 0.55
+    /// Clamp for per-frame mean-luma matching that cancels global AC brightness pulse.
+    static let lumaMatchScaleMin = 0.78
+    static let lumaMatchScaleMax = 1.28
 }
 
 private struct MotionActiveCell: Sendable {
     let x: Int
     let y: Int
-    let magnitude: Int
+    let dx: Int
+    let dy: Int
+
+    var magnitude: Int { abs(dx) + abs(dy) }
 }
 
 actor MotionDetector {
@@ -80,6 +94,9 @@ actor MotionDetector {
     private let analysisBuffers: [CVPixelBuffer]
     private var nextBufferIndex = 0
     private var previous: CVPixelBuffer?
+    /// Running mean luma of the last analysis frame (after match). Used to cancel
+    /// frame-to-frame global brightness pulse from AC-powered lights before ME.
+    private var previousMeanLuma: Double?
 
     // Existing 1024x768 ROI normalized once. It intentionally retains the current
     // near-full-frame coverage while excluding the small margins outside the polygon.
@@ -152,7 +169,23 @@ actor MotionDetector {
                 blueOverGreen: nil
             )
         }
+        // Metrics from the raw analysis frame (pre mean-match) so exposure/WB still
+        // see true scene brightness rather than the flicker-normalized copy.
         let metrics = Self.imageMetrics(buffer)
+        let rawMean = Self.meanLuma(buffer)
+        // Cancel global AC light pulse: scale current toward previous mean so pure
+        // full-frame brightness oscillation does not seed motion vectors. Local
+        // object motion remains after the global gain is removed.
+        if let previousMean = previousMeanLuma, let rawMean, rawMean > 1 {
+            let scale = min(
+                MotionScoring.lumaMatchScaleMax,
+                max(MotionScoring.lumaMatchScaleMin, previousMean / rawMean)
+            )
+            if abs(scale - 1) > 0.008 {
+                Self.scaleLuma(buffer, by: scale)
+            }
+        }
+        previousMeanLuma = Self.meanLuma(buffer) ?? rawMean
         guard let previous else {
             self.previous = buffer
             return MotionResult(
@@ -237,11 +270,11 @@ actor MotionDetector {
                     guard inROI else { continue }
                     eligible += 1
                     let offset = y * rowBytes + x * 4
-                    let dx = Int16(bitPattern: UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8)
-                    let dy = Int16(bitPattern: UInt16(bytes[offset + 2]) | UInt16(bytes[offset + 3]) << 8)
-                    let magnitude = abs(Int(dx)) + abs(Int(dy))
+                    let dx = Int(Int16(bitPattern: UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8))
+                    let dy = Int(Int16(bitPattern: UInt16(bytes[offset + 2]) | UInt16(bytes[offset + 3]) << 8))
+                    let magnitude = abs(dx) + abs(dy)
                     if magnitude >= MotionScoring.minVectorMagnitude {
-                        activeCells.append(MotionActiveCell(x: x, y: y, magnitude: magnitude))
+                        activeCells.append(MotionActiveCell(x: x, y: y, dx: dx, dy: dy))
                     }
                 }
             }
@@ -256,13 +289,30 @@ actor MotionDetector {
     }
 
     /// Pure scoring path for production summarization and unit tests.
+    /// When only magnitude is supplied, vectors are treated as coherent (dx=magnitude, dy=0)
+    /// so geometry gates can be tested independently of direction scatter.
     nonisolated static func evaluate(
         activeCells: [(x: Int, y: Int, magnitude: Int)],
         gridWidth: Int,
         gridHeight: Int,
         eligible: Int
     ) -> MotionResult {
-        let cells = activeCells.map { MotionActiveCell(x: $0.x, y: $0.y, magnitude: $0.magnitude) }
+        let cells = activeCells.map {
+            MotionActiveCell(x: $0.x, y: $0.y, dx: $0.magnitude, dy: 0)
+        }
+        return evaluate(activeCells: cells, gridWidth: gridWidth, gridHeight: gridHeight, eligible: eligible)
+    }
+
+    /// Vector-aware scoring path (preferred for flicker-coherence tests).
+    nonisolated static func evaluate(
+        activeCells: [(x: Int, y: Int, dx: Int, dy: Int)],
+        gridWidth: Int,
+        gridHeight: Int,
+        eligible: Int
+    ) -> MotionResult {
+        let cells = activeCells.map {
+            MotionActiveCell(x: $0.x, y: $0.y, dx: $0.dx, dy: $0.dy)
+        }
         return evaluate(activeCells: cells, gridWidth: gridWidth, gridHeight: gridHeight, eligible: eligible)
     }
 
@@ -274,7 +324,7 @@ actor MotionDetector {
     ) -> MotionResult {
         let active = activeCells.count
         let score = eligible > 0 ? Double(active) / Double(eligible) : 0
-        let confidence = min(1, max(0, (score - 0.010) / 0.08))
+        let confidence = min(1, max(0, (score - 0.012) / 0.08))
 
         guard
             score >= MotionScoring.minActiveFraction,
@@ -302,10 +352,20 @@ actor MotionDetector {
         let aspect = Double(max(boxWidth, boxHeight)) / Double(max(1, min(boxWidth, boxHeight)))
         let ribbonLike = aspect >= MotionScoring.maxRibbonAspect
             && min(boxWidth, boxHeight) <= MotionScoring.maxRibbonThickness
+        // Rolling-shutter AC flicker often paints a wide multi-row band rather than
+        // a one-pixel ribbon. Reject any short, near-full-width horizontal strip.
+        let horizontalBand = Double(boxWidth) / Double(max(1, gridWidth)) >= MotionScoring.maxBandWidthFraction
+            && boxHeight <= MotionScoring.maxBandHeightBlocks
+        let verticalBand = Double(boxHeight) / Double(max(1, gridHeight)) >= MotionScoring.maxBandWidthFraction
+            && boxWidth <= MotionScoring.maxBandHeightBlocks
+        let coherence = directionCoherence(cluster.cells)
 
         let candidate = density >= MotionScoring.minClusterDensity
             && meanMagnitude >= MotionScoring.minMeanClusterMagnitude
             && !ribbonLike
+            && !horizontalBand
+            && !verticalBand
+            && coherence >= MotionScoring.minDirectionCoherence
 
         let box = NormalizedRect(
             x: Double(cluster.minX) / Double(gridWidth),
@@ -322,6 +382,90 @@ actor MotionDetector {
             redOverGreen: nil,
             blueOverGreen: nil
         )
+    }
+
+    /// Fraction of cluster cells whose direction agrees with the magnitude-weighted mean.
+    /// Flicker / noise scatters; a walking person or animal does not.
+    nonisolated static func directionCoherence(_ cells: [(dx: Int, dy: Int)]) -> Double {
+        directionCoherence(cells.map { MotionActiveCell(x: 0, y: 0, dx: $0.dx, dy: $0.dy) })
+    }
+
+    nonisolated private static func directionCoherence(_ cells: [MotionActiveCell]) -> Double {
+        guard !cells.isEmpty else { return 0 }
+        var sumX = 0.0
+        var sumY = 0.0
+        var weightSum = 0.0
+        for cell in cells {
+            let weight = Double(max(1, cell.magnitude))
+            sumX += Double(cell.dx) * weight
+            sumY += Double(cell.dy) * weight
+            weightSum += weight
+        }
+        guard weightSum > 0 else { return 0 }
+        let meanLength = (sumX * sumX + sumY * sumY).squareRoot()
+        // Near-zero mean direction with non-trivial magnitudes ⇒ opposing/random vectors.
+        if meanLength < 1e-6 {
+            return 0
+        }
+        let meanX = sumX / meanLength
+        let meanY = sumY / meanLength
+        var agreeing = 0
+        for cell in cells {
+            let length = (Double(cell.dx * cell.dx + cell.dy * cell.dy)).squareRoot()
+            guard length > 1e-6 else { continue }
+            let cosine = (Double(cell.dx) * meanX + Double(cell.dy) * meanY) / length
+            if cosine >= MotionScoring.directionCosineThreshold {
+                agreeing += 1
+            }
+        }
+        return Double(agreeing) / Double(cells.count)
+    }
+
+    nonisolated static func meanLuma(_ buffer: CVPixelBuffer) -> Double? {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        let step = 4
+        var total = 0.0
+        var count = 0
+        for y in stride(from: 0, to: height, by: step) {
+            for x in stride(from: 0, to: width, by: step) {
+                let offset = y * rowBytes + x * 4
+                let blue = Double(bytes[offset])
+                let green = Double(bytes[offset + 1])
+                let red = Double(bytes[offset + 2])
+                total += 0.2126 * red + 0.7152 * green + 0.0722 * blue
+                count += 1
+            }
+        }
+        guard count > 0 else { return nil }
+        return total / Double(count)
+    }
+
+    /// In-place RGB scale (alpha untouched) used for global luma matching.
+    nonisolated static func scaleLuma(_ buffer: CVPixelBuffer, by scale: Double) {
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return }
+
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<height {
+            let row = y * rowBytes
+            for x in 0..<width {
+                let offset = row + x * 4
+                bytes[offset] = UInt8(min(255, max(0, Double(bytes[offset]) * scale)))
+                bytes[offset + 1] = UInt8(min(255, max(0, Double(bytes[offset + 1]) * scale)))
+                bytes[offset + 2] = UInt8(min(255, max(0, Double(bytes[offset + 2]) * scale)))
+            }
+        }
     }
 
     nonisolated private static func largestCluster(
