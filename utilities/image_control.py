@@ -114,6 +114,15 @@ class ImageControlClient:
             timeout=timeout if timeout is not None else self.timeout,
         )
 
+    def recalibrate_v3(self, *, timeout: float | None = 30.0) -> dict[str, Any]:
+        """Run firmware recalibrate-v3 (full image-control recalibration pass)."""
+        # Deliberately do not pass json= or data=: this endpoint rejects any body.
+        return self._request(
+            "put",
+            "/image-control/recalibrate-v3",
+            timeout=timeout if timeout is not None else self.timeout,
+        )
+
     def update_exposure(self, shutter_lines: int, gain_x16: int) -> dict[str, Any]:
         return self.update_profile(
             {"exposure": {"shutterLines": shutter_lines, "gainX16": gain_x16}}

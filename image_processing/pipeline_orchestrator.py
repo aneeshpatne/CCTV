@@ -47,6 +47,9 @@ if not RECORDINGS_DIR.exists():
 DISK_USAGE_THRESHOLD = 90  # percent
 DISK_USAGE_TARGET = 85  # cleanup hysteresis target
 CHECK_INTERVAL_SECONDS = 5 * 60
+RECALIBRATE_INTERVAL_SECONDS = int(
+    os.getenv("CCTV_RECALIBRATE_INTERVAL_SECONDS", str(4 * 60 * 60))
+)
 STOP_TIMEOUT_SECONDS = 5.0
 NATIVE_FAILURE_LIMIT = 3
 NATIVE_FAILURE_WINDOW_SECONDS = 5 * 60
@@ -58,6 +61,8 @@ _camera_monitor_lock = threading.Lock()
 _camera_monitor: Optional["CameraProcessMonitor"] = None
 _storage_monitor_lock = threading.Lock()
 _storage_monitor: Optional["StorageMonitor"] = None
+_recalibrate_monitor_lock = threading.Lock()
+_recalibrate_monitor: Optional["RecalibrateMonitor"] = None
 _shutdown_event = threading.Event()
 _event_reader: Optional["NativeEventReader"] = None
 _event_reader_lock = threading.Lock()
@@ -1203,6 +1208,42 @@ class StorageMonitor(threading.Thread):
         logging.info("[monitor] Storage monitor thread stopped.")
 
 
+class RecalibrateMonitor(threading.Thread):
+    """Background thread that runs PUT /image-control/recalibrate-v3 on an interval."""
+
+    def __init__(self, interval_seconds: int) -> None:
+        super().__init__(daemon=True, name="cctv-recalibrate-monitor")
+        self.interval = max(60, int(interval_seconds))
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        logging.info(
+            "[monitor] Recalibrate monitor thread started (interval=%ss).",
+            self.interval,
+        )
+        while not self._stop_event.is_set():
+            # Wait the full interval first so boot/image-control setup is not raced.
+            if self._stop_event.wait(self.interval):
+                break
+            try:
+                result = _image_control.recalibrate_v3()
+                logging.info(
+                    "[image-control] recalibrate-v3 completed: %s",
+                    result,
+                )
+            except ImageControlAPIError as error:
+                logging.warning(
+                    "[image-control] recalibrate-v3 failed: %s",
+                    error,
+                )
+            except Exception:
+                logging.exception("[image-control] recalibrate-v3 unexpected failure")
+        logging.info("[monitor] Recalibrate monitor thread stopped.")
+
+
 class CameraProcessMonitor(threading.Thread):
     """Restart the camera pipeline if it exits while the orchestrator is running."""
 
@@ -1257,7 +1298,7 @@ class CameraProcessMonitor(threading.Thread):
 
 def start_orchestrator() -> None:
     """Start the camera pipeline and the storage monitor."""
-    global _camera_monitor, _storage_monitor
+    global _camera_monitor, _storage_monitor, _recalibrate_monitor
 
     start_camera_pipeline()
 
@@ -1275,10 +1316,19 @@ def start_orchestrator() -> None:
                 CHECK_INTERVAL_SECONDS,
             )
 
+    with _recalibrate_monitor_lock:
+        if _recalibrate_monitor is None or not _recalibrate_monitor.is_alive():
+            _recalibrate_monitor = RecalibrateMonitor(RECALIBRATE_INTERVAL_SECONDS)
+            _recalibrate_monitor.start()
+            logging.info(
+                "[orchestrator] Image recalibrate-v3 scheduled every %s seconds.",
+                RECALIBRATE_INTERVAL_SECONDS,
+            )
+
 
 def shutdown_orchestrator(sig: signal.Signals = signal.SIGTERM) -> None:
     """Stop the storage monitor and camera pipeline."""
-    global _camera_monitor, _storage_monitor
+    global _camera_monitor, _storage_monitor, _recalibrate_monitor
 
     logging.info("[orchestrator] Shutting down (signal=%s).", sig.name)
 
@@ -1299,6 +1349,14 @@ def shutdown_orchestrator(sig: signal.Signals = signal.SIGTERM) -> None:
     if monitor is not None:
         monitor.stop()
         monitor.join(timeout=STOP_TIMEOUT_SECONDS)
+
+    with _recalibrate_monitor_lock:
+        recalibrate_monitor = _recalibrate_monitor
+        _recalibrate_monitor = None
+
+    if recalibrate_monitor is not None:
+        recalibrate_monitor.stop()
+        recalibrate_monitor.join(timeout=STOP_TIMEOUT_SECONDS)
 
     stop_camera_pipeline(sig)
     _floodlight.close()

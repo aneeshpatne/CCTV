@@ -406,7 +406,7 @@ class StartupResolutionTests(unittest.TestCase):
         ]
         startup()
         change_quality.assert_called_once_with(12)
-        _change_clock.assert_called_once_with(10)
+        _change_clock.assert_called_once_with(14)
 
 
 if __name__ == "__main__":

@@ -191,10 +191,10 @@ def startup():
             logger.warning("Resolution setting incomplete - will retry")
             continue
 
-        # Clean ISP look: leave clock at 10 MHz (matches the good hardware-default look).
+        # Prefer 14 MHz XCLK for the current ISP/profile look.
         try:
-            logger.info("Setting camera clock to 10")
-            change_clock(10)
+            logger.info("Setting camera clock to 14")
+            change_clock(14)
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
 
