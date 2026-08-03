@@ -21,12 +21,17 @@ class MotionActivityTests(unittest.TestCase):
         self.assertFalse(first.started)
 
         second = guard.update(True, 100.1)
-        self.assertTrue(second.active)
-        self.assertTrue(second.started)
+        self.assertFalse(second.active)
+        self.assertFalse(second.started)
+
+        third = guard.update(True, 100.2)
+        self.assertTrue(third.active)
+        self.assertTrue(third.started)
 
     def test_guard_holds_until_ten_quiet_seconds(self):
         guard = MotionActivityGuard(hold_seconds=10)
 
+        guard.update(True, 99.8)
         guard.update(True, 99.9)
         started = guard.update(True, 100)
         self.assertTrue(started.active)
@@ -39,6 +44,7 @@ class MotionActivityTests(unittest.TestCase):
     def test_guard_extends_without_restarting_episode(self):
         guard = MotionActivityGuard(hold_seconds=10)
 
+        guard.update(True, 99.8)
         guard.update(True, 99.9)
         self.assertTrue(guard.update(True, 100).started)
         renewed = guard.update(True, 109)
@@ -47,7 +53,16 @@ class MotionActivityTests(unittest.TestCase):
         self.assertTrue(guard.update(False, 118.9).active)
         self.assertFalse(guard.update(False, 119).active)
         guard.update(True, 119.0)
+        guard.update(True, 119.05)
         self.assertTrue(guard.update(True, 119.1).started)
+
+    def test_guard_ignores_intermittent_flicker_pattern(self):
+        """Alternating true/false (typical AC flicker hits) must not start motion."""
+        guard = MotionActivityGuard(hold_seconds=10)
+        for index in range(10):
+            state = guard.update(index % 2 == 0, 100 + index * 0.1)
+            self.assertFalse(state.active)
+            self.assertFalse(state.started)
 
     def test_blinker_starts_immediately_and_ignores_duplicate_start(self):
         dispatcher = FakeDispatcher()

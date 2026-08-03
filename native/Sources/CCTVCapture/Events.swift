@@ -61,7 +61,7 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encode(duration, forKey: .duration)
                 try container.encode(confidence, forKey: .confidence)
                 try container.encode(labels, forKey: .labels)
-                try container.encode("vt-motion-v2", forKey: .detectorVersion)
+                try container.encode("vt-motion-v3", forKey: .detectorVersion)
             case let .segment(path, start, end, duration, codec, size):
                 try container.encode(path, forKey: .path)
                 try container.encode(start, forKey: .startTime)
@@ -147,8 +147,9 @@ final class EventEmitter: @unchecked Sendable {
 
 actor MotionEventAccumulator {
     private let cooldown: TimeInterval
-    private var recent = [Bool](repeating: false, count: 3)
-    private var recentIndex = 0
+    /// Match MotionActivityGuard: three consecutive positives before a clip opens.
+    private let persistenceRequired = 3
+    private var consecutiveHits = 0
     private var eventStart: Date?
     private var lastMotion: Date?
     private var labels: [String: Double] = [:]
@@ -166,9 +167,15 @@ actor MotionEventAccumulator {
     }
 
     func update(candidate: Bool, confidence: Double, semanticLabels: [SemanticLabel], at now: Date) -> WorkerEvent? {
-        recent[recentIndex] = candidate
-        recentIndex = (recentIndex + 1) % recent.count
-        let accepted = recent.filter { $0 }.count >= 2
+        if candidate {
+            consecutiveHits += 1
+        } else {
+            consecutiveHits = 0
+        }
+        // Open (or keep open) only after consecutive positives; while an event is
+        // already open, any single candidate refreshes lastMotion.
+        let eventOpen = eventStart != nil
+        let accepted = candidate && (eventOpen || consecutiveHits >= persistenceRequired)
 
         if accepted {
             if eventStart == nil { eventStart = now }
@@ -203,6 +210,7 @@ actor MotionEventAccumulator {
         lastMotion = nil
         labels.removeAll(keepingCapacity: true)
         peakConfidence = 0
+        consecutiveHits = 0
         return event
     }
 }

@@ -7,39 +7,46 @@ struct MotionActivityUpdate: Sendable {
 
 struct MotionActivityGuard: Sendable {
     let holdDuration: TimeInterval
-    /// Require this many true candidates inside the rolling window before a new episode.
+    /// Require this many *consecutive* true candidates before a new episode.
+    /// Consecutive (not rolling-count) rejects alternating light-frequency hits.
     let persistenceRequired: Int
-    private var recent: [Bool]
-    private var recentIndex = 0
+    private var consecutiveHits = 0
     private var activeUntil: TimeInterval?
 
-    init(holdDuration: TimeInterval = 10, persistenceWindow: Int = 3, persistenceRequired: Int = 2) {
+    /// Three consecutive positives ≈ 0.3–0.6s at typical ESP32-CAM FPS; enough to
+    /// ignore single-frame noise and every-other-frame AC flicker artifacts.
+    init(holdDuration: TimeInterval = 10, persistenceRequired: Int = 3) {
         self.holdDuration = holdDuration
-        self.persistenceRequired = max(1, min(persistenceRequired, max(1, persistenceWindow)))
-        self.recent = [Bool](repeating: false, count: max(1, persistenceWindow))
+        self.persistenceRequired = max(1, persistenceRequired)
     }
 
     mutating func update(candidate: Bool, at now: TimeInterval) -> MotionActivityUpdate {
-        recent[recentIndex] = candidate
-        recentIndex = (recentIndex + 1) % recent.count
-        // Require the current frame plus recent support so single-frame noise is
-        // ignored, while a quiet frame never extends the hold from stale history.
-        let accepted = candidate && recent.filter(\.self).count >= persistenceRequired
+        if candidate {
+            consecutiveHits += 1
+        } else {
+            consecutiveHits = 0
+        }
+
+        let episodeActive = activeUntil.map { now < $0 } ?? false
+        // Starting a new episode needs consecutive hits. Once live, any candidate
+        // extends the quiet-hold so brief detector gaps do not end real motion.
+        let accepted = candidate && (episodeActive || consecutiveHits >= persistenceRequired)
 
         if accepted {
-            let started = activeUntil == nil || now >= activeUntil!
+            let started = !episodeActive
             activeUntil = now + holdDuration
             return MotionActivityUpdate(active: true, started: started)
         }
 
-        guard let activeUntil else {
-            return MotionActivityUpdate(active: false, started: false)
-        }
-        if now < activeUntil {
+        if episodeActive {
             return MotionActivityUpdate(active: true, started: false)
         }
 
-        self.activeUntil = nil
+        // Episode ended: drop the streak so a leftover hit does not immediately re-arm.
+        if activeUntil != nil {
+            activeUntil = nil
+            consecutiveHits = 0
+        }
         return MotionActivityUpdate(active: false, started: false)
     }
 }

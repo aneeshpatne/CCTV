@@ -140,10 +140,12 @@ final class CCTVCaptureTests: XCTestCase {
         let start = Date(timeIntervalSince1970: 1_000)
         let first = await accumulator.update(candidate: true, confidence: 0.7, semanticLabels: [], at: start)
         let second = await accumulator.update(candidate: true, confidence: 0.8, semanticLabels: [SemanticLabel(name: "person", confidence: 0.9)], at: start.addingTimeInterval(0.1))
-        let third = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(0.5))
+        let third = await accumulator.update(candidate: true, confidence: 0.85, semanticLabels: [], at: start.addingTimeInterval(0.2))
+        let quiet = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(0.5))
         XCTAssertNil(first)
         XCTAssertNil(second)
         XCTAssertNil(third)
+        XCTAssertNil(quiet)
         let event = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(1.6))
         XCTAssertNotNil(event)
     }
@@ -156,13 +158,18 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertFalse(first.started)
 
         let second = guardState.update(candidate: true, at: 100.1)
-        XCTAssertTrue(second.active)
-        XCTAssertTrue(second.started)
+        XCTAssertFalse(second.active)
+        XCTAssertFalse(second.started)
+
+        let third = guardState.update(candidate: true, at: 100.2)
+        XCTAssertTrue(third.active)
+        XCTAssertTrue(third.started)
     }
 
     func testMotionActivityStaysActiveUntilTenQuietSeconds() {
         var guardState = MotionActivityGuard(holdDuration: 10)
 
+        _ = guardState.update(candidate: true, at: 99.8)
         _ = guardState.update(candidate: true, at: 99.9)
         let started = guardState.update(candidate: true, at: 100)
         XCTAssertTrue(started.active)
@@ -180,6 +187,7 @@ final class CCTVCaptureTests: XCTestCase {
     func testMotionActivityExtendsWithoutRestartingBlink() {
         var guardState = MotionActivityGuard(holdDuration: 10)
 
+        _ = guardState.update(candidate: true, at: 99.8)
         _ = guardState.update(candidate: true, at: 99.9)
         XCTAssertTrue(guardState.update(candidate: true, at: 100).started)
         let renewed = guardState.update(candidate: true, at: 109)
@@ -188,14 +196,24 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertTrue(guardState.update(candidate: false, at: 118.9).active)
         XCTAssertFalse(guardState.update(candidate: false, at: 119).active)
         _ = guardState.update(candidate: true, at: 119.0)
+        _ = guardState.update(candidate: true, at: 119.05)
         XCTAssertTrue(guardState.update(candidate: true, at: 119.1).started)
+    }
+
+    func testMotionActivityIgnoresIntermittentFlickerPattern() {
+        var guardState = MotionActivityGuard(holdDuration: 10)
+        for index in 0..<10 {
+            let state = guardState.update(candidate: index % 2 == 0, at: 100 + Double(index) * 0.1)
+            XCTAssertFalse(state.active)
+            XCTAssertFalse(state.started)
+        }
     }
 
     func testMotionScoringRejectsScatteredNoise() {
         // Sparse single-block hits with barely-threshold magnitudes look like
         // sensor/JPEG noise rather than an object.
         let cells = (0..<12).map { index in
-            (x: (index * 3) % 24, y: (index * 5) % 18, magnitude: 12)
+            (x: (index * 3) % 24, y: (index * 5) % 18, magnitude: 14)
         }
         let result = MotionDetector.evaluate(
             activeCells: cells,
@@ -208,7 +226,7 @@ final class CCTVCaptureTests: XCTestCase {
 
     func testMotionScoringRejectsRibbonFlickerBand() {
         // Full-width one-row band is typical of AC light frequency / rolling flicker.
-        let cells = (0..<24).map { x in (x: x, y: 10, magnitude: 20) }
+        let cells = (0..<24).map { x in (x: x, y: 10, magnitude: 22) }
         let result = MotionDetector.evaluate(
             activeCells: cells,
             gridWidth: 32,
@@ -218,11 +236,53 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertFalse(result.candidate)
     }
 
+    func testMotionScoringRejectsMultiRowHorizontalBand() {
+        // Rolling-shutter AC banding is often 2–4 block-rows tall and nearly full width.
+        var cells: [(x: Int, y: Int, magnitude: Int)] = []
+        for y in 10..<14 {
+            for x in 2..<30 {
+                cells.append((x: x, y: y, magnitude: 24))
+            }
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+    }
+
+    func testMotionScoringRejectsIncoherentVectorDirections() {
+        // Dense cluster with random directions is light-frequency / noise, not an object.
+        var cells: [(x: Int, y: Int, dx: Int, dy: Int)] = []
+        let directions = [(20, 0), (-20, 0), (0, 20), (0, -20), (14, 14), (-14, 14), (14, -14), (-14, -14)]
+        var index = 0
+        for y in 8..<12 {
+            for x in 10..<15 {
+                let direction = directions[index % directions.count]
+                cells.append((x: x, y: y, dx: direction.0, dy: direction.1))
+                index += 1
+            }
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+        XCTAssertLessThan(
+            MotionDetector.directionCoherence(cells.map { ($0.dx, $0.dy) }),
+            MotionScoring.minDirectionCoherence
+        )
+    }
+
     func testMotionScoringAcceptsCompactObjectMotion() {
         var cells: [(x: Int, y: Int, magnitude: Int)] = []
         for y in 8..<12 {
             for x in 10..<15 {
-                cells.append((x: x, y: y, magnitude: 22))
+                cells.append((x: x, y: y, magnitude: 24))
             }
         }
         let result = MotionDetector.evaluate(
@@ -360,6 +420,7 @@ final class CCTVCaptureTests: XCTestCase {
         let start = Date(timeIntervalSince1970: 2_000)
         _ = await accumulator.update(candidate: true, confidence: 0.5, semanticLabels: [], at: start)
         _ = await accumulator.update(candidate: true, confidence: 0.6, semanticLabels: [], at: start.addingTimeInterval(0.1))
+        _ = await accumulator.update(candidate: true, confidence: 0.65, semanticLabels: [], at: start.addingTimeInterval(0.15))
         await accumulator.merge(semanticLabels: [SemanticLabel(name: "animal", confidence: 0.8)])
         _ = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(0.2))
         let finalized = await accumulator.update(
