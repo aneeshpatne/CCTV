@@ -1,0 +1,65 @@
+{
+  "whiteBalance": {
+    "auto": true,
+    "red": 128,
+    "green": 128,
+    "blue": 128
+  },
+  "color": {
+    "saturation": {
+      "u": 72,
+      "v": 72
+    },
+    "matrix": {
+      "enabled": true,
+      "registers": [
+        197,
+        148,
+        15,
+        175,
+        151,
+        255,
+        102,
+        100,
+        165,
+        124
+      ]
+    }
+  },
+  "tone": {
+    "lumaOffset": 0,
+    "contrastRegisters": [
+      32,
+      32,
+      32,
+      6
+    ],
+    "gamma": {
+      "enabled": true,
+      "points": [
+        14,
+        26,
+        49,
+        90,
+        105,
+        117,
+        126,
+        136,
+        143,
+        150,
+        163,
+        175,
+        196,
+        215,
+        232
+      ],
+      "slope": 32
+    }
+  },
+  "exposure_snapshot": {
+    "autoExposure": true,
+    "autoGain": true,
+    "shutterLines": 1247,
+    "gainX16": 31
+  }
+}

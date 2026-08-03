@@ -1,10 +1,11 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 _TEMP = tempfile.TemporaryDirectory()
 os.environ["CCTV_RECORDINGS_DIR"] = _TEMP.name
@@ -13,9 +14,161 @@ os.environ["MOTION_DATA_DIR"] = _TEMP.name
 os.environ["CCTV_PIPELINE_BACKEND"] = "python"
 
 from image_processing import pipeline_orchestrator as orchestrator
+from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
+from utilities.color_profile import CameraColorProfile
+from utilities.white_balance_mode import WhiteBalanceDecision
+
+
+def frozen_profile(shutter=100, gain=32):
+    return {
+        "ok": True,
+        "cachedForRecovery": True,
+        "exposure": {
+            "autoExposure": False,
+            "shutterLines": shutter,
+            "autoGain": False,
+            "gainX16": gain,
+            "gainRegister": 8,
+        },
+        "whiteBalance": {"auto": False, "red": 94, "green": 65, "blue": 84},
+        "color": {"saturation": {"u": 72, "v": 72}},
+        "tone": {"lumaOffset": 20, "contrastRegisters": [48, 48, 48, 10]},
+    }
+
+
+class ImmediateThread:
+    def __init__(self, *, target, **_kwargs):
+        self.target = target
+
+    def is_alive(self):
+        return False
+
+    def start(self):
+        self.target()
 
 
 class NativeEventProtocolTests(unittest.TestCase):
+    def setUp(self):
+        orchestrator._image_control_ready.set()
+        # Event tests must not launch the real periodic camera read-back worker.
+        orchestrator._wb_drift_last_check = time.monotonic()
+        # Default production path is hardware ISP; legacy software-loop tests
+        # opt into the manual path explicitly.
+        self._hardware_isp = orchestrator._HARDWARE_ISP
+        self._hardware_awb = orchestrator._HARDWARE_AWB
+        orchestrator._HARDWARE_ISP = False
+        orchestrator._HARDWARE_AWB = False
+        orchestrator._AWB_BOOTSTRAP = False
+        orchestrator._USE_IMAGE_STATS = False
+
+    def tearDown(self):
+        orchestrator._image_control_ready.clear()
+        orchestrator._HARDWARE_ISP = self._hardware_isp
+        orchestrator._HARDWARE_AWB = self._hardware_awb
+
+    def test_startup_applies_exposure_white_balance_and_saturation_separately(self):
+        controller = ManualExposureController(gain_max_x16=128)
+        white_balance_controller = Mock()
+        white_balance_controller.saved_white_balance.return_value = None
+        white_balance_controller.status_summary.return_value = "WBCTRL HOLD"
+        client = Mock()
+        automatic = frozen_profile()
+        automatic["exposure"]["autoExposure"] = True
+        automatic["exposure"]["autoGain"] = True
+        automatic["whiteBalance"]["auto"] = True
+        manual = frozen_profile()
+        colored = {
+            **manual,
+            "color": {"saturation": {"u": 72, "v": 72}},
+            "tone": {"lumaOffset": 12, "contrastRegisters": [48, 48, 48, 10]},
+        }
+        client.get_profile.side_effect = [automatic, colored]
+        client.freeze_exposure.return_value = manual
+        client.update_profile.side_effect = [manual, manual, colored]
+
+        with patch.object(orchestrator, "_HARDWARE_ISP", False), patch.object(
+            orchestrator, "_HARDWARE_AWB", False
+        ), patch.object(
+            orchestrator, "_AWB_BOOTSTRAP", False
+        ), patch.object(
+            orchestrator, "_exposure_controller", controller
+        ), patch.object(
+            orchestrator, "_white_balance_controller", white_balance_controller
+        ), patch.object(
+            orchestrator, "_image_control", client
+        ), patch.object(
+            orchestrator,
+            "_color_profile",
+            CameraColorProfile(94, 65, 84, 72, 72, luma_offset=12, contrast_registers=(48, 48, 48, 10)),
+        ), patch.object(orchestrator, "_color_profile_error", None):
+            orchestrator._initialize_manual_exposure()
+
+        client.freeze_exposure.assert_called_once_with(automatic)
+        self.assertEqual(
+            client.update_profile.call_args_list,
+            [
+                call(
+                    {"whiteBalance": {"auto": False, "red": 94, "green": 65, "blue": 84}}
+                ),
+                call({"color": {"saturation": {"u": 72, "v": 72}}}),
+                call({"tone": {"lumaOffset": 12, "contrastRegisters": [48, 48, 48, 10]}}),
+            ],
+        )
+        self.assertTrue(orchestrator._image_control_ready.is_set())
+        white_balance_controller.saved_white_balance.assert_called_once_with(
+            {"red": 94, "green": 65, "blue": 84}
+        )
+        white_balance_controller.initialize.assert_called_once_with(
+            colored, {"red": 94, "green": 65, "blue": 84}
+        )
+
+    def test_hardware_isp_enables_ae_agc_awb_without_color_profile(self):
+        white_balance_controller = Mock()
+        white_balance_controller.status_summary.return_value = "WBCTRL DISABLED"
+        client = Mock()
+        hardware = frozen_profile()
+        hardware["exposure"]["autoExposure"] = True
+        hardware["exposure"]["autoGain"] = True
+        hardware["whiteBalance"]["auto"] = True
+        client.update_profile.return_value = hardware
+        client.get_profile.return_value = hardware
+
+        orchestrator._HARDWARE_ISP = True
+        with patch.object(
+            orchestrator, "_white_balance_controller", white_balance_controller
+        ), patch.object(orchestrator, "_image_control", client):
+            orchestrator._initialize_manual_exposure()
+
+        self.assertEqual(
+            client.update_profile.call_args_list[0],
+            call(
+                {
+                    "exposure": {"autoExposure": True, "autoGain": True},
+                    "whiteBalance": {"auto": True},
+                }
+            ),
+        )
+        client.freeze_exposure.assert_not_called()
+        white_balance_controller.disable.assert_called()
+        self.assertTrue(orchestrator._image_control_ready.is_set())
+
+    def test_manual_adjustment_uses_partial_image_control_without_reset(self):
+        controller = ManualExposureController()
+        controller.initialize(frozen_profile())
+        client = Mock()
+        client.update_exposure.return_value = frozen_profile(125, 32)
+        decision = ManualExposureDecision("dark", 0.20, 125, 32)
+
+        with patch.object(orchestrator, "_exposure_controller", controller), patch.object(
+            orchestrator, "_image_control", client
+        ), patch.object(orchestrator, "_exposure_adjustment_thread", None), patch.object(
+            orchestrator.threading, "Thread", ImmediateThread
+        ):
+            orchestrator._schedule_exposure_adjustment(decision)
+
+        client.update_exposure.assert_called_once_with(125, 32)
+        self.assertIn("125L", controller.status_summary())
+
     def test_motion_event_is_persisted_and_annotated(self):
         motion = Mock(id=42)
         with patch.object(orchestrator, "log_motion_event", return_value=motion) as log, patch.object(
@@ -67,7 +220,9 @@ class NativeEventProtocolTests(unittest.TestCase):
             )
 
     def test_health_event_accepts_additive_vfr_metrics(self):
-        with self.assertLogs(level="INFO") as captured:
+        with patch.object(orchestrator, "_schedule_wb_drift_check"), self.assertLogs(
+            level="INFO"
+        ) as captured:
             orchestrator.NativeEventReader._handle(
                 {
                     "version": 1,
@@ -90,6 +245,175 @@ class NativeEventProtocolTests(unittest.TestCase):
         self.assertIn("camera=10.20", message)
         self.assertIn("latency_ms=14.2", message)
         self.assertIn("brightness=42.0%", message)
+
+    def test_image_metrics_event_feeds_exposure_controller(self):
+        controller = Mock()
+        controller.observe.return_value = None
+        with patch.object(orchestrator, "_HARDWARE_ISP", False), patch.object(
+            orchestrator, "_exposure_controller", controller
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {"scene_brightness": 0.20},
+                }
+            )
+        controller.observe.assert_called_once_with(0.20)
+
+    def test_image_metrics_event_feeds_white_balance_controller(self):
+        exposure = Mock()
+        exposure.observe.return_value = None
+        white_balance = Mock()
+        white_balance.observe.return_value = None
+        with (
+            patch.object(orchestrator, "_HARDWARE_ISP", False),
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {
+                        "scene_brightness": 0.30,
+                        "red_over_green": 0.92,
+                        "blue_over_green": 1.08,
+                    },
+                }
+            )
+        white_balance.observe.assert_called_once_with(
+            0.92, 1.08, scene_brightness=0.30
+        )
+
+    def test_hardware_isp_skips_software_image_loops(self):
+        exposure = Mock()
+        white_balance = Mock()
+        floodlight = Mock()
+        floodlight.observe.return_value = None
+        orchestrator._image_control_ready.set()
+        orchestrator._HARDWARE_ISP = True
+        with (
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+            patch.object(orchestrator, "_floodlight", floodlight),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {
+                        "scene_brightness": 0.30,
+                        "red_over_green": 0.92,
+                        "blue_over_green": 1.08,
+                    },
+                }
+            )
+        exposure.observe.assert_not_called()
+        white_balance.observe.assert_not_called()
+        floodlight.observe.assert_called_once_with(0.30)
+
+    def test_motion_started_event_does_not_control_floodlight(self):
+        floodlight = Mock()
+        with patch.object(orchestrator, "_floodlight", floodlight):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "motion.started",
+                    "payload": {},
+                }
+            )
+        floodlight.motion_started.assert_not_called()
+
+    def test_floodlight_transition_pauses_image_adjustment_loops(self):
+        exposure = Mock()
+        white_balance = Mock()
+        floodlight = Mock()
+        floodlight.observe.return_value = True
+        with (
+            patch.object(orchestrator, "_HARDWARE_ISP", False),
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+            patch.object(orchestrator, "_floodlight", floodlight),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {"scene_brightness": 0.12},
+                }
+            )
+        floodlight.observe.assert_called_once_with(0.12)
+        exposure.reset_observations.assert_called_once_with()
+        exposure.observe.assert_not_called()
+        white_balance.hold.assert_called_once_with()
+
+    def test_missing_chroma_is_forwarded_to_white_balance_controller(self):
+        exposure = Mock()
+        exposure.observe.return_value = None
+        white_balance = Mock()
+        white_balance.observe.return_value = None
+        with (
+            patch.object(orchestrator, "_exposure_controller", exposure),
+            patch.object(orchestrator, "_white_balance_controller", white_balance),
+        ):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {"scene_brightness": 0.30},
+                }
+            )
+        white_balance.observe.assert_called_once_with(
+            None, None, scene_brightness=0.30
+        )
+
+    def test_white_balance_rollback_uses_partial_image_control_patch(self):
+        controller = Mock()
+        client = Mock()
+        returned = frozen_profile()
+        client.update_profile.return_value = returned
+        decision = WhiteBalanceDecision("rollback", None, None, 94, 65, 84)
+
+        with (
+            patch.object(orchestrator, "_white_balance_controller", controller),
+            patch.object(orchestrator, "_image_control", client),
+            patch.object(orchestrator, "_white_balance_adjustment_thread", None),
+            patch.object(orchestrator.threading, "Thread", ImmediateThread),
+        ):
+            orchestrator._schedule_white_balance_adjustment(decision)
+
+        client.update_profile.assert_called_once_with(
+            {
+                "whiteBalance": {
+                    "auto": False,
+                    "red": 94,
+                    "green": 65,
+                    "blue": 84,
+                }
+            }
+        )
+        controller.complete.assert_called_once_with(returned, success=True)
+
+    def test_image_metrics_are_ignored_until_manual_profile_is_verified(self):
+        orchestrator._image_control_ready.clear()
+        exposure = Mock()
+        orchestrator.NativeEventReader._handle(
+            {
+                "version": 1,
+                "type": "image.metrics",
+                "payload": {"scene_brightness": 0.20},
+            }
+        )
+        with patch.object(orchestrator, "_exposure_controller", exposure):
+            orchestrator.NativeEventReader._handle(
+                {
+                    "version": 1,
+                    "type": "image.metrics",
+                    "payload": {"scene_brightness": 0.20},
+                }
+            )
+        exposure.observe.assert_not_called()
 
 
 if __name__ == "__main__":

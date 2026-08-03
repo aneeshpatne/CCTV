@@ -1,0 +1,771 @@
+from __future__ import annotations
+
+import json
+import math
+import os
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+
+DEFAULT_STATE_PATH = Path("~/.local/state/cctv/image-control.json").expanduser()
+
+
+@dataclass(frozen=True)
+class WhiteBalanceDecision:
+    action: Literal["adjust", "rollback"]
+    average_red_over_green: float | None
+    average_blue_over_green: float | None
+    red: int
+    green: int
+    blue: int
+
+
+@dataclass(frozen=True)
+class _WhiteBalanceTrial:
+    channel: Literal["red", "blue"]
+    before_ratio: float
+    before_values: tuple[int, int, int]
+    candidate_values: tuple[int, int, int]
+
+
+class WhiteBalanceStateStore:
+    def __init__(self, path: Path | None = None) -> None:
+        configured = os.getenv("CCTV_IMAGE_CONTROL_STATE_PATH")
+        self.path = Path(configured).expanduser() if configured else (path or DEFAULT_STATE_PATH)
+
+    def load(self) -> dict[str, Any] | None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        if not isinstance(data, dict):
+            raise ValueError("invalid white-balance state")
+        return data
+
+    def save(self, data: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(self.path)
+
+
+class ManualWhiteBalanceController:
+    """Software WB with sensor AWB disabled.
+
+    Modes:
+    - ``oneshot`` (default): after each camera recovery, watch a few bright frames,
+      apply a short bounded hunt, then lock RGB. If camera-side RGB later drifts
+      past a threshold, unlock and re-enter the verify loop.
+    - ``off``: fixed profile only; still re-applies verified RGB if the camera drifts.
+    - ``continuous``: keep tuning (still dark-gated and hunt-capped).
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: Literal["off", "oneshot", "continuous"] = "oneshot",
+        enabled: bool | None = None,
+        observation_seconds: float = 10.0,
+        window_seconds: float = 24.0,
+        settle_seconds: float = 8.0,
+        deadband: float = 0.08,
+        max_step: int = 4,
+        # Natural wall ratios measured under good hardware AWB (morning stairwell).
+        target_red_over_green: float = 0.90,
+        target_blue_over_green: float = 0.87,
+        max_deviation_fraction: float = 0.25,
+        min_response: float = 0.004,
+        failure_cooldown_seconds: float = 120.0,
+        min_scene_brightness: float = 0.10,
+        max_hunt_steps: int = 4,
+        drift_threshold: int = 6,
+        chroma_drift_deadband: float = 0.16,
+        drift_reopen_cooldown_seconds: float = 45.0,
+        state_store: WhiteBalanceStateStore | None = None,
+    ) -> None:
+        if mode not in {"off", "oneshot", "continuous"}:
+            raise ValueError("mode must be off, oneshot, or continuous")
+        if observation_seconds <= 0 or window_seconds < observation_seconds:
+            raise ValueError("invalid white-balance observation window")
+        if not 0 < deadband < 0.5:
+            raise ValueError("white-balance deadband must be between zero and 0.5")
+        if not 1 <= max_step <= 32:
+            raise ValueError("white-balance max step must be between 1 and 32")
+        if target_red_over_green <= 0 or target_blue_over_green <= 0:
+            raise ValueError("white-balance targets must be positive")
+        if not 0 < max_deviation_fraction < 1:
+            raise ValueError("white-balance max deviation must be between zero and one")
+        if not 0 < min_response < 0.5:
+            raise ValueError("white-balance minimum response must be between zero and 0.5")
+        if failure_cooldown_seconds < 0:
+            raise ValueError("white-balance failure cooldown must not be negative")
+        if not 0 <= min_scene_brightness <= 1:
+            raise ValueError("min_scene_brightness must be between zero and one")
+        if max_hunt_steps < 1:
+            raise ValueError("max_hunt_steps must be at least one")
+        if drift_threshold < 1:
+            raise ValueError("drift_threshold must be at least one")
+        if not 0 < chroma_drift_deadband < 1:
+            raise ValueError("chroma_drift_deadband must be between zero and one")
+        if drift_reopen_cooldown_seconds < 0:
+            raise ValueError("drift_reopen_cooldown_seconds must not be negative")
+        self.mode: Literal["off", "oneshot", "continuous"] = mode
+        # Legacy ``enabled`` overrides mode when explicitly passed.
+        if enabled is False:
+            self.mode = "off"
+        elif enabled is True and mode == "off":
+            self.mode = "continuous"
+        self.enabled = self.mode != "off"
+        self.observation_seconds = observation_seconds
+        self.window_seconds = window_seconds
+        self.settle_seconds = settle_seconds
+        self.deadband = deadband
+        self.max_step = max_step
+        self.target_red_over_green = target_red_over_green
+        self.target_blue_over_green = target_blue_over_green
+        self.max_deviation_fraction = max_deviation_fraction
+        self.min_response = min_response
+        self.failure_cooldown_seconds = failure_cooldown_seconds
+        self.min_scene_brightness = min_scene_brightness
+        self.max_hunt_steps = max_hunt_steps
+        self.drift_threshold = drift_threshold
+        # Reopening must never be more sensitive than an ordinary correction.
+        self.chroma_drift_deadband = max(deadband, chroma_drift_deadband)
+        self.drift_reopen_cooldown_seconds = drift_reopen_cooldown_seconds
+        self.state_store = state_store or WhiteBalanceStateStore()
+        self._profile: dict[str, Any] | None = None
+        self._baseline: tuple[int, int, int] | None = None
+        self._verified_values: tuple[int, int, int] | None = None
+        self._samples: deque[tuple[float, float, float]] = deque()
+        self._trial: _WhiteBalanceTrial | None = None
+        self._pending = False
+        self._pending_action: Literal["adjust", "rollback"] | None = None
+        self._hold_until = 0.0
+        self._state = "disabled" if not self.enabled else "hold"
+        self._disabled_reason: str | None = None
+        self._hunt_steps = 0
+        self._locked = False
+        self._last_drift_reopen = 0.0
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_environment(cls) -> "ManualWhiteBalanceController":
+        try:
+            mode_raw = os.getenv("CCTV_AUTO_WB_MODE", "").strip().lower()
+            enabled_raw = os.getenv("CCTV_AUTO_WB_ENABLED", "").strip().lower()
+            if mode_raw in {"off", "oneshot", "continuous"}:
+                mode: Literal["off", "oneshot", "continuous"] = mode_raw  # type: ignore[assignment]
+            elif enabled_raw in {"1", "true", "yes"}:
+                mode = "continuous"
+            elif enabled_raw in {"0", "false", "no"}:
+                mode = "off"
+            else:
+                mode = "oneshot"
+            return cls(
+                mode=mode,
+                observation_seconds=float(os.getenv("CCTV_WB_OBSERVATION_SECONDS", "10")),
+                window_seconds=float(os.getenv("CCTV_WB_WINDOW_SECONDS", "24")),
+                settle_seconds=float(os.getenv("CCTV_WB_SETTLE_SECONDS", "8")),
+                deadband=float(os.getenv("CCTV_WB_DEADBAND", "0.08")),
+                max_step=int(os.getenv("CCTV_WB_MAX_STEP", "4")),
+                target_red_over_green=float(
+                    os.getenv("CCTV_WB_TARGET_RED_OVER_GREEN", "0.90")
+                ),
+                target_blue_over_green=float(
+                    os.getenv("CCTV_WB_TARGET_BLUE_OVER_GREEN", "0.87")
+                ),
+                max_deviation_fraction=float(
+                    os.getenv("CCTV_WB_MAX_DEVIATION_FRACTION", "0.25")
+                ),
+                min_response=float(os.getenv("CCTV_WB_MIN_RESPONSE", "0.004")),
+                failure_cooldown_seconds=float(
+                    os.getenv("CCTV_WB_FAILURE_COOLDOWN_SECONDS", "120")
+                ),
+                min_scene_brightness=float(
+                    os.getenv("CCTV_WB_MIN_SCENE_BRIGHTNESS", "0.10")
+                ),
+                max_hunt_steps=int(os.getenv("CCTV_WB_MAX_HUNT_STEPS", "4")),
+                drift_threshold=int(os.getenv("CCTV_WB_DRIFT_THRESHOLD", "6")),
+                chroma_drift_deadband=float(
+                    os.getenv("CCTV_WB_CHROMA_DRIFT_DEADBAND", "0.16")
+                ),
+                drift_reopen_cooldown_seconds=float(
+                    os.getenv("CCTV_WB_DRIFT_REOPEN_COOLDOWN_SECONDS", "45")
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            controller = cls(mode="off")
+            controller.disable(f"invalid white-balance configuration: {error}")
+            return controller
+
+    def saved_white_balance(self, baseline: dict[str, int]) -> dict[str, int] | None:
+        baseline_values = self._dict_values(baseline)
+        self._validate_channel_values(baseline_values)
+        state = self.state_store.load()
+        if state is None or state.get("version") != 3:
+            return None
+        stored_baseline = state.get("baseline")
+        verified = state.get("verified")
+        if not isinstance(stored_baseline, dict) or not isinstance(verified, dict):
+            raise ValueError("white-balance state is missing baseline or verified values")
+        if self._dict_values(stored_baseline) != baseline_values:
+            return None
+        values = self._dict_values(verified)
+        if not self._within_bounds(values, baseline_values):
+            return None
+        return self._values_dict(values)
+
+    def initialize(
+        self,
+        profile: dict[str, Any],
+        baseline: dict[str, int] | None = None,
+        *,
+        now: float | None = None,
+    ) -> None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._validate_profile(profile)
+            profile_values = self._values(profile)
+            baseline_values = profile_values if baseline is None else self._dict_values(baseline)
+            self._validate_channel_values(baseline_values)
+            if not self._within_bounds(profile_values, baseline_values):
+                raise ValueError("applied white balance is outside the calibrated safety range")
+            self._profile = profile
+            self._baseline = baseline_values
+            self._verified_values = profile_values
+            self._samples.clear()
+            self._trial = None
+            self._pending = False
+            self._pending_action = None
+            self._hunt_steps = 0
+            # Each recovery starts a fresh oneshot calibration window.
+            self._locked = False
+            self._hold_until = now + self.settle_seconds
+            if not self.enabled:
+                self._state = "disabled"
+                self._save_state()
+                return
+            self._disabled_reason = None
+            self._state = "hold"
+            self._save_state()
+
+    def hold(self, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._samples.clear()
+            self._hold_until = max(self._hold_until, now + self.settle_seconds)
+            if self.enabled and not self._disabled_reason and not self._locked:
+                self._state = "verify" if self._trial is not None else "hold"
+                self._save_state()
+
+    def observe(
+        self,
+        red_over_green: float | None,
+        blue_over_green: float | None,
+        *,
+        scene_brightness: float | None = None,
+        now: float | None = None,
+    ) -> WhiteBalanceDecision | None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if (
+                not self.enabled
+                or self._disabled_reason
+                or self._profile is None
+                or self._baseline is None
+                or self._verified_values is None
+                or self._pending
+            ):
+                return None
+
+            if self._locked:
+                return self._observe_locked_drift(
+                    red_over_green,
+                    blue_over_green,
+                    scene_brightness=scene_brightness,
+                    now=now,
+                )
+
+            # Dark stairwell chroma is dominated by noise and crushed red; hunting
+            # there only produces teal drift.
+            if (
+                scene_brightness is not None
+                and float(scene_brightness) < self.min_scene_brightness
+            ):
+                self._samples.clear()
+                if self._trial is not None and now >= self._hold_until + self.observation_seconds:
+                    return self._rollback_decision(None, None)
+                if self._trial is None and self._state not in {
+                    "hold",
+                    "guarded",
+                    "limit",
+                    "locked",
+                }:
+                    self._state = "hold"
+                    self._save_state()
+                return None
+
+            ratios = self._valid_ratios(red_over_green, blue_over_green)
+            if ratios is None:
+                self._samples.clear()
+                if self._trial is not None and now >= self._hold_until + self.observation_seconds:
+                    return self._rollback_decision(None, None)
+                return None
+            red_ratio, blue_ratio = ratios
+            if now < self._hold_until:
+                return None
+
+            self._samples.append((now, red_ratio, blue_ratio))
+            cutoff = now - self.window_seconds
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
+            if len(self._samples) < 5:
+                if self._trial is None and self._state not in {
+                    "limit",
+                    "guarded",
+                    "locked",
+                }:
+                    self._state = "stable"
+                return None
+            if self._samples[-1][0] - self._samples[0][0] < self.observation_seconds:
+                return None
+
+            measured_red = self._median(sample[1] for sample in self._samples)
+            measured_blue = self._median(sample[2] for sample in self._samples)
+            self._samples.clear()
+
+            if self._trial is not None:
+                return self._verify_trial(measured_red, measured_blue)
+            return self._correction_decision(measured_red, measured_blue)
+
+    def _observe_locked_drift(
+        self,
+        red_over_green: float | None,
+        blue_over_green: float | None,
+        *,
+        scene_brightness: float | None,
+        now: float,
+    ) -> WhiteBalanceDecision | None:
+        """Re-open oneshot only for a sustained cast in the neutral reference ROI."""
+        if self.mode != "oneshot":
+            return None
+        if (
+            scene_brightness is not None
+            and float(scene_brightness) < self.min_scene_brightness
+        ):
+            self._samples.clear()
+            return None
+        ratios = self._valid_ratios(red_over_green, blue_over_green)
+        if ratios is None or now < self._hold_until:
+            self._samples.clear()
+            return None
+
+        red_ratio, blue_ratio = ratios
+        maximum_sample_gap = max(4.0, self.observation_seconds / 2)
+        if self._samples and now - self._samples[-1][0] > maximum_sample_gap:
+            self._samples.clear()
+        self._samples.append((now, red_ratio, blue_ratio))
+        cutoff = now - self.window_seconds
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+        if (
+            len(self._samples) < 5
+            or self._samples[-1][0] - self._samples[0][0]
+            < self.observation_seconds
+        ):
+            return None
+
+        measured_red = self._median(sample[1] for sample in self._samples)
+        measured_blue = self._median(sample[2] for sample in self._samples)
+        self._samples.clear()
+        drift = max(
+            self._relative_error(measured_red, self.target_red_over_green),
+            self._relative_error(measured_blue, self.target_blue_over_green),
+        )
+        if drift <= self.chroma_drift_deadband:
+            return None
+        if now - self._last_drift_reopen < self.drift_reopen_cooldown_seconds:
+            return None
+
+        self._last_drift_reopen = now
+        self._locked = False
+        self._hunt_steps = 0
+        self._state = "hold"
+        self._save_state()
+        return self._correction_decision(measured_red, measured_blue)
+
+    def complete(
+        self,
+        profile: dict[str, Any] | None,
+        *,
+        success: bool,
+        now: float | None = None,
+    ) -> None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            action = self._pending_action
+            if success and profile is not None:
+                self._validate_profile(profile)
+                values = self._values(profile)
+                if self._baseline is None or not self._within_bounds(values, self._baseline):
+                    raise ValueError("returned white balance is outside the calibrated safety range")
+                self._profile = profile
+                if action == "adjust":
+                    if self._trial is None or values != self._trial.candidate_values:
+                        raise ValueError("white-balance trial read-back mismatch")
+                    self._state = "verify"
+                    self._hold_until = now + self.settle_seconds
+                elif action == "rollback":
+                    if values != self._verified_values:
+                        raise ValueError("white-balance rollback read-back mismatch")
+                    self._trial = None
+                    self._hunt_steps = 0
+                    if self.mode == "oneshot":
+                        # Failed trial: keep last verified RGB and stop hunting.
+                        self._lock_for_session()
+                    else:
+                        self._state = "guarded"
+                        self._hold_until = now + self.failure_cooldown_seconds
+            elif action == "adjust":
+                self._trial = None
+                self._state = "hold"
+                self._hold_until = now + self.settle_seconds
+            elif action == "rollback":
+                self._trial = None
+                self._hunt_steps = 0
+                if self.mode == "oneshot":
+                    self._lock_for_session()
+                else:
+                    self._state = "guarded"
+                    self._hold_until = now + self.failure_cooldown_seconds
+            elif self.enabled and not self._disabled_reason and not self._locked:
+                self._state = "hold"
+            self._pending = False
+            self._pending_action = None
+            self._samples.clear()
+            self._save_state()
+
+    def sync_profile(self, profile: dict[str, Any]) -> None:
+        with self._lock:
+            self._validate_profile(profile)
+            values = self._values(profile)
+            if self._baseline is not None and not self._within_bounds(values, self._baseline):
+                raise ValueError("applied white balance is outside the calibrated safety range")
+            self._profile = profile
+            self._save_state()
+
+    def reset_observations(self) -> None:
+        self.hold()
+
+    def invalidate_pending(self) -> None:
+        """Discard trials created against a camera generation that is gone."""
+        with self._lock:
+            self._pending = False
+            self._pending_action = None
+            self._trial = None
+            self._samples.clear()
+            self._hunt_steps = 0
+            self._locked = False
+            if self.enabled and not self._disabled_reason:
+                self._state = "hold"
+            self._save_state()
+
+    def disable(self, reason: str) -> None:
+        with self._lock:
+            self._disabled_reason = reason
+            self._pending = False
+            self._pending_action = None
+            self._trial = None
+            self._samples.clear()
+            self._hunt_steps = 0
+            self._locked = False
+            self._state = "disabled"
+            self._save_state()
+
+    def status_summary(self) -> str:
+        with self._lock:
+            if self._disabled_reason:
+                return f"WBCTRL DISABLED ({self._disabled_reason})"
+            if self.mode == "off":
+                return "WBCTRL OFF"
+            if not self.enabled:
+                return "WBCTRL DISABLED"
+            if self._locked or self._state == "locked":
+                return "WBCTRL LOCKED"
+            return f"WBCTRL {self._state.upper()}"
+
+    def verified_white_balance(self) -> dict[str, int] | None:
+        with self._lock:
+            if self._verified_values is None:
+                return None
+            return self._values_dict(self._verified_values)
+
+    def check_camera_drift(
+        self,
+        red: int,
+        green: int,
+        blue: int,
+        *,
+        now: float | None = None,
+    ) -> dict[str, int] | None:
+        """If camera RGB drifted from the locked/verified set, reopen correction.
+
+        Returns the verified RGB that should be pushed back to the camera, or
+        ``None`` when no action is needed.
+        """
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._verified_values is None or self._pending:
+                return None
+            # Continuous mode already hunts; only re-open locked oneshot / fixed off.
+            if self.mode == "continuous":
+                return None
+            if self.mode == "oneshot" and not self._locked and self.enabled:
+                return None
+            if now - self._last_drift_reopen < self.drift_reopen_cooldown_seconds:
+                return None
+
+            live = (int(red), int(green), int(blue))
+            self._validate_channel_values(live)
+            verified = self._verified_values
+            drift = max(abs(live[i] - verified[i]) for i in range(3))
+            if drift < self.drift_threshold:
+                return None
+
+            self._last_drift_reopen = now
+            self._hunt_steps = 0
+            self._trial = None
+            self._samples.clear()
+            self._pending = False
+            self._pending_action = None
+            if self.mode == "oneshot":
+                self._locked = False
+                self._disabled_reason = None
+                self.enabled = True
+                self._state = "hold"
+                self._hold_until = now + self.settle_seconds
+            else:
+                # mode off: keep hunting disabled, just re-assert verified RGB.
+                self._state = "off"
+            self._save_state()
+            return self._values_dict(verified)
+
+    def _lock_for_session(self) -> None:
+        """Freeze RGB until recovery, initialize(), or camera-side drift."""
+        self._locked = True
+        self._trial = None
+        self._pending = False
+        self._pending_action = None
+        self._samples.clear()
+        self._state = "locked"
+
+    def _correction_decision(
+        self, measured_red: float, measured_blue: float
+    ) -> WhiteBalanceDecision | None:
+        assert self._profile is not None
+        assert self._baseline is not None
+        if self._hunt_steps >= self.max_hunt_steps:
+            if self.mode == "oneshot":
+                self._lock_for_session()
+            else:
+                # Continuous: rest after a short burst so we never thrash, then resume.
+                self._hunt_steps = 0
+                self._state = "hold"
+                self._hold_until = time.monotonic() + max(
+                    self.settle_seconds, self.failure_cooldown_seconds * 0.25
+                )
+            self._save_state()
+            return None
+
+        current = self._values(self._profile)
+        candidates: list[tuple[float, Literal["red", "blue"], tuple[int, int, int]]] = []
+        measurements = {
+            "red": (measured_red, self.target_red_over_green, 0),
+            "blue": (measured_blue, self.target_blue_over_green, 2),
+        }
+        outside_deadband = False
+        for channel, (measured, target, index) in measurements.items():
+            error = target / measured
+            if abs(error - 1) <= self.deadband:
+                continue
+            outside_deadband = True
+            desired = current[index] * error
+            lower, upper = self._channel_bounds(index, self._baseline)
+            requested = self._bounded_step(current[index], desired, lower, upper)
+            if requested == current[index]:
+                # Channel already at the safety rail — do not thrash the other channel
+                # forever chasing an unreachable wall ratio.
+                continue
+            values = list(current)
+            values[index] = requested
+            candidates.append((abs(math.log(error)), channel, tuple(values)))
+
+        if not candidates:
+            if self.mode == "oneshot":
+                # Good enough (or unachievable): lock whatever is verified now.
+                self._lock_for_session()
+            else:
+                # Continuous equilibrium (or rails): clear burst counter, stay quiet.
+                self._hunt_steps = 0
+                self._state = "limit" if outside_deadband else "stable"
+            self._save_state()
+            return None
+
+        _, channel, candidate = max(candidates, key=lambda item: item[0])
+        before_ratio = measured_red if channel == "red" else measured_blue
+        self._trial = _WhiteBalanceTrial(channel, before_ratio, current, candidate)
+        self._pending = True
+        self._pending_action = "adjust"
+        self._state = "adjust"
+        self._save_state()
+        return WhiteBalanceDecision(
+            "adjust", measured_red, measured_blue, *candidate
+        )
+
+    def _verify_trial(
+        self, measured_red: float, measured_blue: float
+    ) -> WhiteBalanceDecision | None:
+        assert self._trial is not None
+        channel = self._trial.channel
+        target = (
+            self.target_red_over_green
+            if channel == "red"
+            else self.target_blue_over_green
+        )
+        measured = measured_red if channel == "red" else measured_blue
+        before_error = abs(math.log(target / self._trial.before_ratio))
+        after_error = abs(math.log(target / measured))
+        if before_error - after_error >= self.min_response:
+            assert self._profile is not None
+            self._verified_values = self._values(self._profile)
+            self._trial = None
+            self._hunt_steps += 1
+            # Accept small improvements but freeze after a short hunt so night
+            # scenes with unreachable R/G targets cannot walk forever.
+            in_band = after_error <= self.deadband
+            done = self._hunt_steps >= self.max_hunt_steps or in_band
+            if self.mode == "oneshot" and done:
+                self._lock_for_session()
+            elif self.mode == "continuous" and in_band:
+                # Natural equilibrium — keep watching, no permanent freeze.
+                self._hunt_steps = 0
+                self._state = "stable"
+            elif done:
+                if self.mode == "continuous":
+                    # Burst cap: rest, then allow another slow correction later.
+                    self._hunt_steps = 0
+                    self._state = "hold"
+                    self._hold_until = time.monotonic() + max(
+                        self.settle_seconds * 2, 20.0
+                    )
+                else:
+                    self._state = "stable" if in_band else "limit"
+            else:
+                self._state = "stable"
+            self._save_state()
+            return None
+        return self._rollback_decision(measured_red, measured_blue)
+
+    def _rollback_decision(
+        self, measured_red: float | None, measured_blue: float | None
+    ) -> WhiteBalanceDecision:
+        assert self._verified_values is not None
+        self._pending = True
+        self._pending_action = "rollback"
+        self._state = "rollback"
+        self._save_state()
+        return WhiteBalanceDecision(
+            "rollback", measured_red, measured_blue, *self._verified_values
+        )
+
+    def _bounded_step(self, current: int, desired: float, lower: int, upper: int) -> int:
+        delta = round(desired) - current
+        delta = min(self.max_step, max(-self.max_step, delta))
+        return min(upper, max(lower, current + delta))
+
+    def _save_state(self) -> None:
+        if self._baseline is None or self._verified_values is None or self._disabled_reason:
+            return
+        data: dict[str, Any] = {
+            "version": 3,
+            "baseline": self._values_dict(self._baseline),
+            "verified": self._values_dict(self._verified_values),
+            "controllerState": self._state,
+            "updatedAt": time.time(),
+        }
+        try:
+            self.state_store.save(data)
+        except OSError:
+            pass
+
+    def _within_bounds(
+        self, values: tuple[int, int, int], baseline: tuple[int, int, int]
+    ) -> bool:
+        self._validate_channel_values(values)
+        if values[1] != baseline[1]:
+            return False
+        for index in (0, 2):
+            lower, upper = self._channel_bounds(index, baseline)
+            if not lower <= values[index] <= upper:
+                return False
+        return True
+
+    def _channel_bounds(
+        self, index: int, baseline: tuple[int, int, int]
+    ) -> tuple[int, int]:
+        if index == 1:
+            return baseline[1], baseline[1]
+        value = baseline[index]
+        lower = max(0, round(value * (1 - self.max_deviation_fraction)))
+        upper = min(255, round(value * (1 + self.max_deviation_fraction)))
+        return lower, upper
+
+    @staticmethod
+    def _median(values: Any) -> float:
+        ordered = sorted(values)
+        return float(ordered[len(ordered) // 2])
+
+    @staticmethod
+    def _relative_error(measured: float, target: float) -> float:
+        return max(measured / target, target / measured) - 1
+
+    @staticmethod
+    def _valid_ratios(
+        red_over_green: float | None, blue_over_green: float | None
+    ) -> tuple[float, float] | None:
+        if red_over_green is None or blue_over_green is None:
+            return None
+        red = float(red_over_green)
+        blue = float(blue_over_green)
+        if not math.isfinite(red) or not math.isfinite(blue) or red <= 0 or blue <= 0:
+            return None
+        return red, blue
+
+    @staticmethod
+    def _values(profile: dict[str, Any]) -> tuple[int, int, int]:
+        white_balance = profile["whiteBalance"]
+        return tuple(int(white_balance[name]) for name in ("red", "green", "blue"))
+
+    @staticmethod
+    def _dict_values(values: dict[str, Any]) -> tuple[int, int, int]:
+        return tuple(int(values[name]) for name in ("red", "green", "blue"))
+
+    @staticmethod
+    def _values_dict(values: tuple[int, int, int]) -> dict[str, int]:
+        return dict(zip(("red", "green", "blue"), values, strict=True))
+
+    @staticmethod
+    def _validate_channel_values(values: tuple[int, int, int]) -> None:
+        if any(value < 0 or value > 255 for value in values):
+            raise ValueError("white-balance value is out of range")
+
+    @classmethod
+    def _validate_profile(cls, profile: dict[str, Any]) -> None:
+        white_balance = profile.get("whiteBalance")
+        if not isinstance(white_balance, dict) or white_balance.get("auto") is not False:
+            raise ValueError("image profile does not have manual white balance")
+        cls._validate_channel_values(cls._values(profile))

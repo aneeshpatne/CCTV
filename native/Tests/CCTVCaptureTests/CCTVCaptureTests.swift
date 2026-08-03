@@ -2,6 +2,42 @@ import XCTest
 @testable import CCTVCapture
 
 final class CCTVCaptureTests: XCTestCase {
+    private func pixelBuffer(
+        width: Int = 8,
+        height: Int = 8,
+        blue: UInt8,
+        green: UInt8,
+        red: UInt8
+    ) throws -> CVPixelBuffer {
+        var created: CVPixelBuffer?
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                nil,
+                width,
+                height,
+                kCVPixelFormatType_32BGRA,
+                nil,
+                &created
+            ),
+            kCVReturnSuccess
+        )
+        let buffer = try XCTUnwrap(created)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
+        let bytes = CVPixelBufferGetBaseAddress(buffer)!.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * rowBytes + x * 4
+                bytes[offset] = blue
+                bytes[offset + 1] = green
+                bytes[offset + 2] = red
+                bytes[offset + 3] = 255
+            }
+        }
+        return buffer
+    }
+
     func testConfigurationDefaults() throws {
         let configuration = try PipelineConfiguration.load(environment: [:])
         XCTAssertEqual(configuration.targetFPS, 9)
@@ -23,6 +59,82 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(configuration.streamURL.port, 8080)
     }
 
+    func testCameraSettingsSummarizeAuthoritativeManualProfile() {
+        let settings = CameraSettings(
+            framesize: 12,
+            xclk: 20,
+            autoExposure: false,
+            shutterLines: 300,
+            autoGain: false,
+            gainX16: 24,
+            gainRegister: 8,
+            autoWhiteBalance: false,
+            red: 94,
+            green: 65,
+            blue: 84,
+            saturationU: 72,
+            saturationV: 72,
+            cachedForRecovery: true
+        )
+
+        XCTAssertEqual(
+            settings.imageSummary,
+            "XCLK 20 · AE MANUAL · 300L · AGC MANUAL · GAIN 24/16 · REG 8 · AWB MANUAL · WB 94/65/84 · SAT 72/72"
+        )
+    }
+
+    func testImageMetricsEventCarriesBrightnessWithoutChangingProtocolVersion() throws {
+        let event = WorkerEvent(
+            type: "image.metrics",
+            payload: .imageMetrics(
+                sceneBrightness: 0.21,
+                redOverGreen: 0.94,
+                blueOverGreen: 1.08
+            )
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        XCTAssertEqual(object["type"] as? String, "image.metrics")
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["scene_brightness"] as? Double, 0.21)
+        XCTAssertEqual(payload["red_over_green"] as? Double, 0.94)
+        XCTAssertEqual(payload["blue_over_green"] as? Double, 1.08)
+    }
+
+    func testImageMetricsUseNeutralPixelRatios() throws {
+        let buffer = try pixelBuffer(blue: 90, green: 100, red: 110)
+        let metrics = try XCTUnwrap(MotionDetector.imageMetrics(buffer))
+        XCTAssertEqual(try XCTUnwrap(metrics.redOverGreen), 1.1, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(metrics.blueOverGreen), 0.9, accuracy: 0.0001)
+    }
+
+    func testImageMetricsReferenceReportsStrongColorCast() throws {
+        let buffer = try pixelBuffer(blue: 20, green: 40, red: 180)
+        let metrics = try XCTUnwrap(MotionDetector.imageMetrics(buffer))
+        XCTAssertEqual(try XCTUnwrap(metrics.redOverGreen), 4.5, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(metrics.blueOverGreen), 0.5, accuracy: 0.0001)
+    }
+
+    func testImageMetricsFilterDoesNotSmoothFreshChroma() throws {
+        var filter = ImageMetricsFilter()
+        _ = filter.update(brightness: 0.2, redRatio: 0.8, blueRatio: 1.2)
+        let current = filter.update(brightness: 0.4, redRatio: 1.1, blueRatio: 0.9)
+        XCTAssertEqual(try XCTUnwrap(current.1), 1.1, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(current.2), 0.9, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(current.0), 0.22, accuracy: 0.0001)
+    }
+
+    func testImageMetricsFilterClearsStaleChromaWhenNeutralPixelsDisappear() throws {
+        var filter = ImageMetricsFilter()
+        _ = filter.update(brightness: 0.3, redRatio: 1.08, blueRatio: 0.93)
+        let missing = filter.update(brightness: 0.3, redRatio: nil, blueRatio: nil)
+        XCTAssertNil(missing.1)
+        XCTAssertNil(missing.2)
+        XCTAssertNotNil(missing.0)
+    }
+
     func testMotionAccumulatorRequiresPersistenceAndKeepsPadding() async {
         let accumulator = MotionEventAccumulator(cooldown: 1)
         let start = Date(timeIntervalSince1970: 1_000)
@@ -34,6 +146,130 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertNil(third)
         let event = await accumulator.update(candidate: false, confidence: 0, semanticLabels: [], at: start.addingTimeInterval(1.6))
         XCTAssertNotNil(event)
+    }
+
+    func testMotionActivityIgnoresSingleFrameNoise() {
+        var guardState = MotionActivityGuard(holdDuration: 10)
+
+        let first = guardState.update(candidate: true, at: 100)
+        XCTAssertFalse(first.active)
+        XCTAssertFalse(first.started)
+
+        let second = guardState.update(candidate: true, at: 100.1)
+        XCTAssertTrue(second.active)
+        XCTAssertTrue(second.started)
+    }
+
+    func testMotionActivityStaysActiveUntilTenQuietSeconds() {
+        var guardState = MotionActivityGuard(holdDuration: 10)
+
+        _ = guardState.update(candidate: true, at: 99.9)
+        let started = guardState.update(candidate: true, at: 100)
+        XCTAssertTrue(started.active)
+        XCTAssertTrue(started.started)
+
+        let quiet = guardState.update(candidate: false, at: 109.9)
+        XCTAssertTrue(quiet.active)
+        XCTAssertFalse(quiet.started)
+
+        let expired = guardState.update(candidate: false, at: 110)
+        XCTAssertFalse(expired.active)
+        XCTAssertFalse(expired.started)
+    }
+
+    func testMotionActivityExtendsWithoutRestartingBlink() {
+        var guardState = MotionActivityGuard(holdDuration: 10)
+
+        _ = guardState.update(candidate: true, at: 99.9)
+        XCTAssertTrue(guardState.update(candidate: true, at: 100).started)
+        let renewed = guardState.update(candidate: true, at: 109)
+        XCTAssertTrue(renewed.active)
+        XCTAssertFalse(renewed.started)
+        XCTAssertTrue(guardState.update(candidate: false, at: 118.9).active)
+        XCTAssertFalse(guardState.update(candidate: false, at: 119).active)
+        _ = guardState.update(candidate: true, at: 119.0)
+        XCTAssertTrue(guardState.update(candidate: true, at: 119.1).started)
+    }
+
+    func testMotionScoringRejectsScatteredNoise() {
+        // Sparse single-block hits with barely-threshold magnitudes look like
+        // sensor/JPEG noise rather than an object.
+        let cells = (0..<12).map { index in
+            (x: (index * 3) % 24, y: (index * 5) % 18, magnitude: 12)
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+    }
+
+    func testMotionScoringRejectsRibbonFlickerBand() {
+        // Full-width one-row band is typical of AC light frequency / rolling flicker.
+        let cells = (0..<24).map { x in (x: x, y: 10, magnitude: 20) }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+    }
+
+    func testMotionScoringAcceptsCompactObjectMotion() {
+        var cells: [(x: Int, y: Int, magnitude: Int)] = []
+        for y in 8..<12 {
+            for x in 10..<15 {
+                cells.append((x: x, y: y, magnitude: 22))
+            }
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertTrue(result.candidate)
+        XCTAssertNotNil(result.boundingBox)
+        XCTAssertGreaterThan(result.score, 0.02)
+    }
+
+    func testMotionScoringRejectsNearGlobalLightingChange() {
+        var cells: [(x: Int, y: Int, magnitude: Int)] = []
+        for y in 0..<24 {
+            for x in 0..<20 {
+                cells.append((x: x, y: y, magnitude: 30))
+            }
+        }
+        let result = MotionDetector.evaluate(
+            activeCells: cells,
+            gridWidth: 32,
+            gridHeight: 24,
+            eligible: 700
+        )
+        XCTAssertFalse(result.candidate)
+        XCTAssertGreaterThanOrEqual(result.score, MotionScoring.maxActiveFraction)
+    }
+
+    func testCameraLEDBlinkPatternIsGuardedQuickDoubleFlash() {
+        XCTAssertEqual(CameraLEDBlinker.pattern, [
+            LEDBlinkStep(brightness: 10, duration: 0.2),
+            LEDBlinkStep(brightness: 0, duration: 0.2),
+            LEDBlinkStep(brightness: 10, duration: 0.2),
+            LEDBlinkStep(brightness: 0, duration: 1.0),
+        ])
+    }
+
+    func testMotionStartedEventProtocol() throws {
+        let event = WorkerEvent(type: "motion.started", payload: .motionStarted)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        XCTAssertEqual(object["type"] as? String, "motion.started")
+        XCTAssertEqual((object["payload"] as? [String: Any])?.count, 0)
     }
 
     func testStreamStateEventProtocol() throws {
@@ -153,6 +389,8 @@ final class CCTVCaptureTests: XCTestCase {
                 processingLatencyMS: 12.5,
                 motionScore: 0.1,
                 sceneBrightness: 0.42,
+                redOverGreen: 0.95,
+                blueOverGreen: 1.05,
                 recording: true,
                 rtsp: true
             )

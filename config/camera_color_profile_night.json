@@ -1,0 +1,22 @@
+{
+  "whiteBalance": {
+    "red": 132,
+    "green": 55,
+    "blue": 46
+  },
+  "color": {
+    "saturation": {
+      "u": 72,
+      "v": 72
+    }
+  },
+  "tone": {
+    "lumaOffset": 12,
+    "contrastRegisters": [
+      48,
+      48,
+      48,
+      10
+    ]
+  }
+}

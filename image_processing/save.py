@@ -10,7 +10,7 @@ URL = MJPEG_STREAM_URL
 IST = pytz.timezone("Asia/Kolkata")
 
 # Output
-BASE_DIR = os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
+BASE_DIR = os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/HP USB20FD/CCTV/recordings/esp_cam1")
 SEGMENT_SECONDS = 300
 BITRATE = "4M"
 RTSP_OUT = "rtsp://127.0.0.1:8554/esp_cam1_overlay"

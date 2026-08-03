@@ -17,18 +17,21 @@ import subprocess
 import sys
 import threading
 import time
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
 
-import requests
-
 from utilities.motion_db_new import annotate_motion_event, log_motion_event
 from utilities.recording_catalog import RecordingCatalog
-from utilities.dynamic_resolution import DynamicResolutionController, ResolutionDecision
-from utilities.esp32cam_client import get_camera_status_with_retry
+from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
+from utilities.color_profile import CameraColorProfile, color_period_for_now
+from utilities.floodlight import FloodlightController
+from utilities.image_control import ImageControlAPIError, ImageControlClient
+from utilities.white_balance_mode import (
+    ManualWhiteBalanceController,
+    WhiteBalanceDecision,
+)
 from utilities.startup import CameraRecoveryMode, startup
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
@@ -37,21 +40,20 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
 RECORDINGS_DIR = Path(
-    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/drive/CCTV/recordings/esp_cam1")
+    os.getenv("CCTV_RECORDINGS_DIR", "/Volumes/HP USB20FD/CCTV/recordings/esp_cam1")
 ).expanduser()
 if not RECORDINGS_DIR.exists():
     RECORDINGS_DIR = REPO_ROOT / "recordings" / "esp_cam1"
 DISK_USAGE_THRESHOLD = 90  # percent
 DISK_USAGE_TARGET = 85  # cleanup hysteresis target
 CHECK_INTERVAL_SECONDS = 5 * 60
+RECALIBRATE_INTERVAL_SECONDS = int(
+    os.getenv("CCTV_RECALIBRATE_INTERVAL_SECONDS", str(4 * 60 * 60))
+)
 STOP_TIMEOUT_SECONDS = 5.0
 NATIVE_FAILURE_LIMIT = 3
 NATIVE_FAILURE_WINDOW_SECONDS = 5 * 60
-POST_CONNECT_ADJUSTMENT_DELAY_SECONDS = float(
-    os.getenv("CCTV_POST_CONNECT_ADJUSTMENT_DELAY_SECONDS", "20")
-)
 CAMERA_BASE_URL = os.getenv("ESP32CAM_BASE_URL", "http://192.168.0.13").rstrip("/")
-IST = ZoneInfo("Asia/Kolkata")
 
 _camera_process_lock = threading.Lock()
 _camera_process: Optional[subprocess.Popen] = None
@@ -59,6 +61,8 @@ _camera_monitor_lock = threading.Lock()
 _camera_monitor: Optional["CameraProcessMonitor"] = None
 _storage_monitor_lock = threading.Lock()
 _storage_monitor: Optional["StorageMonitor"] = None
+_recalibrate_monitor_lock = threading.Lock()
+_recalibrate_monitor: Optional["RecalibrateMonitor"] = None
 _shutdown_event = threading.Event()
 _event_reader: Optional["NativeEventReader"] = None
 _event_reader_lock = threading.Lock()
@@ -68,83 +72,417 @@ _active_backend = "python"
 _recording_catalog = RecordingCatalog(RECORDINGS_DIR)
 _camera_recovery_lock = threading.Lock()
 _camera_recovery_thread: Optional[threading.Thread] = None
-_camera_adjustment_lock = threading.Lock()
-_camera_adjustment_generation = 0
 _camera_configuration_lock = threading.Lock()
-_resolution_change_lock = threading.Lock()
-_resolution_change_thread: Optional[threading.Thread] = None
-_resolution_controller = DynamicResolutionController.from_environment(initial_framesize=12)
+_image_control_state_lock = threading.Lock()
+_image_control_ready = threading.Event()
+_image_control_generation = 0
+_exposure_adjustment_lock = threading.Lock()
+_exposure_adjustment_thread: Optional[threading.Thread] = None
+_white_balance_adjustment_lock = threading.Lock()
+_white_balance_adjustment_thread: Optional[threading.Thread] = None
+_wb_drift_check_lock = threading.Lock()
+_wb_drift_check_thread: Optional[threading.Thread] = None
+_wb_drift_last_check = 0.0
+_WB_DRIFT_CHECK_INTERVAL_SECONDS = float(
+    os.getenv("CCTV_WB_DRIFT_CHECK_INTERVAL_SECONDS", "20")
+)
+_HARDWARE_ISP = os.getenv("CCTV_HARDWARE_ISP", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# Legacy flags — ignored while CCTV_HARDWARE_ISP is on (no software color/exposure).
+_HARDWARE_AWB = _HARDWARE_ISP or os.getenv("CCTV_HARDWARE_AWB", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_AWB_BOOTSTRAP = (
+    False
+    if _HARDWARE_ISP
+    else os.getenv("CCTV_WB_AWB_BOOTSTRAP", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_USE_IMAGE_STATS = (
+    False
+    if _HARDWARE_ISP
+    else os.getenv("CCTV_IMAGE_STATS", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_image_control = ImageControlClient(CAMERA_BASE_URL)
+_exposure_controller = ManualExposureController.from_environment()
+_white_balance_controller = ManualWhiteBalanceController.from_environment()
+_floodlight = FloodlightController.from_environment()
+_color_profile_lock = threading.Lock()
+_camera_capabilities_lock = threading.Lock()
+_camera_capabilities_probed = False
+try:
+    _color_profile = CameraColorProfile.load_active()
+    _color_profile_error: str | None = None
+    _color_profile_period = _color_profile.period
+    logging.info(
+        "[image-control] Loaded %s color profile WB %d/%d/%d.",
+        _color_profile.period,
+        _color_profile.red,
+        _color_profile.green,
+        _color_profile.blue,
+    )
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    _color_profile = None
+    _color_profile_error = str(error)
+    _color_profile_period = color_period_for_now()
 
 
-def _cancel_post_connect_adjustments() -> None:
-    """Invalidate delayed adjustments belonging to an obsolete connection."""
-    global _camera_adjustment_generation
-    with _camera_adjustment_lock:
-        _camera_adjustment_generation += 1
+def _disable_for_image_error(error: ImageControlAPIError) -> bool:
+    return error.status in {400, 413, 500, 501} or error.code == "invalid_response"
 
 
-def _adjustment_is_current(generation: int) -> bool:
-    with _camera_adjustment_lock:
-        return not _shutdown_event.is_set() and generation == _camera_adjustment_generation
+def _probe_camera_capabilities(*, force: bool = False) -> None:
+    global _camera_capabilities_probed
+    with _camera_capabilities_lock:
+        if _camera_capabilities_probed and not force:
+            return
+        try:
+            caps = _image_control.probe_capabilities(probe_awb_freeze=False)
+            _camera_capabilities_probed = True
+            logging.info(
+                "[image-control] Firmware capabilities: %s",
+                ", ".join(f"{k}={v}" for k, v in caps.as_dict().items()),
+            )
+            if caps.image_stats_roi and _USE_IMAGE_STATS:
+                try:
+                    roi = _image_control.set_image_stats_roi()
+                    logging.info(
+                        "[image-control] Stats ROI set to x=%.2f y=%.2f w=%.2f h=%.2f",
+                        roi["x"],
+                        roi["y"],
+                        roi["w"],
+                        roi["h"],
+                    )
+                except ImageControlAPIError as error:
+                    logging.warning("[image-control] Unable to set stats ROI: %s", error)
+        except Exception:
+            logging.exception("[image-control] Capability probe failed")
 
 
-def _wait_for_adjustment(generation: int, seconds: float) -> bool:
-    if _shutdown_event.wait(seconds):
-        return False
-    return _adjustment_is_current(generation)
-
-
-def _set_camera_control(name: str, value: int) -> bool:
+def _bootstrap_white_balance_from_awb() -> dict[str, int] | None:
+    """Run firmware AWB freeze and return latched manual RGB, or None on failure."""
+    if not _AWB_BOOTSTRAP or _HARDWARE_AWB:
+        return None
     try:
-        response = requests.get(
-            f"{CAMERA_BASE_URL}/control",
-            params={"var": name, "val": value},
-            timeout=2,
-        )
-        response.raise_for_status()
-        logging.info("[adjustments] Set %s=%s.", name, value)
-        return True
-    except requests.RequestException:
-        logging.exception("[adjustments] Failed to set %s=%s.", name, value)
-        return False
-
-
-def _schedule_post_connect_adjustments() -> None:
-    """Apply the legacy AWB/exposure/AGC policy after MJPEG stabilizes."""
-    global _camera_adjustment_generation
-
-    with _camera_adjustment_lock:
-        _camera_adjustment_generation += 1
-        generation = _camera_adjustment_generation
-
-    def adjust() -> None:
+        _image_control.set_white_balance_auto(True)
+        # Brief settle so soft-latch / awbStable can advance when firmware supports it.
+        deadline = time.monotonic() + float(os.getenv("CCTV_WB_AWB_SETTLE_SECONDS", "1.5"))
+        while time.monotonic() < deadline:
+            profile = _image_control.get_profile()
+            white_balance = profile.get("whiteBalance") or {}
+            if white_balance.get("auto") is True and white_balance.get("awbStable") is True:
+                break
+            time.sleep(0.2)
+        frozen = _image_control.freeze_awb()
+        rgb = ImageControlClient.extract_manual_rgb(frozen)
         logging.info(
-            "[adjustments] Signal restored; waiting %.0fs before camera tuning.",
-            POST_CONNECT_ADJUSTMENT_DELAY_SECONDS,
+            "[image-control] AWB freeze latched manual WB %d/%d/%d (stable=%s).",
+            rgb["red"],
+            rgb["green"],
+            rgb["blue"],
+            (frozen.get("whiteBalance") or {}).get("awbStable"),
         )
-        if not _wait_for_adjustment(generation, POST_CONNECT_ADJUSTMENT_DELAY_SECONDS):
+        return rgb
+    except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+        logging.warning("[image-control] AWB bootstrap unavailable: %s", error)
+        return None
+
+
+def _maybe_switch_color_period() -> None:
+    """Reload day/night color profile when local wall-clock period changes."""
+    global _color_profile, _color_profile_error, _color_profile_period
+
+    if _HARDWARE_ISP:
+        return
+
+    desired = color_period_for_now()
+    with _color_profile_lock:
+        if _color_profile is not None and _color_profile_period == desired:
             return
-
-        _set_camera_control("awb", 0)
-        if not _wait_for_adjustment(generation, 2):
+        try:
+            profile = CameraColorProfile.load_active()
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            _color_profile = None
+            _color_profile_error = str(error)
+            logging.warning(
+                "[image-control] Unable to load %s color profile: %s", desired, error
+            )
             return
+        previous = _color_profile_period
+        _color_profile = profile
+        _color_profile_error = None
+        _color_profile_period = profile.period
+        changed = previous != profile.period
 
-        current_hour_ist = datetime.now(IST).hour
-        if 12 <= current_hour_ist < 18:
-            logging.info("[adjustments] Skipping ae_level during 12pm-6pm IST window.")
-        else:
-            _set_camera_control("ae_level", 2)
+    if not changed:
+        return
 
-        if not _wait_for_adjustment(generation, 2):
-            return
-        _set_camera_control("agc", 0)
-        logging.info("[adjustments] Post-connect camera tuning complete.")
+    logging.info(
+        "[image-control] Switching color profile %s → %s (WB %d/%d/%d).",
+        previous,
+        profile.period,
+        profile.red,
+        profile.green,
+        profile.blue,
+    )
+    generation = _begin_image_control_recovery()
+    try:
+        with _camera_configuration_lock:
+            _initialize_manual_exposure(generation)
+        logging.info(
+            "[image-control] Applied %s color profile · %s",
+            profile.period,
+            _exposure_controller.status_summary(),
+        )
+    except Exception as error:
+        logging.exception(
+            "[image-control] Failed applying %s color profile: %s",
+            profile.period,
+            error,
+        )
+        _schedule_camera_recovery(f"color profile switch failed: {error}")
 
-    threading.Thread(
-        target=adjust,
-        daemon=True,
-        name="cctv-camera-adjustments",
-    ).start()
+
+def _begin_image_control_recovery() -> int:
+    global _image_control_generation
+    with _image_control_state_lock:
+        _image_control_generation += 1
+        generation = _image_control_generation
+        _image_control_ready.clear()
+    _exposure_controller.invalidate_pending()
+    _white_balance_controller.invalidate_pending()
+    return generation
+
+
+def _current_image_control_generation() -> int:
+    with _image_control_state_lock:
+        return _image_control_generation
+
+
+def _generation_is_current(generation: int) -> bool:
+    return generation == _current_image_control_generation()
+
+
+def _validate_authoritative_profile(
+    profile: dict,
+    *,
+    expected_white_balance: dict[str, int] | None = None,
+    require_manual_white_balance: bool | None = None,
+) -> None:
+    exposure = profile.get("exposure")
+    white_balance = profile.get("whiteBalance")
+    if not isinstance(exposure, dict):
+        raise ValueError("image profile is missing exposure")
+    if not isinstance(white_balance, dict):
+        raise ValueError("image profile is missing white balance")
+
+    if _HARDWARE_ISP:
+        # Clean look: hardware owns AE/AGC/AWB. Do not require manual freeze or
+        # host color-profile sat/tone match.
+        if exposure.get("autoExposure") is not True or exposure.get("autoGain") is not True:
+            raise ValueError("image profile does not have hardware AE/AGC enabled")
+        if white_balance.get("auto") is not True:
+            raise ValueError("image profile does not have hardware AWB enabled")
+        return
+
+    if exposure.get("autoExposure") is not False or exposure.get("autoGain") is not False:
+        raise ValueError("image profile does not have manual AE/AGC")
+    require_manual_wb = (
+        (not _HARDWARE_AWB)
+        if require_manual_white_balance is None
+        else require_manual_white_balance
+    )
+    if require_manual_wb and white_balance.get("auto") is not False:
+        raise ValueError("image profile does not have manual white balance")
+    if not require_manual_wb and white_balance.get("auto") is not True:
+        raise ValueError("image profile does not have hardware AWB enabled")
+    if profile.get("cachedForRecovery") is not True:
+        raise ValueError("manual image profile is not cached for recovery")
+    if expected_white_balance is not None:
+        actual = {name: int(white_balance[name]) for name in ("red", "green", "blue")}
+        if actual != expected_white_balance:
+            raise ValueError(f"white-balance read-back mismatch: {actual}")
+    if _color_profile is not None:
+        saturation = profile.get("color", {}).get("saturation", {})
+        expected_saturation = {
+            "u": _color_profile.saturation_u,
+            "v": _color_profile.saturation_v,
+        }
+        actual_saturation = {name: int(saturation[name]) for name in ("u", "v")}
+        if actual_saturation != expected_saturation:
+            raise ValueError(f"saturation read-back mismatch: {actual_saturation}")
+        tone = profile.get("tone") or {}
+        if int(tone.get("lumaOffset", 0)) != _color_profile.luma_offset:
+            raise ValueError(
+                f"lumaOffset read-back mismatch: {tone.get('lumaOffset')}"
+            )
+        actual_contrast = [int(value) for value in tone.get("contrastRegisters", [])]
+        expected_contrast = list(_color_profile.contrast_registers)
+        if actual_contrast != expected_contrast:
+            raise ValueError(
+                f"contrastRegisters read-back mismatch: {actual_contrast}"
+            )
+
+
+def _initialize_hardware_isp(generation: int) -> dict:
+    """Enable sensor AWB + AE/AGC only — no software color or exposure control."""
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        if not _generation_is_current(generation):
+            raise RuntimeError("camera generation changed during image-control recovery")
+        try:
+            # Hand the full ISP look back to hardware. Do not freeze exposure,
+            # apply color profiles, AWB-freeze, or software WB/exposure loops.
+            profile = _image_control.update_profile(
+                {
+                    "exposure": {"autoExposure": True, "autoGain": True},
+                    "whiteBalance": {"auto": True},
+                }
+            )
+            # Prefer factory-mild tone when firmware supports reset (clean look).
+            try:
+                profile = _image_control.update_profile({"tone": {"reset": True}})
+            except ImageControlAPIError as error:
+                logging.info(
+                    "[image-control] tone.reset unavailable (%s); leaving tone as-is.",
+                    error,
+                )
+            profile = _image_control.get_profile()
+            _validate_authoritative_profile(profile)
+            _white_balance_controller.disable("hardware ISP only (no software color)")
+            if not _generation_is_current(generation):
+                raise RuntimeError(
+                    "camera generation changed after image-control verification"
+                )
+            _image_control_ready.set()
+            logging.info(
+                "[image-control] Hardware ISP · AE=%s AGC=%s AWB=%s · shutter=%s gain=%s/16 · %s",
+                profile.get("exposure", {}).get("autoExposure"),
+                profile.get("exposure", {}).get("autoGain"),
+                profile.get("whiteBalance", {}).get("auto"),
+                profile.get("exposure", {}).get("shutterLines"),
+                profile.get("exposure", {}).get("gainX16"),
+                _white_balance_controller.status_summary(),
+            )
+            return profile
+        except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+            last_error = error
+            _image_control_ready.clear()
+            logging.warning(
+                "[image-control] Hardware ISP setup attempt %d/3 failed: %s",
+                attempt,
+                error,
+            )
+            if attempt < 3:
+                time.sleep(float(attempt))
+    raise RuntimeError(f"unable to enable hardware ISP image control: {last_error}")
+
+
+def _initialize_manual_exposure(generation: int | None = None) -> dict:
+    """Apply image-control policy after camera startup/recovery."""
+    generation = _current_image_control_generation() if generation is None else generation
+    if _HARDWARE_ISP:
+        return _initialize_hardware_isp(generation)
+
+    if _color_profile is None:
+        raise ValueError(f"invalid color profile: {_color_profile_error}")
+
+    _probe_camera_capabilities()
+
+    profile_baseline = {
+        "red": _color_profile.red,
+        "green": _color_profile.green,
+        "blue": _color_profile.blue,
+    }
+    # Prefer firmware AWB latch as the session baseline (natural look seed).
+    awb_seed = None if _HARDWARE_AWB else _bootstrap_white_balance_from_awb()
+    baseline_white_balance = awb_seed or profile_baseline
+
+    # Oneshot always re-seeds from the chosen baseline. Continuous restores last
+    # verified only when it still matches the same baseline family.
+    if awb_seed is not None or getattr(_white_balance_controller, "mode", None) == "oneshot":
+        requested_white_balance = baseline_white_balance
+    else:
+        try:
+            saved = _white_balance_controller.saved_white_balance(baseline_white_balance)
+            requested_white_balance = saved or baseline_white_balance
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            logging.warning("[image-control] Ignoring invalid WB state: %s", error)
+            requested_white_balance = baseline_white_balance
+
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        if not _generation_is_current(generation):
+            raise RuntimeError("camera generation changed during image-control recovery")
+        try:
+            profile = _image_control.freeze_exposure(_image_control.get_profile())
+            normalization = _exposure_controller.initialize(profile)
+            if normalization is not None:
+                profile = _image_control.update_exposure(
+                    normalization["shutterLines"], normalization["gainX16"]
+                )
+            if _HARDWARE_AWB:
+                profile = _image_control.update_profile(
+                    {"whiteBalance": {"auto": True}}
+                )
+            else:
+                # Re-apply manual RGB even after AWB freeze so sat/tone writes cannot
+                # leave an inconsistent auto flag on older firmware mixes.
+                profile = _image_control.update_profile(
+                    {"whiteBalance": {"auto": False, **requested_white_balance}}
+                )
+            _image_control.update_profile(_color_profile.saturation_patch())
+            _image_control.update_profile(_color_profile.tone_patch())
+            profile = _image_control.get_profile()
+            if not _HARDWARE_AWB:
+                # Prefer readback RGB after sat/tone (authoritative hardware state).
+                requested_white_balance = ImageControlClient.extract_manual_rgb(profile)
+            _validate_authoritative_profile(
+                profile,
+                expected_white_balance=(
+                    None if _HARDWARE_AWB else requested_white_balance
+                ),
+            )
+            _exposure_controller.initialize(profile)
+            if _HARDWARE_AWB:
+                # Leave software WB idle while sensor AWB owns the RGB gains.
+                _white_balance_controller.disable("hardware AWB enabled")
+            else:
+                _white_balance_controller.initialize(
+                    profile,
+                    baseline_white_balance
+                    if awb_seed is None
+                    else requested_white_balance,
+                )
+            if not _generation_is_current(generation):
+                raise RuntimeError("camera generation changed after image-control verification")
+            _image_control_ready.set()
+            break
+        except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+            last_error = error
+            _image_control_ready.clear()
+            logging.warning(
+                "[image-control] Reconciliation attempt %d/3 failed: %s", attempt, error
+            )
+            if attempt < 3:
+                time.sleep(float(attempt))
+    else:
+        raise RuntimeError(f"unable to verify manual image control: {last_error}")
+
+    logging.info(
+        "[image-control] %s · %s",
+        _exposure_controller.status_summary(),
+        _white_balance_controller.status_summary(),
+    )
+    return profile
 
 
 def _schedule_camera_recovery(reason: str) -> None:
@@ -158,17 +496,26 @@ def _schedule_camera_recovery(reason: str) -> None:
             logging.info("[recovery] Camera startup already running; coalescing disconnect (%s).", reason)
             return
 
+        generation = _begin_image_control_recovery()
+
         def recover() -> None:
             logging.warning("[recovery] MJPEG disconnected (%s); running full camera startup.", reason)
-            try:
-                with _camera_configuration_lock:
-                    startup(target_framesize=_resolution_controller.selected_framesize)
-            except CameraRecoveryMode:
-                logging.exception("[recovery] Camera entered OTA/recovery mode during startup.")
-            except Exception:
-                logging.exception("[recovery] Camera startup failed; native reconnect will retry.")
-            else:
-                logging.info("[recovery] Full camera startup sequence completed after disconnect.")
+            while not _shutdown_event.is_set() and _generation_is_current(generation):
+                try:
+                    with _camera_configuration_lock:
+                        startup()
+                        _initialize_manual_exposure(generation)
+                except CameraRecoveryMode:
+                    logging.exception("[recovery] Camera entered OTA/recovery mode during startup.")
+                    return
+                except Exception:
+                    logging.exception(
+                        "[recovery] Camera startup or manual verification failed; retrying in 5s."
+                    )
+                    _shutdown_event.wait(5)
+                else:
+                    logging.info("[recovery] Camera startup and manual image verification completed.")
+                    return
 
         _camera_recovery_thread = threading.Thread(
             target=recover,
@@ -178,58 +525,219 @@ def _schedule_camera_recovery(reason: str) -> None:
         _camera_recovery_thread.start()
 
 
-def _schedule_resolution_change(decision: ResolutionDecision) -> None:
-    """Apply one verified framesize change without blocking native event reads."""
-    global _resolution_change_thread
-
-    with _resolution_change_lock:
-        if _shutdown_event.is_set():
-            _resolution_controller.complete_change(decision.framesize, success=False)
+def _verify_profile_after_connect() -> None:
+    """Read back manual state after a connection transition without blocking events."""
+    with _camera_recovery_lock:
+        if _camera_recovery_thread and _camera_recovery_thread.is_alive():
             return
-        if _resolution_change_thread and _resolution_change_thread.is_alive():
+
+    def verify() -> None:
+        try:
+            with _camera_configuration_lock:
+                profile = _image_control.get_profile()
+                _validate_authoritative_profile(profile)
+        except (ImageControlAPIError, KeyError, TypeError, ValueError) as error:
+            logging.warning("[image-control] Post-connect verification failed: %s", error)
+            _schedule_camera_recovery(f"post-connect verification failed: {error}")
+
+    threading.Thread(
+        target=verify,
+        daemon=True,
+        name="cctv-image-control-verifier",
+    ).start()
+
+
+def _schedule_exposure_adjustment(decision: ManualExposureDecision) -> None:
+    """Apply one manual exposure correction without blocking native event reads."""
+    global _exposure_adjustment_thread
+
+    generation = _current_image_control_generation()
+    with _exposure_adjustment_lock:
+        if _shutdown_event.is_set() or not _image_control_ready.is_set():
+            _exposure_controller.complete(None, success=False)
+            return
+        if _exposure_adjustment_thread and _exposure_adjustment_thread.is_alive():
             return
 
         def adjust() -> None:
-            target = decision.framesize
+            if not _generation_is_current(generation):
+                _exposure_controller.complete(None, success=False)
+                return
             logging.info(
-                "[resolution] Sustained brightness %.1f%%; switching framesize to %d.",
+                "[image-control] %.1f%% brightness: %s correction to %dL, gain %d/16.",
                 decision.average_brightness * 100,
-                target,
+                decision.direction,
+                decision.shutter_lines,
+                decision.gain_x16,
             )
-            success = False
             try:
                 with _camera_configuration_lock:
-                    if not _set_camera_control("framesize", target):
+                    if (
+                        not _image_control_ready.is_set()
+                        or not _generation_is_current(generation)
+                    ):
+                        _exposure_controller.complete(None, success=False)
                         return
-                    if _shutdown_event.wait(3):
-                        return
-                    status = get_camera_status_with_retry(attempts=3, timeout=2)
-                    success = (
-                        status.camera_online
-                        and status.framesize is not None
-                        and int(status.framesize) == target
+                    profile = _image_control.update_exposure(
+                        decision.shutter_lines, decision.gain_x16
                     )
-            except Exception:
-                logging.exception("[resolution] Failed while verifying framesize %d.", target)
-            finally:
-                _resolution_controller.complete_change(target, success=success)
-                if success:
-                    logging.info(
-                        "[resolution] Framesize %d verified; 15-minute cooldown started.",
-                        target,
-                    )
-                elif not _shutdown_event.is_set():
-                    logging.warning(
-                        "[resolution] Framesize %d was not verified; a later brightness sample may retry.",
-                        target,
-                    )
+                    _validate_authoritative_profile(profile)
+                _exposure_controller.complete(profile, success=True)
+                _white_balance_controller.sync_profile(profile)
+                _white_balance_controller.hold()
+                logging.info("[image-control] Applied %s", _exposure_controller.status_summary())
+            except (ImageControlAPIError, ValueError) as error:
+                _exposure_controller.complete(None, success=False)
+                logging.exception("[image-control] Manual exposure correction failed")
+                _schedule_camera_recovery(f"manual exposure verification failed: {error}")
 
-        _resolution_change_thread = threading.Thread(
+        _exposure_adjustment_thread = threading.Thread(
             target=adjust,
             daemon=True,
-            name="cctv-dynamic-resolution",
+            name="cctv-manual-exposure",
         )
-        _resolution_change_thread.start()
+        _exposure_adjustment_thread.start()
+
+
+def _schedule_white_balance_adjustment(decision: WhiteBalanceDecision) -> None:
+    """Apply one software WB correction without enabling sensor AWB."""
+    global _white_balance_adjustment_thread
+
+    generation = _current_image_control_generation()
+    with _white_balance_adjustment_lock:
+        if _shutdown_event.is_set() or not _image_control_ready.is_set():
+            _white_balance_controller.complete(None, success=False)
+            return
+        if _white_balance_adjustment_thread and _white_balance_adjustment_thread.is_alive():
+            return
+
+        def adjust() -> None:
+            if not _generation_is_current(generation):
+                _white_balance_controller.complete(None, success=False)
+                return
+            logging.info(
+                "[image-control] WB %s from chroma %s/1/%s to %d/%d/%d.",
+                decision.action,
+                "--" if decision.average_red_over_green is None else f"{decision.average_red_over_green:.3f}",
+                "--" if decision.average_blue_over_green is None else f"{decision.average_blue_over_green:.3f}",
+                decision.red,
+                decision.green,
+                decision.blue,
+            )
+            try:
+                with _camera_configuration_lock:
+                    if (
+                        not _image_control_ready.is_set()
+                        or not _generation_is_current(generation)
+                    ):
+                        _white_balance_controller.complete(None, success=False)
+                        return
+                    profile = _image_control.update_profile(
+                        {
+                            "whiteBalance": {
+                                "auto": False,
+                                "red": decision.red,
+                                "green": decision.green,
+                                "blue": decision.blue,
+                            }
+                        }
+                    )
+                    _validate_authoritative_profile(
+                        profile,
+                        expected_white_balance={
+                            "red": decision.red,
+                            "green": decision.green,
+                            "blue": decision.blue,
+                        },
+                    )
+                # Validate the complete returned profile before either controller
+                # commits it or the state store persists it.
+                _exposure_controller.complete(profile, success=True)
+                _white_balance_controller.complete(profile, success=True)
+                logging.info("[image-control] Applied %s", _white_balance_controller.status_summary())
+            except (ImageControlAPIError, ValueError) as error:
+                _white_balance_controller.complete(None, success=False)
+                logging.exception("[image-control] Manual WB correction failed")
+                _schedule_camera_recovery(f"manual WB verification failed: {error}")
+
+        _white_balance_adjustment_thread = threading.Thread(
+            target=adjust,
+            daemon=True,
+            name="cctv-manual-white-balance",
+        )
+        _white_balance_adjustment_thread.start()
+
+
+def _schedule_wb_drift_check() -> None:
+    """Read camera RGB; if it drifted from the locked set, restore and re-open oneshot."""
+    global _wb_drift_check_thread, _wb_drift_last_check
+
+    if _HARDWARE_AWB:
+        # Sensor AWB owns RGB; do not force manual gains back.
+        return
+
+    now = time.monotonic()
+    with _wb_drift_check_lock:
+        if _shutdown_event.is_set() or not _image_control_ready.is_set():
+            return
+        if now - _wb_drift_last_check < _WB_DRIFT_CHECK_INTERVAL_SECONDS:
+            return
+        if _wb_drift_check_thread and _wb_drift_check_thread.is_alive():
+            return
+        _wb_drift_last_check = now
+        generation = _current_image_control_generation()
+
+        def check() -> None:
+            if not _generation_is_current(generation):
+                return
+            try:
+                with _camera_configuration_lock:
+                    if (
+                        not _image_control_ready.is_set()
+                        or not _generation_is_current(generation)
+                    ):
+                        return
+                    profile = _image_control.get_profile()
+                    white_balance = profile.get("whiteBalance") or {}
+                    restore = _white_balance_controller.check_camera_drift(
+                        int(white_balance["red"]),
+                        int(white_balance["green"]),
+                        int(white_balance["blue"]),
+                    )
+                    if restore is None:
+                        return
+                    logging.warning(
+                        "[image-control] Camera WB drifted to %s/%s/%s; restoring %d/%d/%d and reopening verify.",
+                        white_balance.get("red"),
+                        white_balance.get("green"),
+                        white_balance.get("blue"),
+                        restore["red"],
+                        restore["green"],
+                        restore["blue"],
+                    )
+                    profile = _image_control.update_profile(
+                        {"whiteBalance": {"auto": False, **restore}}
+                    )
+                    _validate_authoritative_profile(
+                        profile, expected_white_balance=restore
+                    )
+                _exposure_controller.complete(profile, success=True)
+                _white_balance_controller.sync_profile(profile)
+                # Leave unlocked (oneshot HOLD) so the next bright-frame window
+                # can re-enter ADJUST/VERIFY and lock again.
+                logging.info(
+                    "[image-control] Drift restore applied · %s",
+                    _white_balance_controller.status_summary(),
+                )
+            except (ImageControlAPIError, KeyError, TypeError, ValueError):
+                logging.exception("[image-control] WB drift check failed")
+
+        _wb_drift_check_thread = threading.Thread(
+            target=check,
+            daemon=True,
+            name="cctv-wb-drift-check",
+        )
+        _wb_drift_check_thread.start()
 
 
 def _resolve_python_command() -> str:
@@ -365,19 +873,86 @@ class NativeEventReader(threading.Thread):
                 payload.get("recording"),
                 payload.get("rtsp"),
             )
-            if brightness is not None:
-                decision = _resolution_controller.observe(brightness)
+            if not _HARDWARE_ISP:
+                _maybe_switch_color_period()
+                _schedule_wb_drift_check()
+        elif event_type == "image.metrics":
+            if _HARDWARE_ISP:
+                # No software exposure/WB/color. Floodlight may still use brightness.
+                if not _image_control_ready.is_set():
+                    return
+                brightness_value = payload.get("scene_brightness")
+                brightness = (
+                    float(brightness_value)
+                    if isinstance(brightness_value, (int, float))
+                    else None
+                )
+                _floodlight.observe(brightness)
+                return
+            _maybe_switch_color_period()
+            if not _image_control_ready.is_set():
+                return
+            brightness_value = payload.get("scene_brightness")
+            brightness = (
+                float(brightness_value)
+                if isinstance(brightness_value, (int, float))
+                else None
+            )
+            floodlight_transition = _floodlight.observe(brightness)
+            if floodlight_transition or _floodlight.image_adjustments_paused:
+                _exposure_controller.reset_observations()
+                _white_balance_controller.hold()
+                return
+            if isinstance(brightness_value, (int, float)):
+                decision = _exposure_controller.observe(float(brightness_value))
                 if decision is not None:
-                    _schedule_resolution_change(decision)
+                    _white_balance_controller.hold()
+                    _schedule_exposure_adjustment(decision)
+                    return
+            red_ratio = payload.get("red_over_green")
+            blue_ratio = payload.get("blue_over_green")
+            scene_brightness = (
+                float(brightness_value)
+                if isinstance(brightness_value, (int, float))
+                else None
+            )
+            # Prefer on-device wall stats when firmware supports them (no MJPEG steal).
+            if (
+                _USE_IMAGE_STATS
+                and not _HARDWARE_AWB
+                and _image_control.capabilities.image_stats
+            ):
+                try:
+                    stats = _image_control.get_image_stats()
+                    if (
+                        stats.roi is not None
+                        and stats.roi.usable
+                        and stats.roi.median_rg is not None
+                        and stats.roi.median_bg is not None
+                    ):
+                        red_ratio = stats.roi.median_rg
+                        blue_ratio = stats.roi.median_bg
+                    if stats.mean_y is not None and scene_brightness is None:
+                        scene_brightness = stats.mean_y
+                except ImageControlAPIError:
+                    pass
+            wb_decision = _white_balance_controller.observe(
+                float(red_ratio) if isinstance(red_ratio, (int, float)) else None,
+                float(blue_ratio) if isinstance(blue_ratio, (int, float)) else None,
+                scene_brightness=scene_brightness,
+            )
+            if wb_decision is not None:
+                _schedule_white_balance_adjustment(wb_decision)
+            _schedule_wb_drift_check()
+        elif event_type == "motion.started":
+            pass
         elif event_type == "stream.disconnected":
             reason = str(payload.get("reason") or "stream closed")
             logging.warning("[native-stream] Disconnected: %s", reason)
-            _resolution_controller.reset_observations()
-            _cancel_post_connect_adjustments()
             _schedule_camera_recovery(reason)
         elif event_type == "stream.connected":
             logging.info("[native-stream] MJPEG signal restored.")
-            _schedule_post_connect_adjustments()
+            _verify_profile_after_connect()
 
 
 def start_camera_pipeline() -> Optional[subprocess.Popen]:
@@ -405,7 +980,9 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
             else:
                 try:
                     with _camera_configuration_lock:
-                        startup(target_framesize=_resolution_controller.selected_framesize)
+                        generation = _begin_image_control_recovery()
+                        startup()
+                        _initialize_manual_exposure(generation)
                 except CameraRecoveryMode:
                     logging.exception("[orchestrator] Camera is in recovery mode; using Python controller.")
                     backend = "python"
@@ -631,6 +1208,42 @@ class StorageMonitor(threading.Thread):
         logging.info("[monitor] Storage monitor thread stopped.")
 
 
+class RecalibrateMonitor(threading.Thread):
+    """Background thread that runs PUT /image-control/recalibrate-v3 on an interval."""
+
+    def __init__(self, interval_seconds: int) -> None:
+        super().__init__(daemon=True, name="cctv-recalibrate-monitor")
+        self.interval = max(60, int(interval_seconds))
+        self._stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        logging.info(
+            "[monitor] Recalibrate monitor thread started (interval=%ss).",
+            self.interval,
+        )
+        while not self._stop_event.is_set():
+            # Wait the full interval first so boot/image-control setup is not raced.
+            if self._stop_event.wait(self.interval):
+                break
+            try:
+                result = _image_control.recalibrate_v3()
+                logging.info(
+                    "[image-control] recalibrate-v3 completed: %s",
+                    result,
+                )
+            except ImageControlAPIError as error:
+                logging.warning(
+                    "[image-control] recalibrate-v3 failed: %s",
+                    error,
+                )
+            except Exception:
+                logging.exception("[image-control] recalibrate-v3 unexpected failure")
+        logging.info("[monitor] Recalibrate monitor thread stopped.")
+
+
 class CameraProcessMonitor(threading.Thread):
     """Restart the camera pipeline if it exits while the orchestrator is running."""
 
@@ -685,7 +1298,7 @@ class CameraProcessMonitor(threading.Thread):
 
 def start_orchestrator() -> None:
     """Start the camera pipeline and the storage monitor."""
-    global _camera_monitor, _storage_monitor
+    global _camera_monitor, _storage_monitor, _recalibrate_monitor
 
     start_camera_pipeline()
 
@@ -703,10 +1316,19 @@ def start_orchestrator() -> None:
                 CHECK_INTERVAL_SECONDS,
             )
 
+    with _recalibrate_monitor_lock:
+        if _recalibrate_monitor is None or not _recalibrate_monitor.is_alive():
+            _recalibrate_monitor = RecalibrateMonitor(RECALIBRATE_INTERVAL_SECONDS)
+            _recalibrate_monitor.start()
+            logging.info(
+                "[orchestrator] Image recalibrate-v3 scheduled every %s seconds.",
+                RECALIBRATE_INTERVAL_SECONDS,
+            )
+
 
 def shutdown_orchestrator(sig: signal.Signals = signal.SIGTERM) -> None:
     """Stop the storage monitor and camera pipeline."""
-    global _camera_monitor, _storage_monitor
+    global _camera_monitor, _storage_monitor, _recalibrate_monitor
 
     logging.info("[orchestrator] Shutting down (signal=%s).", sig.name)
 
@@ -728,7 +1350,16 @@ def shutdown_orchestrator(sig: signal.Signals = signal.SIGTERM) -> None:
         monitor.stop()
         monitor.join(timeout=STOP_TIMEOUT_SECONDS)
 
+    with _recalibrate_monitor_lock:
+        recalibrate_monitor = _recalibrate_monitor
+        _recalibrate_monitor = None
+
+    if recalibrate_monitor is not None:
+        recalibrate_monitor.stop()
+        recalibrate_monitor.join(timeout=STOP_TIMEOUT_SECONDS)
+
     stop_camera_pipeline(sig)
+    _floodlight.close()
 
 
 def _handle_signal(signum: int, _frame) -> None:

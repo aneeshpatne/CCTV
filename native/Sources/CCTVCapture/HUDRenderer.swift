@@ -4,34 +4,163 @@ import CoreVideo
 import Foundation
 import Metal
 
+struct CameraSettings: Sendable, Equatable {
+    var framesize: Int?
+    var xclk: Int?
+    var autoExposure: Bool?
+    var shutterLines: Int?
+    var autoGain: Bool?
+    var gainX16: Int?
+    var gainRegister: Int?
+    var autoWhiteBalance: Bool?
+    var red: Int?
+    var green: Int?
+    var blue: Int?
+    var saturationU: Int?
+    var saturationV: Int?
+    var cachedForRecovery: Bool?
+    var wbControllerState: String? = nil
+
+    var imageSummary: String? {
+        var values: [String] = []
+        if let xclk { values.append("XCLK \(xclk)") }
+        if let autoExposure { values.append(autoExposure ? "AE AUTO" : "AE MANUAL") }
+        if let shutterLines { values.append("\(shutterLines)L") }
+        if let autoGain { values.append(autoGain ? "AGC AUTO" : "AGC MANUAL") }
+        if let gainX16 { values.append("GAIN \(gainX16)/16") }
+        if let gainRegister { values.append("REG \(gainRegister)") }
+        if let autoWhiteBalance { values.append(autoWhiteBalance ? "AWB AUTO" : "AWB MANUAL") }
+        if let red, let green, let blue { values.append("WB \(red)/\(green)/\(blue)") }
+        if let wbControllerState { values.append("WBCTRL \(wbControllerState.uppercased())") }
+        if let saturationU, let saturationV { values.append("SAT \(saturationU)/\(saturationV)") }
+        if cachedForRecovery == false { values.append("NOT CACHED") }
+        return values.isEmpty ? nil : values.joined(separator: " · ")
+    }
+}
+
 struct HUDStatus: Sendable {
     var fps: Double = 0
     var rssi: Int?
     var temperature: Double?
     var sceneBrightness: Double?
+    var redOverGreen: Double? = nil
+    var blueOverGreen: Double? = nil
     var motion = false
+    var floodlightOn = false
     var labels: [SemanticLabel] = []
     var motionBox: NormalizedRect?
     var message: String?
+    var cameraSettings = CameraSettings()
 }
 
 actor CameraTelemetry {
     private(set) var rssi: Int?
     private(set) var temperature: Double?
+    private(set) var cameraSettings = CameraSettings()
     private let baseURL: URL
+    private let floodlightStatePath: String
 
-    init(baseURL: URL) { self.baseURL = baseURL }
+    init(baseURL: URL) {
+        self.baseURL = baseURL
+        self.floodlightStatePath = (
+            ProcessInfo.processInfo.environment["CCTV_FLOODLIGHT_STATE_PATH"]
+                ?? "~/.local/state/cctv/floodlight.json"
+        ) as NSString as String
+    }
 
-    func snapshot() -> (Int?, Double?) { (rssi, temperature) }
+    func snapshot() -> (Int?, Double?, CameraSettings, Bool) {
+        (rssi, temperature, cameraSettings, readFloodlightState())
+    }
+
+    private func readFloodlightState() -> Bool {
+        let path = (floodlightStatePath as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["enabled"] as? Bool == true else {
+            return false
+        }
+        return object["on"] as? Bool == true
+    }
 
     func pollForever() async {
         while !Task.isCancelled {
             async let nextRSSI = fetchNumber(path: "/rssi", key: "rssi")
             async let nextTemperature = fetchNumber(path: "/syshealth", key: "socTempC")
-            let (rssiValue, temperatureValue) = await (nextRSSI, nextTemperature)
+            async let nextCameraSettings = fetchCameraSettings()
+            let (rssiValue, temperatureValue, settingsValue) = await (
+                nextRSSI, nextTemperature, nextCameraSettings
+            )
             if let rssiValue { rssi = Int(rssiValue) }
             if let temperatureValue { temperature = temperatureValue }
+            if let settingsValue { cameraSettings = settingsValue }
             try? await Task.sleep(for: .seconds(10))
+        }
+    }
+
+    private func fetchCameraSettings() async -> CameraSettings? {
+        // JSONSerialization produces [String: Any], which is not Sendable under
+        // Swift 6; keep these small telemetry reads actor-isolated and sequential.
+        let legacyValue = await fetchObject(path: "/status")
+        let currentValue = await fetchObject(path: "/status-v2")
+        let imageValue = await fetchObject(path: "/image-control")
+        let merged = (legacyValue ?? [:]).merging(currentValue ?? [:]) { _, current in current }
+        guard !merged.isEmpty || imageValue != nil else { return nil }
+        let exposure = imageValue?["exposure"] as? [String: Any]
+        let whiteBalance = imageValue?["whiteBalance"] as? [String: Any]
+        let color = imageValue?["color"] as? [String: Any]
+        let saturation = color?["saturation"] as? [String: Any]
+        let wbControllerState = fetchWBControllerState()
+        return CameraSettings(
+            framesize: intValue(merged["framesize"]),
+            xclk: intValue(merged["xclk"]),
+            autoExposure: boolValue(exposure?["autoExposure"]),
+            shutterLines: intValue(exposure?["shutterLines"]),
+            autoGain: boolValue(exposure?["autoGain"]),
+            gainX16: intValue(exposure?["gainX16"]),
+            gainRegister: intValue(exposure?["gainRegister"]),
+            autoWhiteBalance: boolValue(whiteBalance?["auto"]),
+            red: intValue(whiteBalance?["red"]),
+            green: intValue(whiteBalance?["green"]),
+            blue: intValue(whiteBalance?["blue"]),
+            saturationU: intValue(saturation?["u"]),
+            saturationV: intValue(saturation?["v"]),
+            cachedForRecovery: boolValue(imageValue?["cachedForRecovery"]),
+            wbControllerState: wbControllerState
+        )
+    }
+
+    private func fetchWBControllerState() -> String? {
+        let environment = ProcessInfo.processInfo.environment
+        let configured = environment["CCTV_IMAGE_CONTROL_STATE_PATH"]
+            ?? "~/.local/state/cctv/image-control.json"
+        let path = (configured as NSString).expandingTildeInPath
+        guard let data = FileManager.default.contents(atPath: path),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object["controllerState"] as? String
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String { return Int(string) }
+        return nil
+    }
+
+    private func boolValue(_ value: Any?) -> Bool? {
+        if let value = value as? Bool { return value }
+        if let number = value as? NSNumber { return number.boolValue }
+        return nil
+    }
+
+    private func fetchObject(path: String) async -> [String: Any]? {
+        guard let url = URL(string: path, relativeTo: baseURL) else { return nil }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        } catch {
+            return nil
         }
     }
 
@@ -113,15 +242,37 @@ final class HUDRenderer: @unchecked Sendable {
             let strongest = status.labels.first?.name.uppercased()
             let label = strongest.map { "MOTION · \($0)" } ?? "MOTION"
             composed = panel(text: label, x: left, y: top, width: strongest == nil ? 86 : 150, height: panelHeight, accent: CIColor(red: 0.98, green: 0.74, blue: 0.02), over: composed)
+            left += strongest == nil ? 92 : 156
         }
+
+        if status.floodlightOn {
+            composed = panel(
+                text: "● LIGHT",
+                x: left,
+                y: top,
+                width: 94,
+                height: panelHeight,
+                accent: CIColor(red: 0.98, green: 0.74, blue: 0.02),
+                over: composed
+            )
+            left += 100
+        }
+
+        let sceneText = status.sceneBrightness.map { String(format: "SCENE %.0f%%", $0 * 100) } ?? "SCENE --"
+        composed = panel(
+            text: sceneText,
+            x: left,
+            y: top,
+            width: 104,
+            height: panelHeight,
+            accent: statusColor(forSceneBrightness: status.sceneBrightness),
+            over: composed
+        )
 
         var right = width - gap
         let temperature = status.temperature.map { String(format: "%.1fC", $0) } ?? "--C"
         right -= 94
         composed = panel(text: temperature, x: right, y: top, width: 94, height: panelHeight, accent: statusColor(forTemperature: status.temperature), over: composed)
-        right -= gap + 112
-        let brightness = status.sceneBrightness.map { String(format: "%.1f%% LIGHT", $0 * 100) } ?? "--% LIGHT"
-        composed = panel(text: brightness, x: right, y: top, width: 112, height: panelHeight, accent: statusColor(forBrightness: status.sceneBrightness), over: composed)
         right -= gap + 88
         composed = panel(text: String(format: "%.0f fps", status.fps), x: right, y: top, width: 88, height: panelHeight, accent: statusColor(forFPS: status.fps), over: composed)
         right -= gap + 104
@@ -228,11 +379,13 @@ final class HUDRenderer: @unchecked Sendable {
         return temperature < 70 ? CIColor(red: 0.50, green: 0.79, blue: 0.58) : temperature < 80 ? CIColor(red: 0.98, green: 0.74, blue: 0.02) : CIColor(red: 0.95, green: 0.55, blue: 0.51)
     }
 
-    private func statusColor(forBrightness brightness: Double?) -> CIColor {
+    private func statusColor(forSceneBrightness brightness: Double?) -> CIColor {
         guard let brightness else { return CIColor(red: 0.5, green: 0.5, blue: 0.5) }
-        if brightness < 0.25 { return CIColor(red: 0.98, green: 0.74, blue: 0.02) }
-        if brightness > 0.35 { return CIColor(red: 0.50, green: 0.79, blue: 0.58) }
-        return CIColor(red: 0.74, green: 0.76, blue: 0.78)
+        return brightness <= 0.18
+            ? CIColor(red: 0.95, green: 0.55, blue: 0.51)
+            : brightness <= 0.30
+            ? CIColor(red: 0.98, green: 0.74, blue: 0.02)
+            : CIColor(red: 0.50, green: 0.79, blue: 0.58)
     }
 
     private let timestampFormatter: DateFormatter = {

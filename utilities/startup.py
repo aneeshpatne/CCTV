@@ -4,11 +4,14 @@ import logging
 import os
 import socket
 import time
+
+import requests
 from requests.exceptions import RequestException
 
-from tools.changeQuality import change_quality
 from tools.changeClock import change_clock
+from tools.changeQuality import change_quality
 from utilities.esp32cam_client import (
+    CAMERA_BASE_URL,
     CameraStatus,
     get_camera_status,
     get_camera_status_with_retry,
@@ -106,10 +109,9 @@ def run_recovery_mode() -> bool:
     return False
 
 
-def startup(target_framesize: int = 12):
+def startup():
     global count
-    if target_framesize not in {11, 12}:
-        raise ValueError(f"Unsupported target framesize: {target_framesize}")
+    target_framesize = 12
 
     consecutive_connection_failures = 0
     while True:
@@ -189,12 +191,25 @@ def startup(target_framesize: int = 12):
             logger.warning("Resolution setting incomplete - will retry")
             continue
 
-        # Set camera clock
+        # Prefer 14 MHz XCLK for the current ISP/profile look.
         try:
-            logger.info("Setting camera clock to 20")
-            change_clock(20)
+            logger.info("Setting camera clock to 14")
+            change_clock(14)
         except RequestException as err:
             logger.warning(f"Setting camera clock failed: {err}")
+
+        # Pin hardware AE bias while AE/AGC stay in automatic mode.
+        try:
+            logger.info("Setting ae_level=2")
+            response = requests.get(
+                f"{CAMERA_BASE_URL}/control",
+                params={"var": "ae_level", "val": 2},
+                timeout=2,
+            )
+            response.raise_for_status()
+            logger.info("ae_level set to 2")
+        except RequestException as err:
+            logger.warning(f"Setting ae_level failed: {err}")
 
         time.sleep(2)
         logger.info("Camera startup sequence completed")

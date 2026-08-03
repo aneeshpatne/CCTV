@@ -18,8 +18,8 @@ def _resolve_db_dir() -> Path:
         os.getenv("CCTV_RECORDINGS_DIR"),
         os.getenv("MOTION_DATA_DIR"),
         os.getenv("DATA_DIR"),
-        "/Volumes/drive/CCTV/recordings/esp_cam1",
-        "/Volumes/drive/CCTV/motion/data",
+        "/Volumes/HP USB20FD/CCTV/recordings/esp_cam1",
+        "/Volumes/HP USB20FD/CCTV/motion/data",
     ]
 
     for candidate in candidates:
@@ -34,7 +34,7 @@ def _resolve_db_dir() -> Path:
 
     raise RuntimeError(
         "No valid SSD-backed motion DB directory found. "
-        "Set MOTION_DB_DIR or CCTV_RECORDINGS_DIR to a mounted /Volumes/drive path."
+        "Set MOTION_DB_DIR or CCTV_RECORDINGS_DIR to a mounted writable volume path."
     )
 
 

@@ -30,9 +30,13 @@ struct WorkerEvent: Encodable, Sendable {
             processingLatencyMS: Double,
             motionScore: Double,
             sceneBrightness: Double?,
+            redOverGreen: Double?,
+            blueOverGreen: Double?,
             recording: Bool,
             rtsp: Bool
         )
+        case imageMetrics(sceneBrightness: Double?, redOverGreen: Double?, blueOverGreen: Double?)
+        case motionStarted
         case stream(connected: Bool, reason: String?)
 
         private enum CodingKeys: String, CodingKey {
@@ -43,6 +47,7 @@ struct WorkerEvent: Encodable, Sendable {
             case droppedFrames = "dropped_frames", encoderDroppedFrames = "encoder_dropped_frames"
             case processingLatencyMS = "processing_latency_ms", motionScore = "motion_score"
             case sceneBrightness = "scene_brightness"
+            case redOverGreen = "red_over_green", blueOverGreen = "blue_over_green"
             case recording, rtsp
             case connected, reason
         }
@@ -56,7 +61,7 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encode(duration, forKey: .duration)
                 try container.encode(confidence, forKey: .confidence)
                 try container.encode(labels, forKey: .labels)
-                try container.encode("vt-motion-v1", forKey: .detectorVersion)
+                try container.encode("vt-motion-v2", forKey: .detectorVersion)
             case let .segment(path, start, end, duration, codec, size):
                 try container.encode(path, forKey: .path)
                 try container.encode(start, forKey: .startTime)
@@ -73,6 +78,8 @@ struct WorkerEvent: Encodable, Sendable {
                 processingLatencyMS,
                 score,
                 sceneBrightness,
+                redOverGreen,
+                blueOverGreen,
                 recording,
                 rtsp
             ):
@@ -84,8 +91,16 @@ struct WorkerEvent: Encodable, Sendable {
                 try container.encode(processingLatencyMS, forKey: .processingLatencyMS)
                 try container.encode(score, forKey: .motionScore)
                 try container.encodeIfPresent(sceneBrightness, forKey: .sceneBrightness)
+                try container.encodeIfPresent(redOverGreen, forKey: .redOverGreen)
+                try container.encodeIfPresent(blueOverGreen, forKey: .blueOverGreen)
                 try container.encode(recording, forKey: .recording)
                 try container.encode(rtsp, forKey: .rtsp)
+            case let .imageMetrics(sceneBrightness, redOverGreen, blueOverGreen):
+                try container.encodeIfPresent(sceneBrightness, forKey: .sceneBrightness)
+                try container.encodeIfPresent(redOverGreen, forKey: .redOverGreen)
+                try container.encodeIfPresent(blueOverGreen, forKey: .blueOverGreen)
+            case .motionStarted:
+                break
             case let .stream(connected, reason):
                 try container.encode(connected, forKey: .connected)
                 try container.encodeIfPresent(reason, forKey: .reason)

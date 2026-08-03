@@ -22,7 +22,7 @@ struct PipelineConfiguration: Sendable {
         }
 
         let recordings = environment["CCTV_RECORDINGS_DIR"]
-            ?? "/Volumes/drive/CCTV/recordings/esp_cam1"
+            ?? "/Volumes/HP USB20FD/CCTV/recordings/esp_cam1"
         let fps = Double(environment["CCTV_TARGET_FPS"] ?? "9") ?? 9
         let segment = Double(environment["CCTV_SEGMENT_SECONDS"] ?? "60") ?? 60
         let localBitrate = Int(environment["CCTV_HEVC_BITRATE"] ?? "500000") ?? 500_000
