@@ -212,7 +212,15 @@ def get_server_info() -> dict:
 
 @app.get("/", include_in_schema=False)
 async def dashboard():
-    return FileResponse(STATIC_FOLDER / "index.html", media_type="text/html")
+    return FileResponse(
+        STATIC_FOLDER / "index.html",
+        media_type="text/html",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api")
