@@ -20,6 +20,7 @@ const elements = {
   playerEyebrow: document.querySelector("#playerEyebrow"),
   playerTitle: document.querySelector("#playerTitle"),
   liveButton: document.querySelector("#liveButton"),
+  recalibrateButton: document.querySelector("#recalibrateButton"),
   popoutButton: document.querySelector("#popoutButton"),
   eventList: document.querySelector("#eventList"),
   eventCount: document.querySelector("#eventCount"),
@@ -197,21 +198,57 @@ function setSystemState(online, label = online ? "All systems operational" : "Se
   elements.systemStateText.textContent = label;
 }
 
-function showToast(message) {
+function showToast(message, durationMs = 2600) {
   elements.toast.textContent = message;
   elements.toast.classList.add("visible");
   clearTimeout(showToast.timeout);
-  showToast.timeout = setTimeout(() => elements.toast.classList.remove("visible"), 2600);
+  showToast.timeout = setTimeout(() => elements.toast.classList.remove("visible"), durationMs);
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { headers: { Accept: "application/json" } });
+function errorDetail(error) {
+  if (!error) return "Unknown error";
+  if (typeof error === "string") return error;
+  if (error.message && error.message !== "[object Object]") return error.message;
+  try { return JSON.stringify(error); } catch (_) { return String(error); }
+}
+
+async function fetchJson(url, options = {}) {
+  const { headers: extraHeaders, ...rest } = options;
+  const response = await fetch(url, {
+    ...rest,
+    headers: { Accept: "application/json", ...(extraHeaders || {}) },
+  });
   if (!response.ok) {
     let detail = `Request failed (${response.status})`;
-    try { detail = (await response.json()).detail || detail; } catch (_) {}
+    try {
+      const payload = await response.json();
+      const raw = payload.detail ?? payload.message ?? payload.error ?? detail;
+      detail = typeof raw === "string" ? raw : JSON.stringify(raw);
+    } catch (_) {}
     throw new Error(detail);
   }
   return response.json();
+}
+
+async function recalibrateColors(event) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  const button = elements.recalibrateButton || document.querySelector("#recalibrateButton");
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  button.classList.add("busy");
+  showToast("Recalibrating camera colors…", 12000);
+  try {
+    await fetchJson("/api/recalibrate", { method: "POST" });
+    showToast("Colors recalibrated", 4000);
+  } catch (error) {
+    showToast(errorDetail(error) || "Recalibration failed", 5000);
+  } finally {
+    button.disabled = false;
+    button.classList.remove("busy");
+  }
 }
 
 function applyDashboardData(data) {
@@ -263,6 +300,11 @@ elements.clipPlayer.addEventListener("error", () => {
   showToast("This event clip could not be prepared");
 });
 elements.liveButton.addEventListener("click", showLive);
+const recalibrateButton = elements.recalibrateButton || document.querySelector("#recalibrateButton");
+if (recalibrateButton) {
+  elements.recalibrateButton = recalibrateButton;
+  recalibrateButton.addEventListener("click", recalibrateColors);
+}
 elements.refreshButton.addEventListener("click", () => loadDashboard({ announce: true }));
 elements.hoursFilter.addEventListener("change", () => {
   state.hours = Number(elements.hoursFilter.value);

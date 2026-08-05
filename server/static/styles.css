@@ -116,8 +116,12 @@ a { color: inherit; text-decoration: none; }
 .panel-header { min-height: 82px; padding: 21px 22px 18px; display: flex; align-items: center; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); }
 .panel-header h2 { margin: 5px 0 0; font-size: 18px; font-weight: 550; letter-spacing: -.02em; }
 .player-actions { display: flex; align-items: center; gap: 5px; }
-.segmented { height: 35px; border: 1px solid var(--line); border-radius: 10px; padding: 0 13px; display: flex; align-items: center; gap: 8px; background: transparent; cursor: pointer; font-size: 11px; }
+.segmented { height: 35px; border: 1px solid var(--line); border-radius: 10px; padding: 0 13px; display: flex; align-items: center; gap: 8px; background: transparent; cursor: pointer; font-size: 11px; transition: border-color .2s, background .2s, color .2s, opacity .2s; }
 .segmented.active { border-color: rgba(217,255,103,.22); background: var(--accent-soft); color: var(--accent); }
+.segmented:hover:not(:disabled) { border-color: var(--line-bright); background: rgba(255,255,255,.04); }
+.segmented:disabled { opacity: .55; cursor: wait; }
+.segmented svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+.segmented.busy svg { animation: spin .9s linear infinite; }
 .live-pip { width: 6px; height: 6px; animation: pulse 2.2s infinite; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(217,255,103,0); } }
 
