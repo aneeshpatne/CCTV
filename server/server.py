@@ -15,6 +15,7 @@ import hashlib
 import threading
 import uuid
 
+from utilities.image_control import ImageControlAPIError, ImageControlClient
 from utilities.motion_db_new import (
     get_motion_events_by_hours,
     get_motion_events_by_date,
@@ -45,11 +46,14 @@ LIVE_STREAM_URL = os.getenv(
     "CCTV_LIVE_STREAM_URL",
     "http://192.168.0.112:8889/esp_cam1_overlay/",
 )
+CAMERA_BASE_URL = os.getenv("ESP32CAM_BASE_URL", "http://192.168.0.13").rstrip("/")
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 ESP32CAM_RECOVERY_REDIS_KEY = "esp32cam:recovery"
+_image_control = ImageControlClient(CAMERA_BASE_URL, timeout=5.0)
+_recalibrate_lock = threading.Lock()
 
 
 def resolve_path(env_keys: list[str], default_path: Path) -> Path:
@@ -200,6 +204,7 @@ def get_server_info() -> dict:
             "night_events_list": "/nightevents",
             "night_event_by_index": "/nightevents/{index}",
             "esp32cam_recovery": "/esp32cam/recovery",
+            "recalibrate_colors": "/api/recalibrate",
             "docs": "/docs",
         },
     }
@@ -270,6 +275,35 @@ def get_esp32cam_recovery():
         raise HTTPException(status_code=503, detail=f"Redis unavailable: {e}")
 
     return {"recovery": parse_bool(value)}
+
+
+@app.post("/api/recalibrate")
+def recalibrate_colors():
+    """Run camera image-control recalibrate-v3 (white balance / color pass)."""
+    if not _recalibrate_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Color recalibration already in progress")
+
+    try:
+        result = _image_control.recalibrate_v3(timeout=30.0)
+        return {
+            "ok": True,
+            "message": "Color recalibration completed",
+            "result": result,
+            "timestamp": datetime.now().isoformat(),
+        }
+    except ImageControlAPIError as error:
+        status = error.status if error.status and 400 <= error.status < 600 else 502
+        raise HTTPException(
+            status_code=status,
+            detail=f"Camera recalibrate failed: {error}",
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Camera recalibrate failed: {error}",
+        ) from error
+    finally:
+        _recalibrate_lock.release()
 
 
 def find_videos_in_range(start_time: datetime, end_time: datetime) -> list[Path]:
