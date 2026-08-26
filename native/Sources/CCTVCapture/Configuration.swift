@@ -10,6 +10,7 @@ struct PipelineConfiguration: Sendable {
     let localBitrate: Int
     let rtspBitrate: Int
     let eventFileDescriptor: Int32?
+    let faces: FaceConfiguration
 
     static func load(environment: [String: String] = ProcessInfo.processInfo.environment) throws -> Self {
         let baseString = environment["ESP32CAM_BASE_URL"] ?? "http://192.168.0.13"
@@ -42,7 +43,8 @@ struct PipelineConfiguration: Sendable {
             segmentSeconds: segment,
             localBitrate: localBitrate,
             rtspBitrate: rtspBitrate,
-            eventFileDescriptor: fd
+            eventFileDescriptor: fd,
+            faces: FaceConfiguration.load(environment: environment)
         )
     }
 }

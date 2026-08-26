@@ -216,7 +216,7 @@ final class FramePipeline: @unchecked Sendable {
     private let emitter: EventEmitter
     private let renderer: HUDRenderer
     private let motionDetector: MotionDetector
-    private let semanticClassifier = SemanticClassifier()
+    private let semanticClassifier: SemanticClassifier
     private let accumulator = MotionEventAccumulator(cooldown: 15)
     private let ledBlinker: CameraLEDBlinker
     private let telemetry: CameraTelemetry
@@ -229,6 +229,10 @@ final class FramePipeline: @unchecked Sendable {
         self.emitter = EventEmitter(fileDescriptor: configuration.eventFileDescriptor)
         self.renderer = HUDRenderer()
         self.motionDetector = try MotionDetector(context: renderer.context)
+        let faceRecognizer = configuration.faces.enabled
+            ? FaceRecognizer(configuration: configuration.faces, context: renderer.context)
+            : nil
+        self.semanticClassifier = SemanticClassifier(faces: faceRecognizer)
         self.ledBlinker = CameraLEDBlinker(baseURL: configuration.cameraBaseURL, duration: 30)
         self.telemetry = CameraTelemetry(baseURL: configuration.cameraBaseURL)
         self.output = try FrameOutput(configuration: configuration, emitter: emitter)
@@ -379,8 +383,13 @@ final class FramePipeline: @unchecked Sendable {
             for: source,
             candidate: motion.candidate,
             now: frame.receivedAt
-        ) { [accumulator] labels in
-            Task { await accumulator.merge(semanticLabels: labels) }
+        ) { [accumulator, emitter] outcome in
+            Task {
+                await accumulator.merge(semanticLabels: outcome.labels)
+                for event in outcome.faceEvents {
+                    emitter.emit(event)
+                }
+            }
         }
         if let event = await accumulator.update(
             candidate: motion.candidate,
@@ -389,6 +398,7 @@ final class FramePipeline: @unchecked Sendable {
             at: frame.receivedAt
         ) {
             emitter.emit(event)
+            semanticClassifier.endFaceEpisode()
         }
         let measuredFPS = await runtime.recordProcessed(
             at: ProcessInfo.processInfo.systemUptime,

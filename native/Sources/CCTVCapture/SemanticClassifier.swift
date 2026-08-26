@@ -4,12 +4,22 @@
 import CoreVideo
 import Foundation
 
+struct SemanticOutcome: Sendable {
+    var labels: [SemanticLabel]
+    var faceEvents: [WorkerEvent]
+}
+
 final class SemanticClassifier: @unchecked Sendable {
     private let queue = DispatchQueue(label: "cctv.semantic", qos: .utility)
     private let lock = NSLock()
     private var busy = false
     private var lastRun = Date.distantPast
     private var cached: [SemanticLabel] = []
+    private let faces: FaceRecognizer?
+
+    init(faces: FaceRecognizer? = nil) {
+        self.faces = faces
+    }
 
     /// Return the latest labels immediately and schedule at most one candidate inference.
     /// Completion runs off the capture path so Vision cannot reduce camera throughput.
@@ -17,7 +27,7 @@ final class SemanticClassifier: @unchecked Sendable {
         for image: CIImage,
         candidate: Bool,
         now: Date = Date(),
-        completion: @escaping @Sendable ([SemanticLabel]) -> Void
+        completion: @escaping @Sendable (SemanticOutcome) -> Void
     ) -> [SemanticLabel] {
         guard candidate else { return lock.withLock { cached } }
         let (shouldRun, existing) = lock.withLock {
@@ -32,24 +42,31 @@ final class SemanticClassifier: @unchecked Sendable {
 
         queue.async { [weak self] in
             guard let self else { return }
-            let labels = self.perform(image)
+            let outcome = self.perform(image, now: now)
             self.lock.withLock {
-                self.cached = labels
+                self.cached = outcome.labels
                 self.busy = false
             }
-            completion(labels)
+            completion(outcome)
         }
         return existing
     }
 
-    private func perform(_ image: CIImage) -> [SemanticLabel] {
+    func endFaceEpisode() {
+        faces?.endEpisode()
+    }
+
+    private func perform(_ image: CIImage, now: Date) -> SemanticOutcome {
         var result: [SemanticLabel] = []
+        var faceEvents: [WorkerEvent] = []
         let human = VNDetectHumanRectanglesRequest()
         human.upperBodyOnly = false
         let classify = VNClassifyImageRequest()
+        let faceRects = VNDetectFaceRectanglesRequest()
+        let faceQuality = VNDetectFaceCaptureQualityRequest()
         let handler = VNImageRequestHandler(ciImage: image, orientation: .up)
         do {
-            try handler.perform([human, classify])
+            try handler.perform([human, classify, faceRects, faceQuality])
             if let people = human.results, let best = people.max(by: { $0.confidence < $1.confidence }) {
                 result.append(SemanticLabel(name: "person", confidence: Double(best.confidence)))
             }
@@ -73,9 +90,23 @@ final class SemanticClassifier: @unchecked Sendable {
                     }
                 }
             }
+            if let faces {
+                let recognized = faces.observe(
+                    image: image,
+                    faces: FaceRecognizer.mergeDetections(
+                        faceRects.results ?? [],
+                        faceQuality.results ?? []
+                    ),
+                    now: now
+                )
+                result.append(contentsOf: recognized.labels)
+                faceEvents = recognized.events
+            }
         } catch {
             FileHandle.standardError.write(Data("Vision classification failed: \(error)\n".utf8))
         }
-        return result.sorted { $0.confidence > $1.confidence }
+        let identities = result.filter(\.isAutoIdentity).sorted { $0.confidence > $1.confidence }
+        let others = result.filter { !$0.isAutoIdentity }.sorted { $0.confidence > $1.confidence }
+        return SemanticOutcome(labels: identities + others, faceEvents: faceEvents)
     }
 }

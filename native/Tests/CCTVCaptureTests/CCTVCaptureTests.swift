@@ -466,4 +466,214 @@ final class CCTVCaptureTests: XCTestCase {
         XCTAssertEqual(payload["encoder_dropped_frames"] as? Int, 2)
         XCTAssertEqual(payload["scene_brightness"] as? Double, 0.42)
     }
+
+    func testFaceConfigurationDefaultsEnableRecognition() throws {
+        let configuration = try PipelineConfiguration.load(environment: [:])
+        XCTAssertTrue(configuration.faces.enabled)
+        XCTAssertEqual(configuration.faces.minHits, 2)
+        XCTAssertEqual(configuration.faces.maxIdentities, 32)
+        XCTAssertEqual(configuration.faces.minSize, 24, accuracy: 0.0001)
+        XCTAssertEqual(configuration.faces.minQuality, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(configuration.faces.matchThreshold, 0.52, accuracy: 0.0001)
+    }
+
+    func testFaceConfigurationCanBeDisabled() throws {
+        let configuration = try PipelineConfiguration.load(environment: [
+            "CCTV_FACE_RECOGNITION": "0",
+            "CCTV_FACE_MIN_HITS": "4",
+            "CCTV_FACE_MAX_IDENTITIES": "8",
+        ])
+        XCTAssertFalse(configuration.faces.enabled)
+        XCTAssertEqual(configuration.faces.minHits, 4)
+        XCTAssertEqual(configuration.faces.maxIdentities, 8)
+    }
+
+    func testIdentityLabelDetectionIgnoresPerson() {
+        XCTAssertTrue(SemanticLabel(name: "p3", confidence: 1).isAutoIdentity)
+        XCTAssertTrue(SemanticLabel(name: "p12", confidence: 1).isAutoIdentity)
+        XCTAssertFalse(SemanticLabel(name: "person", confidence: 1).isAutoIdentity)
+        XCTAssertFalse(SemanticLabel(name: "animal", confidence: 1).isAutoIdentity)
+    }
+
+    func testFaceEngineRequiresThreeAgreeingUnknownsToEnroll() {
+        var engine = FaceDecisionEngine(configuration: testFaceConfiguration(maxIdentities: 8))
+        let start = Date(timeIntervalSince1970: 4_000)
+        let vector = [1.0, 0.0, 0.0, 0.0]
+        XCTAssertEqual(engine.observe(embedding: vector, quality: 0.8, at: start), .pending)
+        XCTAssertEqual(
+            engine.observe(embedding: vector, quality: 0.8, at: start.addingTimeInterval(0.2)),
+            .pending
+        )
+        guard case let .enrolled(id, _, embedding) = engine.observe(
+            embedding: vector,
+            quality: 0.9,
+            at: start.addingTimeInterval(0.4)
+        ) else {
+            return XCTFail("expected enrollment on the third agreeing hit")
+        }
+        XCTAssertEqual(id, 1)
+        XCTAssertEqual(embedding.count, 4)
+        XCTAssertEqual(engine.identities.count, 1)
+    }
+
+    func testFaceEngineDoesNotEnrollDisagreeingUnknowns() {
+        var engine = FaceDecisionEngine(configuration: testFaceConfiguration())
+        let start = Date(timeIntervalSince1970: 5_000)
+        XCTAssertEqual(engine.observe(embedding: [1, 0, 0, 0], quality: 0.8, at: start), .pending)
+        XCTAssertEqual(
+            engine.observe(embedding: [0, 1, 0, 0], quality: 0.8, at: start.addingTimeInterval(0.2)),
+            .pending
+        )
+        XCTAssertEqual(
+            engine.observe(embedding: [0, 0, 1, 0], quality: 0.8, at: start.addingTimeInterval(0.4)),
+            .pending
+        )
+        XCTAssertTrue(engine.identities.isEmpty)
+    }
+
+    func testFaceEngineMatchesAfterThreeHitsAndEmitsOnce() {
+        var engine = FaceDecisionEngine(
+            configuration: testFaceConfiguration(),
+            identities: [
+                FaceIdentityRecord(id: 3, embeddings: [[1, 0, 0, 0]], qualities: [0.9]),
+            ],
+            nextID: 4
+        )
+        let start = Date(timeIntervalSince1970: 6_000)
+        let vector = [1.0, 0.02, 0.0, 0.0]
+        XCTAssertEqual(engine.observe(embedding: vector, quality: 0.8, at: start), .pending)
+        XCTAssertEqual(
+            engine.observe(embedding: vector, quality: 0.8, at: start.addingTimeInterval(0.2)),
+            .pending
+        )
+        guard case let .matched(id, confidence, emit, record) = engine.observe(
+            embedding: vector,
+            quality: 0.85,
+            at: start.addingTimeInterval(0.4)
+        ) else {
+            return XCTFail("expected a match after three hits")
+        }
+        XCTAssertEqual(id, 3)
+        XCTAssertGreaterThan(confidence, 0.9)
+        XCTAssertTrue(emit)
+        XCTAssertTrue(record)
+        guard case let .matched(_, _, emitAgain, _) = engine.observe(
+            embedding: vector,
+            quality: 0.8,
+            at: start.addingTimeInterval(0.6)
+        ) else {
+            return XCTFail("expected continued match")
+        }
+        XCTAssertFalse(emitAgain)
+    }
+
+    func testFaceEngineRejectsCloseSecondBestMatch() {
+        var engine = FaceDecisionEngine(
+            configuration: testFaceConfiguration(margin: 0.08),
+            identities: [
+                FaceIdentityRecord(id: 1, embeddings: [[1, 0.05, 0, 0]], qualities: [0.8]),
+                FaceIdentityRecord(id: 2, embeddings: [[1, 0.0, 0, 0]], qualities: [0.8]),
+            ],
+            nextID: 3
+        )
+        let outcome = engine.observe(
+            embedding: [1, 0.02, 0, 0],
+            quality: 0.9,
+            at: Date(timeIntervalSince1970: 7_000)
+        )
+        XCTAssertEqual(outcome, .pending)
+        XCTAssertEqual(engine.identities.count, 2)
+    }
+
+    func testFaceEngineHonorsIdentityCap() {
+        var engine = FaceDecisionEngine(
+            configuration: testFaceConfiguration(maxIdentities: 1),
+            identities: [
+                FaceIdentityRecord(id: 1, embeddings: [[1, 0, 0, 0]], qualities: [0.9]),
+            ],
+            nextID: 2
+        )
+        let start = Date(timeIntervalSince1970: 8_000)
+        let vector = [0.0, 1.0, 0.0, 0.0]
+        XCTAssertEqual(engine.observe(embedding: vector, quality: 0.8, at: start), .pending)
+        XCTAssertEqual(engine.observe(embedding: vector, quality: 0.8, at: start.addingTimeInterval(0.2)), .pending)
+        XCTAssertEqual(
+            engine.observe(embedding: vector, quality: 0.8, at: start.addingTimeInterval(0.4)),
+            .rejectedAtCapacity
+        )
+        XCTAssertEqual(engine.identities.map(\.id), [1])
+    }
+
+    func testFaceGalleryRejectsMismatchedEmbedder() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cctv-face-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        FaceGalleryStore.save(
+            FaceGalleryFile(
+                version: 1,
+                embedder: "other-embedder",
+                nextID: 4,
+                identities: [FaceIdentityRecord(id: 3, embeddings: [[1, 0]], qualities: [1])]
+            ),
+            to: directory
+        )
+        XCTAssertNil(
+            FaceGalleryStore.load(directory: directory, expectedEmbedder: FaceConfiguration.featurePrintEmbedder)
+        )
+    }
+
+    func testFaceEnrolledEventKeepsProtocolVersion1() throws {
+        let event = WorkerEvent(
+            type: "face.enrolled",
+            payload: .faceEnrolled(
+                id: 3,
+                confidence: 1,
+                quality: 0.8,
+                cropPath: "/tmp/p3.jpg",
+                embedding: [1, 0, 0],
+                embedder: FaceConfiguration.featurePrintEmbedder
+            )
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        XCTAssertEqual(object["type"] as? String, "face.enrolled")
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["id"] as? Int, 3)
+        XCTAssertEqual(payload["crop_path"] as? String, "/tmp/p3.jpg")
+        XCTAssertEqual(payload["embedder"] as? String, FaceConfiguration.featurePrintEmbedder)
+    }
+
+    func testFaceMatchedEventKeepsProtocolVersion1() throws {
+        let event = WorkerEvent(
+            type: "face.matched",
+            payload: .faceMatched(id: 2, confidence: 0.88)
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, 1)
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["id"] as? Int, 2)
+        XCTAssertEqual(payload["confidence"] as? Double, 0.88)
+    }
+
+    private func testFaceConfiguration(
+        maxIdentities: Int = 32,
+        margin: Double = 0.08
+    ) -> FaceConfiguration {
+        FaceConfiguration(
+            enabled: true,
+            galleryDirectory: URL(fileURLWithPath: "/tmp/cctv-faces", isDirectory: true),
+            matchThreshold: 0.75,
+            matchMargin: margin,
+            minHits: 3,
+            minSize: 48,
+            minQuality: 0.3,
+            maxIdentities: maxIdentities,
+            maxExemplars: 8
+        )
+    }
 }

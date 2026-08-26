@@ -239,10 +239,12 @@ final class HUDRenderer: @unchecked Sendable {
         left += 202
 
         if status.motion {
-            let strongest = status.labels.first?.name.uppercased()
+            let identity = status.labels.first(where: \.isAutoIdentity)
+            let strongest = (identity ?? status.labels.first)?.name.uppercased()
             let label = strongest.map { "MOTION · \($0)" } ?? "MOTION"
-            composed = panel(text: label, x: left, y: top, width: strongest == nil ? 86 : 150, height: panelHeight, accent: CIColor(red: 0.98, green: 0.74, blue: 0.02), over: composed)
-            left += strongest == nil ? 92 : 156
+            let width: CGFloat = strongest == nil ? 86 : (identity == nil ? 150 : 118)
+            composed = panel(text: label, x: left, y: top, width: width, height: panelHeight, accent: CIColor(red: 0.98, green: 0.74, blue: 0.02), over: composed)
+            left += width + 6
         }
 
         if status.floodlightOn {

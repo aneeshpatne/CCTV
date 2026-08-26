@@ -38,6 +38,15 @@ struct WorkerEvent: Encodable, Sendable {
         case imageMetrics(sceneBrightness: Double?, redOverGreen: Double?, blueOverGreen: Double?)
         case motionStarted
         case stream(connected: Bool, reason: String?)
+        case faceEnrolled(
+            id: Int,
+            confidence: Double,
+            quality: Double,
+            cropPath: String?,
+            embedding: [Double],
+            embedder: String
+        )
+        case faceMatched(id: Int, confidence: Double)
 
         private enum CodingKeys: String, CodingKey {
             case startTime = "start_time"
@@ -50,6 +59,8 @@ struct WorkerEvent: Encodable, Sendable {
             case redOverGreen = "red_over_green", blueOverGreen = "blue_over_green"
             case recording, rtsp
             case connected, reason
+            case id, quality, embedding, embedder
+            case cropPath = "crop_path"
         }
 
         func encode(to encoder: any Encoder) throws {
@@ -104,6 +115,16 @@ struct WorkerEvent: Encodable, Sendable {
             case let .stream(connected, reason):
                 try container.encode(connected, forKey: .connected)
                 try container.encodeIfPresent(reason, forKey: .reason)
+            case let .faceEnrolled(id, confidence, quality, cropPath, embedding, embedder):
+                try container.encode(id, forKey: .id)
+                try container.encode(confidence, forKey: .confidence)
+                try container.encode(quality, forKey: .quality)
+                try container.encodeIfPresent(cropPath, forKey: .cropPath)
+                try container.encode(embedding, forKey: .embedding)
+                try container.encode(embedder, forKey: .embedder)
+            case let .faceMatched(id, confidence):
+                try container.encode(id, forKey: .id)
+                try container.encode(confidence, forKey: .confidence)
             }
         }
     }
