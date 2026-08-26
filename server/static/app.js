@@ -1,9 +1,11 @@
 const state = {
   events: [],
+  identities: [],
   visibleEvents: 8,
   liveUrl: "",
   hours: 24,
   selectedEventId: null,
+  personFilter: "",
 };
 
 const elements = {
@@ -26,6 +28,7 @@ const elements = {
   eventCount: document.querySelector("#eventCount"),
   hoursFilter: document.querySelector("#hoursFilter"),
   dateFilter: document.querySelector("#dateFilter"),
+  personFilter: document.querySelector("#personFilter"),
   showMoreButton: document.querySelector("#showMoreButton"),
   latestRecording: document.querySelector("#latestRecording"),
   motionStat: document.querySelector("#motionStat"),
@@ -74,29 +77,56 @@ function eventIcon() {
   return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h3l2-5 4 10 2-5h5" /></svg>`;
 }
 
-function eventDescription(event) {
+function formatLabelName(name) {
+  const raw = String(name || "").replaceAll("_", " ");
+  const identity = /^p(\d+)$/i.exec(raw);
+  if (identity) return `P${identity[1]}`;
+  if (!raw) return "";
+  return `${raw.charAt(0).toUpperCase()}${raw.slice(1)}`;
+}
+
+function eventLabels(event) {
   const labels = Array.isArray(event.labels) ? event.labels : [];
-  const names = labels
+  return labels
     .map(label => {
       if (typeof label === "string") return label;
       if (label && typeof label === "object") return label.name || label.label || label.type || "";
       return "";
     })
-    .filter(Boolean)
-    .map(name => String(name).replaceAll("_", " "));
-  if (names.length) {
-    return names
-      .map(name => `${name.charAt(0).toUpperCase()}${name.slice(1)}`)
-      .join(" · ");
-  }
+    .filter(Boolean);
+}
+
+function eventDescription(event) {
+  const names = eventLabels(event).map(formatLabelName);
+  if (names.length) return names.join(" · ");
   return "Motion detected";
 }
 
-function renderEvents() {
-  elements.eventCount.textContent = state.events.length;
-  elements.motionStat.textContent = state.events.length.toLocaleString();
+function visibleEvents() {
+  if (!state.personFilter) return state.events;
+  return state.events.filter(event => eventLabels(event).includes(state.personFilter));
+}
 
-  if (!state.events.length) {
+function renderPersonFilter() {
+  if (!elements.personFilter) return;
+  const selected = state.personFilter;
+  const options = ['<option value="">All people</option>']
+    .concat(state.identities.map(identity => {
+      const name = identity.name || `p${identity.id}`;
+      const label = formatLabelName(name);
+      const count = Number(identity.sightings || 0);
+      return `<option value="${name}">${label}${count ? ` · ${count}` : ""}</option>`;
+    }));
+  elements.personFilter.innerHTML = options.join("");
+  elements.personFilter.value = selected;
+}
+
+function renderEvents() {
+  const events = visibleEvents();
+  elements.eventCount.textContent = events.length;
+  elements.motionStat.textContent = events.length.toLocaleString();
+
+  if (!events.length) {
     elements.eventList.innerHTML = `<div class="empty-state"><strong>No activity found</strong><span>Try a wider time range or another day.</span></div>`;
     elements.showMoreButton.hidden = true;
     renderActivityBars([]);
@@ -104,7 +134,7 @@ function renderEvents() {
   }
 
   elements.eventList.innerHTML = "";
-  state.events.slice(0, state.visibleEvents).forEach(event => {
+  events.slice(0, state.visibleEvents).forEach(event => {
     const item = document.createElement("button");
     item.type = "button";
     item.className = `event-item${state.selectedEventId === event.id ? " active" : ""}`;
@@ -120,8 +150,8 @@ function renderEvents() {
     item.addEventListener("click", () => playEvent(event));
     elements.eventList.appendChild(item);
   });
-  elements.showMoreButton.hidden = state.visibleEvents >= state.events.length;
-  renderActivityBars(state.events);
+  elements.showMoreButton.hidden = state.visibleEvents >= events.length;
+  renderActivityBars(events);
 }
 
 function updateEventSelection() {
@@ -253,6 +283,8 @@ async function recalibrateColors(event) {
 
 function applyDashboardData(data) {
   state.events = [...(data.events || [])].sort((a, b) => new Date(b.start_time) - new Date(a.start_time));
+  state.identities = Array.isArray(data.identities) ? data.identities : [];
+  renderPersonFilter();
   state.liveUrl = data.live_stream_url;
   if (!elements.liveFrame.src) elements.liveFrame.src = state.liveUrl;
   if (!elements.playerStage.classList.contains("clip-mode")) elements.popoutButton.href = state.liveUrl;
@@ -312,6 +344,13 @@ elements.hoursFilter.addEventListener("change", () => {
   elements.dateFilter.value = "";
   loadDashboard();
 });
+if (elements.personFilter) {
+  elements.personFilter.addEventListener("change", () => {
+    state.personFilter = elements.personFilter.value;
+    state.visibleEvents = 8;
+    renderEvents();
+  });
+}
 elements.dateFilter.addEventListener("change", () => {
   if (elements.dateFilter.value) loadDate(elements.dateFilter.value);
 });

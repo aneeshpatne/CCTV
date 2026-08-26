@@ -24,6 +24,9 @@ from utilities.motion_db_new import (
     get_motion_event_stats_per_hour,
     get_motion_event_stats_per_hour_last_month,
     get_motion_annotations,
+    get_face_identity,
+    get_motion_events_for_identity,
+    list_face_identities,
 )
 from utilities.recording_catalog import RecordingCatalog
 
@@ -201,6 +204,8 @@ def get_server_info() -> dict:
             "motion_stats": "/motion/stats",
             "motion_hourly_stats": "/motion/stats/hourly?days=30",
             "motion_hourly_stats_last_month": "/motion/stats/hourly-last-month",
+            "face_identities": "/faces/identities",
+            "face_identity_events": "/faces/identities/{id}/events",
             "night_events_list": "/nightevents",
             "night_event_by_index": "/nightevents/{index}",
             "esp32cam_recovery": "/esp32cam/recovery",
@@ -244,6 +249,7 @@ def dashboard_data(hours: int = 24):
             "hours": hours,
             "motion_count": len(events),
             "events": serialize_motion_events(events),
+            "identities": list_face_identities(),
             "recordings_count": recordings.count,
             "latest_recording": (
                 {
@@ -1175,6 +1181,36 @@ def get_motion_stats_hourly(days: int = 30):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/faces/identities")
+def get_face_identities():
+    """List auto-enrolled anonymous face identities."""
+    try:
+        identities = list_face_identities()
+        return {"count": len(identities), "identities": identities}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/faces/identities/{identity_id}")
+def get_one_face_identity(identity_id: int):
+    identity = get_face_identity(identity_id)
+    if identity is None:
+        raise HTTPException(status_code=404, detail="Face identity not found")
+    return identity
+
+
+@app.get("/faces/identities/{identity_id}/events")
+def get_face_identity_events(identity_id: int):
+    if get_face_identity(identity_id) is None:
+        raise HTTPException(status_code=404, detail="Face identity not found")
+    events = get_motion_events_for_identity(identity_id)
+    return {
+        "id": identity_id,
+        "count": len(events),
+        "events": serialize_motion_events(events),
+    }
 
 
 @app.get("/motion/stats/hourly-last-month")

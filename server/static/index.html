@@ -6,8 +6,8 @@
     <meta name="theme-color" content="#080b0b" />
     <title>Northstar CCTV</title>
     <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
-    <link rel="stylesheet" href="/static/styles.css?v=recalibrate-1" />
-    <script src="/static/app.js?v=recalibrate-1" defer></script>
+    <link rel="stylesheet" href="/static/styles.css?v=faces-1" />
+    <script src="/static/app.js?v=faces-1" defer></script>
   </head>
   <body>
     <div class="ambient ambient-one"></div>
@@ -128,6 +128,13 @@
               <span class="sr-only">Activity date</span>
               <input id="dateFilter" type="date" />
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v15H5zM8 3v4M16 3v4M5 10h14" /></svg>
+            </label>
+            <label class="select-wrap" title="Filter by recognized person">
+              <span class="sr-only">Recognized person</span>
+              <select id="personFilter">
+                <option value="">All people</option>
+              </select>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 10 4 4 4-4" /></svg>
             </label>
           </div>
 
