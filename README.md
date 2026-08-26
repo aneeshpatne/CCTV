@@ -34,6 +34,7 @@ The operator interface is a responsive, video-first HTML, CSS, and JavaScript da
 | **Signal recovery** | Detects a three-second JPEG stall, keeps archive and RTSP outputs alive with a `NO SIGNAL · RECONNECTING` frame, retries the stream, and coalesces disconnects into one camera startup sequence. |
 | **Recording and retention** | Writes atomically finalized, camera-timed HEVC MP4 segments; registers them in a SQLite catalog; reconciles the catalog at startup; and prunes older footage from 90% disk use toward 85% without deleting recent or partial files. |
 | **Motion intelligence** | Uses ROI-aware VideoToolbox motion vectors, temporal persistence, and global-lighting rejection. Vision classification runs only for motion candidates and adds person or animal annotations without changing the base event schema. |
+| **Face identity** | On motion candidates, Apple Vision finds quality-gated faces and embeds them on the Neural Engine. Three agreeing observations auto-enroll an anonymous `pN` identity in SQLite; later visits reuse that ID. There is no photo upload or naming UI. |
 | **Review and retrieval** | Serves a dashboard plus APIs for recording lists, exact timestamps, arbitrary ranges, hourly/day windows, motion queries, hourly statistics, and accurately trimmed H.264 event clips with configurable pre/post padding. |
 | **Scheduled reporting** | Merges nearby overnight events, downloads their clips from the API, compresses them under the configured Discord transport limit, and sends a summary and videos through a retrying gRPC client. An optional OpenAI job produces a daily text summary and plots. |
 | **Operational resilience** | Restarts a failed capture process, latches to the Python/OpenCV fallback after three native failures in five minutes, publishes health metrics every ten seconds, and includes `launchd` definitions for capture, API, and the nightly job. |
@@ -144,7 +145,7 @@ Python owns process supervision, camera recovery, storage policy, SQLite writes,
 | --- | --- |
 | **Languages** | Python 3.12+, Swift 6.2, JavaScript, HTML, and CSS |
 | **Native capture** | URLSession, Core Image, Metal, Core Video, AVFoundation, and VideoToolbox |
-| **Detection** | VideoToolbox motion estimation and Apple Vision person/image classification |
+| **Detection** | VideoToolbox motion estimation, Apple Vision person/image classification, and Vision face capture-quality plus feature-print embeddings |
 | **Fallback capture** | OpenCV and NumPy |
 | **Backend** | FastAPI 0.124.4 and Uvicorn |
 | **Persistence** | SQLite, SQLAlchemy 2.0.46, and a direct `sqlite3` recording catalog |
@@ -237,7 +238,7 @@ There is no camera simulator. Unit tests run without hardware, but live capture,
    export CCTV_LIVE_STREAM_URL="http://127.0.0.1:8889/esp_cam1_overlay/"
    ```
 
-   `CCTV_PIPELINE_BACKEND` accepts `native`, `python`, or `auto`; the default is `native`, with fallback when the binary is missing or repeatedly fails. Native tuning is available through `CCTV_TARGET_FPS`, `CCTV_SEGMENT_SECONDS`, `CCTV_HEVC_BITRATE`, and `CCTV_RTSP_BITRATE`.
+   `CCTV_PIPELINE_BACKEND` accepts `native`, `python`, or `auto`; the default is `native`, with fallback when the binary is missing or repeatedly fails. Native tuning is available through `CCTV_TARGET_FPS`, `CCTV_SEGMENT_SECONDS`, `CCTV_HEVC_BITRATE`, and `CCTV_RTSP_BITRATE`. Face auto-enrollment is on by default in the native worker (`CCTV_FACE_RECOGNITION=1`) and stores a hot gallery under `CCTV_FACE_GALLERY_DIR` (default `~/.local/state/cctv/faces`). Defaults are tuned for the indoor ESP32-CAM: `CCTV_FACE_MATCH_THRESHOLD=0.52`, `CCTV_FACE_MIN_HITS=2`, `CCTV_FACE_MIN_SIZE=24`, `CCTV_FACE_MIN_QUALITY=0.05`, and `CCTV_FACE_MAX_IDENTITIES=32`. Missing Vision capture-quality scores are not treated as a reject. The Python fallback does not recognize faces.
 
    Manual image controls and their software tuning loops are described in [Automatic image tuner](#automatic-image-tuner).
 
@@ -307,7 +308,7 @@ SWIFT_MODULE_CACHE_PATH=/tmp/cctv-swift-module-cache \
   xcrun swift test --disable-sandbox
 ```
 
-In an IDE, use Python `unittest` discovery for `tests/`, or open `native/Package.swift` in Xcode and choose Product → Test. The current tests cover native configuration, MJPEG parsing, variable-frame-rate timing, RTSP arguments, motion accumulation and event envelopes, plus Python-side event persistence and recording-catalog reconciliation. API, storage-pruning, hardware replay, and Discord integration are not currently covered by the committed automated suite.
+In an IDE, use Python `unittest` discovery for `tests/`, or open `native/Package.swift` in Xcode and choose Product → Test. The current tests cover native configuration, MJPEG parsing, variable-frame-rate timing, RTSP arguments, motion accumulation, face auto-enroll matching, and event envelopes, plus Python-side event persistence, face identity cataloging, and recording-catalog reconciliation. API, storage-pruning, hardware replay, and Discord integration are not currently covered by the committed automated suite.
 
 ## Roadmap
 
