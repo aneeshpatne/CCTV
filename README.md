@@ -24,6 +24,21 @@ CCTV accepts an MJPEG stream and control telemetry from a single ESP32-CAM. It a
 
 The operator interface is a responsive, video-first HTML, CSS, and JavaScript dashboard served by FastAPI. A Swift worker handles the latency-sensitive path with URLSession, Core Image, Metal, VideoToolbox, and Vision; Python supervises that worker, persists metadata with SQLite and SQLAlchemy, serves media, and runs scheduled jobs. Native events cross a versioned JSON pipe, while an OpenCV implementation remains available as an automatic fallback.
 
+## Deployment snapshot
+
+As of 26 August 2026, the single-camera deployment has retained an estimated **500 hours of footage** and has operated concurrently for approximately the same duration. The archive is stored as camera-timed HEVC MP4 segments and indexed for timestamp and motion retrieval.
+
+| Metric | Value |
+| --- | ---: |
+| Estimated footage retained | ~500 hours |
+| Elapsed since first recording implementation (14 Oct 2025) | ~7,584 hours |
+| Motion events indexed | 5,760 |
+| Face identities / sightings | 32 / 266 |
+| Native median CPU reduction | 65.6% |
+| Representative segment-size reduction | 69.3% |
+| Camera-timed processing | 12.3–12.5 FPS at ~12 ms latency |
+| Git history | 385 commits and 128 test declarations |
+
 ## Features
 
 | Area | What the project provides |
