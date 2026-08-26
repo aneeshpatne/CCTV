@@ -27,6 +27,18 @@
     <string>/Users/aneeshpatne/Desktop/Code/CCTV/native/.build/release/cctv-capture</string>
     <key>CCTV_TARGET_FPS</key>
     <string>9</string>
+    <key>CCTV_FACE_RECOGNITION</key>
+    <string>1</string>
+    <key>CCTV_FACE_MATCH_THRESHOLD</key>
+    <string>0.52</string>
+    <key>CCTV_FACE_MATCH_MARGIN</key>
+    <string>0.04</string>
+    <key>CCTV_FACE_MIN_HITS</key>
+    <string>2</string>
+    <key>CCTV_FACE_MIN_SIZE</key>
+    <string>24</string>
+    <key>CCTV_FACE_MIN_QUALITY</key>
+    <string>0.05</string>
     <key>CCTV_LOCAL_CODEC</key>
     <string>hevc</string>
     <key>CCTV_HARDWARE_ISP</key>

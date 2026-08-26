@@ -22,7 +22,14 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Optional
 
-from utilities.motion_db_new import annotate_motion_event, log_motion_event
+from utilities.motion_db_new import (
+    annotate_motion_event,
+    export_face_gallery,
+    link_face_labels_to_event,
+    log_motion_event,
+    record_face_match,
+    upsert_face_identity,
+)
 from utilities.recording_catalog import RecordingCatalog
 from utilities.brightness_mode import ManualExposureController, ManualExposureDecision
 from utilities.color_profile import CameraColorProfile, color_period_for_now
@@ -834,13 +841,33 @@ class NativeEventReader(threading.Thread):
                 end_time=end,
                 duration=float(payload.get("duration", (end - start).total_seconds())),
             )
+            labels = payload.get("labels", [])
             annotate_motion_event(
                 motion.id,
                 detector_version=str(payload.get("detector_version", "native-unknown")),
                 confidence=float(payload.get("confidence", 0.0)),
-                labels_json=json.dumps(payload.get("labels", []), separators=(",", ":")),
+                labels_json=json.dumps(labels, separators=(",", ":")),
             )
+            link_face_labels_to_event(motion.id, labels, seen_at=end)
             logging.info("[native-event] Motion event %s persisted.", motion.id)
+        elif event_type == "face.enrolled":
+            embedding = payload.get("embedding") or []
+            vector = [float(value) for value in embedding] if isinstance(embedding, list) else []
+            upsert_face_identity(
+                int(payload["id"]),
+                embedder=str(payload.get("embedder") or "unknown"),
+                seen_at=datetime.now(),
+                quality=float(payload.get("quality") or 0.0),
+                crop_path=payload.get("crop_path"),
+                embedding=vector or None,
+            )
+            logging.info("[native-event] Auto-enrolled face p%s.", payload.get("id"))
+        elif event_type == "face.matched":
+            record_face_match(
+                int(payload["id"]),
+                seen_at=datetime.now(),
+                confidence=float(payload.get("confidence") or 0.0),
+            )
         elif event_type == "segment.finalized":
             path = Path(payload["path"])
             _recording_catalog.register(
@@ -990,6 +1017,14 @@ def start_camera_pipeline() -> Optional[subprocess.Popen]:
                     logging.exception("[orchestrator] Camera startup failed; using Python fallback.")
                     backend = "python"
                 if backend == "native":
+                    gallery = Path(
+                        os.getenv("CCTV_FACE_GALLERY_DIR", "~/.local/state/cctv/faces")
+                    ).expanduser()
+                    if export_face_gallery(gallery):
+                        logging.info(
+                            "[orchestrator] Rebuilt face gallery from SQLite at %s.",
+                            gallery,
+                        )
                     read_fd, write_fd = os.pipe()
                     os.set_inheritable(write_fd, True)
                     child_env["CCTV_EVENT_FD"] = str(write_fd)

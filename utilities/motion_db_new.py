@@ -10,6 +10,8 @@ from pathlib import Path
 import os
 from typing import Generator, Optional
 from sqlalchemy import create_engine, Column, Integer, DateTime, Float, String, Text, ForeignKey, case, func, text
+import json
+import re
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import DatabaseError
@@ -98,8 +100,62 @@ class MotionEventAnnotation(Base):
     labels_json = Column(Text, nullable=False, default="[]")
 
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+class FaceIdentity(Base):
+    """Auto-enrolled anonymous face identity."""
+
+    __tablename__ = "face_identities"
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime, nullable=False, index=True)
+    last_seen_at = Column(DateTime, nullable=False, index=True)
+    sightings = Column(Integer, nullable=False, default=0)
+    embedder = Column(String(64), nullable=False)
+
+
+class FaceEmbedding(Base):
+    __tablename__ = "face_embeddings"
+
+    id = Column(Integer, primary_key=True)
+    identity_id = Column(
+        Integer,
+        ForeignKey("face_identities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime, nullable=False)
+    vector_json = Column(Text, nullable=False)
+    quality = Column(Float, nullable=False, default=0.0)
+    crop_path = Column(Text, nullable=True)
+
+
+class FaceSighting(Base):
+    __tablename__ = "face_sightings"
+
+    id = Column(Integer, primary_key=True)
+    identity_id = Column(
+        Integer,
+        ForeignKey("face_identities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_id = Column(
+        Integer,
+        ForeignKey("motion_events_new.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    seen_at = Column(DateTime, nullable=False, index=True)
+    confidence = Column(Float, nullable=False, default=0.0)
+
+
+# Create tables. Concurrent imports (orchestrator + server) can race on SQLite.
+try:
+    Base.metadata.create_all(bind=engine)
+except DatabaseError as exc:
+    if "already exists" not in str(exc).lower():
+        raise
+
+_IDENTITY_LABEL = re.compile(r"^p(\d+)$")
 
 
 @contextmanager
@@ -481,3 +537,268 @@ def get_motion_event_hourly_avg_all_time() -> list[dict]:
         }
         for hour in range(24)
     ]
+
+
+def identity_ids_from_labels(labels) -> list[tuple[int, float]]:
+    found: list[tuple[int, float]] = []
+    if not isinstance(labels, list):
+        return found
+    for label in labels:
+        name = ""
+        confidence = 0.0
+        if isinstance(label, str):
+            name = label
+        elif isinstance(label, dict):
+            name = str(label.get("name") or label.get("label") or "")
+            try:
+                confidence = float(label.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+        match = _IDENTITY_LABEL.fullmatch(name)
+        if match:
+            found.append((int(match.group(1)), confidence))
+    return found
+
+
+def upsert_face_identity(
+    identity_id: int,
+    *,
+    embedder: str,
+    seen_at: datetime | None = None,
+    quality: float = 0.0,
+    crop_path: str | None = None,
+    embedding: list[float] | None = None,
+) -> FaceIdentity:
+    now = seen_at or datetime.now()
+    with get_db_session() as session:
+        identity = session.get(FaceIdentity, int(identity_id))
+        if identity is None:
+            identity = FaceIdentity(
+                id=int(identity_id),
+                created_at=now,
+                last_seen_at=now,
+                sightings=0,
+                embedder=str(embedder),
+            )
+            session.add(identity)
+        else:
+            if now > identity.last_seen_at:
+                identity.last_seen_at = now
+            if embedder:
+                identity.embedder = str(embedder)
+        if embedding:
+            session.add(
+                FaceEmbedding(
+                    identity_id=int(identity_id),
+                    created_at=now,
+                    vector_json=json.dumps(embedding, separators=(",", ":")),
+                    quality=float(quality),
+                    crop_path=crop_path,
+                )
+            )
+        session.flush()
+        session.refresh(identity)
+        return identity
+
+
+def record_face_match(
+    identity_id: int,
+    *,
+    seen_at: datetime | None = None,
+    confidence: float = 0.0,
+) -> None:
+    now = seen_at or datetime.now()
+    with get_db_session() as session:
+        identity = session.get(FaceIdentity, int(identity_id))
+        if identity is None:
+            identity = FaceIdentity(
+                id=int(identity_id),
+                created_at=now,
+                last_seen_at=now,
+                sightings=0,
+                embedder="unknown",
+            )
+            session.add(identity)
+        elif now > identity.last_seen_at:
+            identity.last_seen_at = now
+        session.add(
+            FaceSighting(
+                identity_id=int(identity_id),
+                event_id=None,
+                seen_at=now,
+                confidence=float(confidence),
+            )
+        )
+
+
+def link_face_labels_to_event(
+    event_id: int,
+    labels,
+    *,
+    seen_at: datetime,
+) -> None:
+    identities = identity_ids_from_labels(labels)
+    if not identities:
+        return
+    with get_db_session() as session:
+        for identity_id, confidence in identities:
+            identity = session.get(FaceIdentity, identity_id)
+            if identity is None:
+                identity = FaceIdentity(
+                    id=identity_id,
+                    created_at=seen_at,
+                    last_seen_at=seen_at,
+                    sightings=0,
+                    embedder="unknown",
+                )
+                session.add(identity)
+            identity.sightings = int(identity.sightings or 0) + 1
+            if seen_at > identity.last_seen_at:
+                identity.last_seen_at = seen_at
+            session.add(
+                FaceSighting(
+                    identity_id=identity_id,
+                    event_id=int(event_id),
+                    seen_at=seen_at,
+                    confidence=float(confidence),
+                )
+            )
+
+
+def list_face_identities() -> list[dict]:
+    with get_read_session() as session:
+        identities = (
+            session.query(FaceIdentity).order_by(FaceIdentity.last_seen_at.desc()).all()
+        )
+        crops: dict[int, str] = {}
+        if identities:
+            rows = (
+                session.query(FaceEmbedding)
+                .filter(FaceEmbedding.identity_id.in_([item.id for item in identities]))
+                .order_by(FaceEmbedding.created_at.desc())
+                .all()
+            )
+            for row in rows:
+                if row.identity_id not in crops and row.crop_path:
+                    crops[int(row.identity_id)] = row.crop_path
+        return [
+            {
+                "id": int(identity.id),
+                "name": f"p{identity.id}",
+                "created_at": identity.created_at.isoformat(),
+                "last_seen_at": identity.last_seen_at.isoformat(),
+                "sightings": int(identity.sightings or 0),
+                "embedder": identity.embedder,
+                "crop_path": crops.get(int(identity.id)),
+            }
+            for identity in identities
+        ]
+
+
+def get_face_identity(identity_id: int) -> dict | None:
+    with get_read_session() as session:
+        identity = session.get(FaceIdentity, int(identity_id))
+        if identity is None:
+            return None
+        crop = (
+            session.query(FaceEmbedding)
+            .filter(FaceEmbedding.identity_id == int(identity_id))
+            .filter(FaceEmbedding.crop_path.isnot(None))
+            .order_by(FaceEmbedding.created_at.desc())
+            .first()
+        )
+        return {
+            "id": int(identity.id),
+            "name": f"p{identity.id}",
+            "created_at": identity.created_at.isoformat(),
+            "last_seen_at": identity.last_seen_at.isoformat(),
+            "sightings": int(identity.sightings or 0),
+            "embedder": identity.embedder,
+            "crop_path": crop.crop_path if crop else None,
+        }
+
+
+def get_motion_events_for_identity(identity_id: int) -> list[MotionEvent]:
+    label = f"p{int(identity_id)}"
+    with get_read_session() as session:
+        event_ids = [
+            row.event_id
+            for row in session.query(FaceSighting.event_id)
+            .filter(
+                FaceSighting.identity_id == int(identity_id),
+                FaceSighting.event_id.isnot(None),
+            )
+            .distinct()
+        ]
+        if not event_ids:
+            annotations = session.query(MotionEventAnnotation).all()
+            for annotation in annotations:
+                try:
+                    labels = json.loads(annotation.labels_json)
+                except (TypeError, ValueError):
+                    continue
+                if any(
+                    name == label
+                    for name, _confidence in identity_ids_from_labels(labels)
+                ):
+                    event_ids.append(int(annotation.event_id))
+        if not event_ids:
+            return []
+        return (
+            session.query(MotionEvent)
+            .filter(MotionEvent.id.in_(event_ids))
+            .order_by(MotionEvent.start_time.desc())
+            .all()
+        )
+
+
+def export_face_gallery(directory) -> bool:
+    """Rebuild native gallery.json from SQLite when the hot file is missing."""
+    target = Path(directory).expanduser()
+    gallery_path = target / "gallery.json"
+    if gallery_path.exists():
+        return False
+    with get_read_session() as session:
+        identities = session.query(FaceIdentity).order_by(FaceIdentity.id.asc()).all()
+        embeddings = (
+            session.query(FaceEmbedding).order_by(FaceEmbedding.created_at.asc()).all()
+        )
+    if not identities:
+        return False
+    vectors_by_id: dict[int, list[list[float]]] = {}
+    qualities_by_id: dict[int, list[float]] = {}
+    embedder = identities[0].embedder
+    for row in embeddings:
+        try:
+            vector = json.loads(row.vector_json)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(vector, list):
+            continue
+        vectors_by_id.setdefault(int(row.identity_id), []).append(
+            [float(value) for value in vector]
+        )
+        qualities_by_id.setdefault(int(row.identity_id), []).append(
+            float(row.quality or 0.0)
+        )
+    payload = {
+        "version": 1,
+        "embedder": embedder,
+        "next_id": max(int(identity.id) for identity in identities) + 1,
+        "identities": [
+            {
+                "id": int(identity.id),
+                "embeddings": vectors_by_id.get(int(identity.id), []),
+                "qualities": qualities_by_id.get(int(identity.id), []),
+            }
+            for identity in identities
+            if vectors_by_id.get(int(identity.id))
+        ],
+    }
+    if not payload["identities"]:
+        return False
+    target.mkdir(parents=True, exist_ok=True)
+    temporary = gallery_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(gallery_path)
+    return True
