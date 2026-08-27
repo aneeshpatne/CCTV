@@ -20,7 +20,7 @@
 
 ## Overview
 
-CCTV accepts an MJPEG stream and control telemetry from a single ESP32-CAM. It adds an operational HUD, detects sustained motion, records camera-timed video segments, and indexes both recordings and events. A self-hoster receives a live browser view, time-based footage retrieval, motion-specific clips, statistics, and optional Discord digests—useful outputs when the important question is what happened and when.
+CCTV is a self-hosted, single-camera ESP32-CAM recorder that turns an MJPEG feed into a health-overlay live view, camera-timed HEVC archive, searchable motion events, trimmed H.264 clips, and scheduled Discord reports. The current deployment snapshot retains approximately **500 hours of footage** and **5,760 indexed motion events**; the camera-timed native rollout processed **12.3–12.5 FPS** at approximately **12 ms** processing latency.
 
 The operator interface is a responsive, video-first HTML, CSS, and JavaScript dashboard served by FastAPI. A Swift worker handles the latency-sensitive path with URLSession, Core Image, Metal, VideoToolbox, and Vision; Python supervises that worker, persists metadata with SQLite and SQLAlchemy, serves media, and runs scheduled jobs. Native events cross a versioned JSON pipe, while an OpenCV implementation remains available as an automatic fallback.
 
@@ -37,7 +37,29 @@ As of 26 August 2026, the single-camera deployment has retained an estimated **5
 | Native median CPU reduction | 65.6% |
 | Representative segment-size reduction | 69.3% |
 | Camera-timed processing | 12.3–12.5 FPS at ~12 ms latency |
-| Git history | 385 commits and 128 test declarations |
+| Controlled reboot canary | 540 frames / 59.998 seconds |
+| FastAPI route handlers | 22 (21 GET, 1 POST) |
+| Git history / test declarations | 366 commits / 128 tests (99 Python + 29 Swift) |
+
+The footage, event, face, and runtime figures above are a deployment snapshot rather than a synthetic capacity claim. The reproducible CPU and archive comparisons are documented below and in [`benchmarks/canary-results.md`](benchmarks/canary-results.md).
+
+## Performance & scale
+
+The committed benchmark evidence compares the Python process tree with the native process tree on an Apple M4. [`tools/benchmark_pipeline.py`](tools/benchmark_pipeline.py) samples macOS `top` output every two seconds; the stored native report contains 20 seconds of samples and the Python baseline contains 30 seconds. This is a rollout canary, not a controlled multi-host load test.
+
+| Measurement | Python baseline | Native canary | Observed change |
+| --- | ---: | ---: | ---: |
+| Aggregate process-tree CPU median | 58.6% | 20.15% | 65.6% lower |
+| Aggregate process-tree CPU p95 | 61.2% | 21.0% | 65.7% lower |
+| Representative 60-second archive | 5,461,621 bytes, H.264 | 1,675,607 bytes, hardware HEVC | 69.3% smaller |
+
+The follow-up camera-timed canary measured **12.3–12.5 camera/processed/output FPS**, approximately **12 ms** processing latency, **zero sustained queue or encoder drops**, and **738 HEVC frames over 60.08 seconds**. The native worker keeps `CCTV_TARGET_FPS=9` for no-signal keepalive and encoder hints; normal recording and RTSP timestamps follow fresh camera arrivals.
+
+The controlled camera-reset canary continued archive and RTSP output with a `NO SIGNAL · RECONNECTING` frame, ran the complete startup recovery, reconnected MJPEG automatically, and produced a **540-frame, 59.998-second** segment. A three-second no-JPEG deadline triggers this recovery path, while the orchestrator latches to the Python/OpenCV backend after **3 native failures within 5 minutes**.
+
+At the application boundary, `server/server.py` registers **22 route handlers**—**21 GET** and **1 POST**—covering dashboard/health, video retrieval, motion search and statistics, night-event access, and camera recalibration. Recording metadata is served from a SQLite catalog with indexed start/end timestamps, WAL mode, an **8-connection** pool, and background filesystem reconciliation every **60 seconds** rather than rescanning recordings on each API read.
+
+Storage cleanup runs in a background monitor every **5 minutes**, starts at **90%** disk use, and deletes the oldest eligible finalized segments in one batch toward **85%**. Partial, active, and recent files are protected; the canary verified the 90%→85% cleanup behavior without stopping capture.
 
 ## Features
 
